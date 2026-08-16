@@ -1,0 +1,4 @@
+Resolve Package Graph
+Fetching from https://example.com/Package.git
+error: Dependencies could not be resolved because package product 'MissingProduct' is required
+error: Failed to clone repository https://example.com/Package.git

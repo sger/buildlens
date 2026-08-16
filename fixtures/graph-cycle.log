@@ -1,0 +1,5 @@
+Target dependency graph (3 targets)
+Target 'A' in project 'App'
+    ➜ Explicit dependency on target 'B' in project 'App'
+Target 'B' in project 'App'
+    ➜ Explicit dependency on target 'A' in project 'App'

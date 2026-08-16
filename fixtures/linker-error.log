@@ -1,0 +1,6 @@
+xcodebuild -scheme App
+Ld /tmp/App normal arm64
+ld: undefined symbols for architecture arm64:
+  "_MissingSymbol", referenced from:
+Undefined symbols for architecture arm64
+clang: error: linker command failed with exit code 1

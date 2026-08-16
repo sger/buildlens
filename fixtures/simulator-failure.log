@@ -1,0 +1,4 @@
+Testing failed:
+Unable to boot the Simulator.
+error: Failed to launch test runner: Simulator device failed to boot
+xcodebuild: error: Unable to find a destination matching the provided destination specifier

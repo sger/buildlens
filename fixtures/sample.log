@@ -1,0 +1,23 @@
+xcodebuild -workspace App.xcworkspace -scheme AppTests -testPlan AllTests -destination 'platform=iOS Simulator,name=iPhone 15' -resultBundlePath /tmp/App.xcresult -enableCodeCoverage YES
+Xcode 16.2
+Resolved source packages:
++ Firebase https://github.com/firebase/firebase-ios-sdk.git 12.17.0
++ LocalKit /Users/ci/LocalKit 1.0.0
+note: Target dependency graph (3 targets)
+Target 'AppTests' in project 'App'
+    ➜ Explicit dependency on target 'App' in project 'App'
+Target 'App' in project 'App'
+    ➜ Explicit dependency on target 'FirebaseCrashlytics' in project 'Pods'
+Target 'FirebaseCrashlytics' in project 'Pods'
+/Users/ci/Source.swift:18:4: warning: sending 'value' risks causing data races; this is an error in the Swift 6 language mode
+/Users/ci/Source.swift:18:4: warning: sending 'value' risks causing data races; this is an error in the Swift 6 language mode
+/Users/ci/Legacy.swift:9:2: warning: 'oldAPI()' is deprecated: use newAPI()
+/Users/ci/Source.swift:42:3: error: cannot find 'MissingType' in scope
+Test Suite 'AppTests' started
+Test Case '-[AppTests testLoads]' started.
+Test Case '-[AppTests testLoads]' passed (0.213 seconds).
+Test Case '-[AppTests testRetainsManager]' started.
+Fatal error: Unexpectedly found nil while implicitly unwrapping an Optional value
+Restarting after unexpected exit, crash, or test timeout
+Test Case '-[AppTests testRetainsManager]' failed (0.563 seconds).
+IDETestOperationsObserverDebug: 12.480 elapsed

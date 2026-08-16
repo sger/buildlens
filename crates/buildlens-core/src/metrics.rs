@@ -186,7 +186,17 @@ pub struct BuildMetrics {
     pub swift_timings: Vec<SwiftTimingMetric>,
     pub environment: MetricsEnvironment,
     pub cache: CacheMetrics,
+    /// Problems encountered while decoding. A non-empty list means the result
+    /// may be wrong or incomplete through no choice of ours.
     pub warnings: Vec<String>,
+    /// Ranked lists that were deliberately capped, and by how much.
+    ///
+    /// Kept apart from `warnings` because a cap is normal operation, not a
+    /// problem: callers check `warnings.is_empty()` to mean "this log decoded
+    /// cleanly", and folding truncation in there would make every large build
+    /// look broken. Recorded rather than silent so a reader of "50 files"
+    /// knows the build compiled nine thousand.
+    pub truncations: Vec<String>,
     /// Diagnostics summed over every step. Reported alongside `status` rather
     /// than used to derive it: a build can fail with zero step-level errors
     /// (a cancelled build, a failure in a script phase), so counting errors
@@ -206,7 +216,49 @@ pub struct BuildMetrics {
     pub status: Option<String>,
 }
 
+/// The schema version [`BuildMetrics`] is currently written at.
+///
+/// Producers must use this rather than a literal: the value is also what
+/// [`crate::wire::SUPPORTED_METRICS_SCHEMA`] is checked against, so a
+/// hand-written `2` in one constructor and a bump here would silently diverge.
+pub const METRICS_SCHEMA_VERSION: u32 = 2;
+
 impl BuildMetrics {
+    /// An empty result of the given kind, carrying any warnings explaining why
+    /// it is empty.
+    ///
+    /// Exists so producers do not each spell out all twenty-odd fields; two
+    /// such constructors had already drifted into near-copies.
+    pub fn empty(source_kind: MetricsSourceKind, warnings: Vec<String>) -> Self {
+        Self {
+            metrics_schema_version: METRICS_SCHEMA_VERSION,
+            build_id: None,
+            source_log: None,
+            project: None,
+            source_kind,
+            category: BuildCategory::Unknown,
+            compiled_count: 0,
+            total_seconds: None,
+            started_at: None,
+            ended_at: None,
+            phases: Vec::new(),
+            targets: Vec::new(),
+            files: Vec::new(),
+            swift_timings: Vec::new(),
+            environment: MetricsEnvironment::default(),
+            cache: CacheMetrics {
+                status: "unknown".to_owned(),
+                hit_rate: None,
+            },
+            warnings,
+            truncations: Vec::new(),
+            error_count: 0,
+            warning_count: 0,
+            diagnostics: Vec::new(),
+            status: None,
+        }
+    }
+
     /// True only when Xcode explicitly said the build did not succeed. An
     /// unknown status is not a failure.
     pub fn failed(&self) -> bool {

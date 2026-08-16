@@ -69,6 +69,7 @@ pub(crate) mod tests {
                 hit_rate: Some(0.0),
             },
             warnings: vec![],
+            truncations: vec![],
             error_count: 0,
             warning_count: 0,
             diagnostics: vec![],

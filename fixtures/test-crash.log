@@ -1,0 +1,3 @@
+Test Case '-[CrashTests testOptional]' started.
+Fatal error: Unexpectedly found nil while implicitly unwrapping an Optional value
+Restarting after unexpected exit, crash, or test timeout

@@ -26,7 +26,7 @@ pub const WIRE_VERSION: u32 = 1;
 /// [`WireBuild::from_metrics`] asserts against this, so bumping the local
 /// schema forces whoever bumps it to look at the wire format and decide
 /// whether `WIRE_VERSION` must move too.
-pub const SUPPORTED_METRICS_SCHEMA: u32 = 2;
+pub const SUPPORTED_METRICS_SCHEMA: u32 = crate::metrics::METRICS_SCHEMA_VERSION;
 
 /// Cap on transmitted phases. Unlike targets, phases are a small fixed set
 /// Xcode itself defines (~10 per build), so this exists only to bound a
@@ -261,6 +261,7 @@ mod tests {
                 hit_rate: Some(0.0),
             },
             warnings: vec![],
+            truncations: vec![],
             error_count: 0,
             warning_count: 0,
             diagnostics: vec![],

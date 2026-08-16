@@ -1,0 +1,3 @@
+/Sources/Feature.swift:12:4: warning: sending value risks causing data races; this is an error in the Swift 6 language mode
+/Sources/Feature.swift:20:4: warning: type 'Value' does not conform to Sendable
+/Sources/Feature.swift:22:4: warning: main actor-isolated property cannot be mutated from a Sendable closure

@@ -1,0 +1,4 @@
+this line is intentionally malformed and harmless
+\xff not valid in a real UTF-8 fixture, but parser input remains line tolerant
+warning: a truncated diagnostic
+Test Case 'partial

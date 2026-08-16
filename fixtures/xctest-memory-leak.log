@@ -1,0 +1,6 @@
+Test Case '-[GeoShieldTests.GeoShieldManagerTests testStartWithDeniedOutcome]' started.
+/Users/ci/GeoShieldManagerTests.swift:470: error: -[GeoShieldTests.GeoShieldManagerTests testStartWithDeniedOutcome] : XCTAssertNil failed: "GeoShieldManager" - Expected Optional<AnyObject> to be nil after test completion, indicating it was deallocated. Detected a potential memory leak.
+Test Case '-[GeoShieldTests.GeoShieldManagerTests testStartWithDeniedOutcome]' failed (0.120 seconds).
+Test Case '-[GeoShieldTests.GeoShieldManagerTests testStopResetsLatestResult]' started.
+/Users/ci/GeoShieldManagerTests.swift:470: error: -[GeoShieldTests.GeoShieldManagerTests testStopResetsLatestResult] : XCTAssertNil failed: "GeoShieldManager" - Expected Optional<AnyObject> to be nil after test completion, indicating it was deallocated. Detected a potential memory leak.
+Test Case '-[GeoShieldTests.GeoShieldManagerTests testStopResetsLatestResult]' failed (0.120 seconds).

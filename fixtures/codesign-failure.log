@@ -1,0 +1,4 @@
+CodeSign /tmp/App.app
+error: Code signing is required for product type 'Application' in SDK 'iPhoneOS'
+errSecInternalComponent
+Command CodeSign failed with a nonzero exit code

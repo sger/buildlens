@@ -34,10 +34,10 @@ pub use git::{GitCorrelation, GitOwnership, LikelyRelated};
 pub use graph::{TargetDependency, TargetGraphSummary, TargetNode};
 pub use intel::{Bottleneck, EvidenceChain, EvidenceLink, Intelligence, MatchKind, TargetImpact};
 pub use metrics::{
-    BuildCategory, BuildMetrics, BuildStepMetric, CacheMetrics, FileMetric, MetricDiagnostic,
-    MetricKind, MetricRegression, MetricsEnvironment, MetricsSourceKind, PhaseMetric,
-    RegressionCaveat, RegressionConfidence, SwiftTimingKind, SwiftTimingMetric, TargetMetric,
-    TargetTiming, TimingSummary,
+    BuildCategory, BuildMetrics, BuildStepMetric, CacheMetrics, FileMetric, METRICS_SCHEMA_VERSION,
+    MetricDiagnostic, MetricKind, MetricRegression, MetricsEnvironment, MetricsSourceKind,
+    PhaseMetric, RegressionCaveat, RegressionConfidence, SwiftTimingKind, SwiftTimingMetric,
+    TargetMetric, TargetTiming, TimingSummary,
 };
 pub use sourcepath::{matches_any, normalize_separators, same_file};
 pub use testing::{
