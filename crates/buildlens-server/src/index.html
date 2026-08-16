@@ -1,0 +1,242 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BuildLens — team</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7; --surface-1: #fcfcfb;
+    --text-primary: #0b0b0b; --text-secondary: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
+    --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface-1: #1a1a19;
+      --text-primary: #ffffff; --text-secondary: #c3c2b7; --muted: #898781;
+      --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+      --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+    }
+  }
+  body { margin: 0; padding: 24px; background: var(--page); color: var(--text-primary);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--text-secondary); margin: 0 0 16px; }
+  .bar { display: flex; gap: 10px; align-items: center; margin: 0 0 18px; flex-wrap: wrap; }
+  .bar input { font: inherit; padding: 5px 9px; border: 1px solid var(--border);
+               border-radius: 6px; background: var(--surface-1); color: var(--text-primary); }
+  .bar label { color: var(--text-secondary); font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; max-width: 1400px; }
+  .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .card h2 { font-size: 14px; margin: 0 0 2px; }
+  .card .hint { color: var(--muted); font-size: 12px; margin: 0 0 10px; }
+  .tiles { display: flex; gap: 24px; flex-wrap: wrap; }
+  .tile .value { font-size: 26px; font-variant-numeric: tabular-nums; }
+  .tile .label { color: var(--text-secondary); font-size: 12px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 6px 0 2px; font-size: 12px; color: var(--text-secondary); }
+  .legend .chip { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+  svg text { fill: var(--muted); font: 11px system-ui, sans-serif; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th { text-align: left; color: var(--text-secondary); font-weight: 600;
+       border-bottom: 1px solid var(--axis); padding: 5px 10px 5px 0; white-space: nowrap; }
+  td { border-bottom: 1px solid var(--grid); padding: 5px 10px 5px 0; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.name { max-width: 340px; }
+  td.name > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .empty { color: var(--muted); font-size: 12.5px; padding: 12px 0; }
+  #tooltip { position: fixed; pointer-events: none; background: var(--surface-1);
+             border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; font-size: 12px;
+             box-shadow: 0 2px 10px rgba(0,0,0,0.18); display: none; z-index: 10; }
+  #tooltip .k { color: var(--muted); }
+</style>
+<h1>BuildLens — team</h1>
+<p class="sub">Builds aggregated across machines. Read-only.</p>
+<div class="bar">
+  <label for="token">Server token</label>
+  <input id="token" type="password" size="22" placeholder="only if the server sets one">
+  <label for="days">Days</label>
+  <input id="days" type="number" value="30" min="1" max="365" size="4">
+  <span id="status" class="label"></span>
+</div>
+<div class="grid" id="app"></div>
+<div id="tooltip"></div>
+<script>
+"use strict";
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const app = document.getElementById("app");
+const tooltip = document.getElementById("tooltip");
+const tokenInput = document.getElementById("token");
+const daysInput = document.getElementById("days");
+const status = document.getElementById("status");
+tokenInput.value = localStorage.getItem("buildlens-token") || "";
+
+const fmtS = v => v == null ? "–" : (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + "s";
+function card(title, hint) {
+  const el = document.createElement("div");
+  el.className = "card";
+  el.innerHTML = `<h2>${title}</h2><p class="hint">${hint}</p>`;
+  app.appendChild(el);
+  return el;
+}
+function showTip(e, html) {
+  tooltip.innerHTML = html; tooltip.style.display = "block";
+  tooltip.style.left = Math.min(e.clientX + 14, innerWidth - tooltip.offsetWidth - 14) + "px";
+  tooltip.style.top = Math.min(e.clientY + 14, innerHeight - tooltip.offsetHeight - 14) + "px";
+}
+const hideTip = () => { tooltip.style.display = "none"; };
+
+function lineChart(parent, series, opts = {}) {
+  const W = 460, H = 180, L = 46, R = 12, T = 10, B = 26;
+  const pts = series.flatMap(s => s.points);
+  if (!pts.length) { parent.insertAdjacentHTML("beforeend", '<div class="empty">No data for this range.</div>'); return; }
+  const xs = [...new Set(pts.map(p => p.x))].sort();
+  const xPos = x => xs.length === 1 ? L + (W - L - R) / 2
+    : L + (W - L - R) * (xs.indexOf(x) / (xs.length - 1));
+  const yMax = Math.max(...pts.map(p => p.y), 1e-9) * 1.1;
+  const yPos = y => T + (H - T - B) * (1 - y / yMax);
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.style.width = "100%";
+  let inner = "";
+  for (let i = 0; i <= 3; i++) {
+    const v = yMax * i / 3, y = yPos(v);
+    inner += `<line x1="${L}" x2="${W-R}" y1="${y}" y2="${y}" stroke="${css('--grid')}" stroke-width="1"/>`;
+    inner += `<text x="${L-6}" y="${y+3.5}" text-anchor="end">${(opts.yFormat||(x=>x.toFixed(0)))(v)}</text>`;
+  }
+  inner += `<line x1="${L}" x2="${W-R}" y1="${H-B}" y2="${H-B}" stroke="${css('--axis')}" stroke-width="1"/>`;
+  inner += `<text x="${xPos(xs[0])}" y="${H-8}" text-anchor="start">${xs[0]}</text>`;
+  if (xs.length > 1) inner += `<text x="${xPos(xs.at(-1))}" y="${H-8}" text-anchor="end">${xs.at(-1)}</text>`;
+  for (const s of series) {
+    const sorted = [...s.points].sort((a,b) => a.x < b.x ? -1 : 1);
+    inner += `<path d="${sorted.map((p,i)=>`${i?"L":"M"}${xPos(p.x).toFixed(1)},${yPos(p.y).toFixed(1)}`).join("")}"
+                    fill="none" stroke="${css(s.colorVar)}" stroke-width="2" stroke-linejoin="round"/>`;
+  }
+  svg.innerHTML = inner;
+  parent.appendChild(svg);
+  for (const s of series) for (const p of s.points) {
+    const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    dot.setAttribute("cx", xPos(p.x)); dot.setAttribute("cy", yPos(p.y)); dot.setAttribute("r", 3.5);
+    dot.setAttribute("fill", css(s.colorVar));
+    dot.setAttribute("stroke", css("--surface-1")); dot.setAttribute("stroke-width", 2);
+    svg.appendChild(dot);
+    const hit = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    hit.setAttribute("cx", xPos(p.x)); hit.setAttribute("cy", yPos(p.y)); hit.setAttribute("r", 9);
+    hit.setAttribute("fill", "transparent");
+    hit.addEventListener("mousemove", e => showTip(e, p.label));
+    hit.addEventListener("mouseleave", hideTip);
+    svg.appendChild(hit);
+  }
+}
+function legend(parent, entries) {
+  const el = document.createElement("div");
+  el.className = "legend";
+  el.innerHTML = entries.map(([l, c]) =>
+    `<span><span class="chip" style="background:${css(c)}"></span>${l}</span>`).join("");
+  parent.appendChild(el);
+}
+function table(parent, headers, rows, numericFrom = 1, nameColumns = []) {
+  if (!rows.length) { parent.insertAdjacentHTML("beforeend", '<div class="empty">Nothing recorded yet.</div>'); return; }
+  const head = headers.map((h,i) =>
+    `<th${i >= numericFrom && !nameColumns.includes(i) ? ' class="num"' : ""}>${h}</th>`).join("");
+  const body = rows.map(r => "<tr>" + r.map((c,i) =>
+    nameColumns.includes(i)
+      ? `<td class="name" title="${String(c).replace(/"/g,"&quot;")}"><span>${c}</span></td>`
+      : `<td${i >= numericFrom ? ' class="num"' : ""}>${c}</td>`).join("") + "</tr>").join("");
+  parent.insertAdjacentHTML("beforeend",
+    `<div class="scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`);
+}
+
+async function get(path) {
+  const headers = {};
+  const token = tokenInput.value.trim();
+  if (token) headers.Authorization = "Bearer " + token;
+  const response = await fetch(path, { headers });
+  if (response.status === 401) throw new Error("unauthorized — enter the server token above");
+  if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
+  return response.json();
+}
+
+async function load() {
+  app.innerHTML = "";
+  status.textContent = "loading…";
+  const days = Math.max(1, Math.min(365, Number(daysInput.value) || 30));
+  const [stats, slowest, builds] = await Promise.all([
+    get(`/v1/stats?days=${days}`),
+    get(`/v1/targets/slowest?days=${days}&limit=15`),
+    get(`/v1/builds?limit=100`),
+  ]);
+
+  { // Headline numbers
+    const el = card("Fleet", `Across the last ${days} day(s)`);
+    const items = stats.items || [];
+    const totalBuilds = items.reduce((sum, i) => sum + i.builds, 0);
+    const machines = Math.max(0, ...items.map(i => i.machines));
+    const latest = items.at(-1);
+    el.insertAdjacentHTML("beforeend", `<div class="tiles">
+      <div class="tile"><div class="value">${totalBuilds}</div><div class="label">builds</div></div>
+      <div class="tile"><div class="value">${machines}</div><div class="label">machines</div></div>
+      <div class="tile"><div class="value">${latest ? fmtS(latest.p50) : "–"}</div><div class="label">median, latest day</div></div>
+      <div class="tile"><div class="value">${latest ? fmtS(latest.p95) : "–"}</div><div class="label">p95, latest day</div></div>
+    </div>`);
+  }
+  { // Duration trend per day
+    const el = card("Build duration by day", "Median and p95 across every machine reporting");
+    const byProject = {};
+    for (const item of stats.items || []) (byProject[item.project] ||= []).push(item);
+    const project = Object.keys(byProject)[0];
+    const rows = byProject[project] || [];
+    const mk = (key, colorVar) => ({
+      colorVar,
+      points: rows.filter(r => r[key] != null).map(r => ({
+        x: r.day, y: r[key],
+        label: `<b>${r.day}</b><br>${key}: ${fmtS(r[key])}<br><span class="k">builds:</span> ${r.builds} on ${r.machines} machine(s)`,
+      })),
+    });
+    lineChart(el, [mk("p50", "--series-1"), mk("p95", "--series-2")], { yFormat: v => v.toFixed(0) + "s" });
+    if (rows.length) legend(el, [["p50 (median)", "--series-1"], ["p95", "--series-2"]]);
+    if (project) el.insertAdjacentHTML("beforeend", `<p class="hint" style="margin:8px 0 0">${project}</p>`);
+  }
+  { // Builds per day
+    const el = card("Builds per day", "Volume and how many machines contributed");
+    const rows = stats.items || [];
+    lineChart(el, [{ colorVar: "--series-3", points: rows.map(r => ({
+      x: r.day, y: r.builds,
+      label: `<b>${r.day}</b><br>${r.builds} builds<br><span class="k">machines:</span> ${r.machines}`,
+    })) }]);
+  }
+  {
+    const el = card("Slowest targets, fleet-wide", "Averaged across all reporting machines");
+    table(el, ["Target", "Observations", "Avg", "Max"],
+      (slowest.items || []).map(t => [t.name, t.observations, fmtS(t.avg_seconds), fmtS(t.max_seconds)]),
+      1, [0]);
+  }
+  {
+    const el = card("Recent builds", "Most recently received");
+    table(el, ["Project", "Day", "Category", "Duration", "Machine", "Xcode", "Arch"],
+      (builds.items || []).slice(0, 25).map(b => [
+        b.project, b.day, b.category, fmtS(b.total_seconds),
+        b.machine_id ? b.machine_id.replace("machine-", "").slice(0, 8) : "anonymous",
+        b.xcode_version || "–", b.architecture || "–",
+      ]), 3);
+  }
+  {
+    const el = card("Per-day detail", "Every day in range");
+    table(el, ["Project", "Day", "Builds", "Machines", "p50", "p95"],
+      (stats.items || []).slice().reverse().map(i =>
+        [i.project, i.day, i.builds, i.machines, fmtS(i.p50), fmtS(i.p95)]), 2);
+  }
+  status.textContent = "";
+}
+
+function refresh() {
+  localStorage.setItem("buildlens-token", tokenInput.value.trim());
+  load().catch(error => {
+    status.textContent = "";
+    app.innerHTML = `<div class="card"><h2>Could not load</h2><p class="hint">${error.message}</p></div>`;
+  });
+}
+tokenInput.addEventListener("change", refresh);
+daysInput.addEventListener("change", refresh);
+refresh();
+</script>
