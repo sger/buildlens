@@ -53,6 +53,7 @@ pub(crate) mod tests {
             build_id: None,
             source_log: None,
             project: None,
+            scheme: None,
             source_kind: MetricsSourceKind::Xcactivitylog,
             category: BuildCategory::Incremental,
             compiled_count: 10,

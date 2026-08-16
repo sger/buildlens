@@ -102,6 +102,17 @@ impl PostgresStore {
             tx.commit()?;
             return Ok(false);
         }
+        // Set apart from `insert_wire`: `WireBuild` deliberately omits the
+        // scheme, since a team server has no use for it and it names a
+        // developer's local configuration. A locally collected build records
+        // it because the dashboard's build list shows it.
+        if let Some(scheme) = metrics.scheme.as_deref() {
+            tx.execute(
+                "UPDATE builds SET scheme = $3 WHERE day = to_date($1,'YYYY-MM-DD') AND build_key = $2",
+                &[&day, &key, &scheme],
+            )
+            .map_err(|source| StoreError::Query { operation: "recording the scheme", source })?;
+        }
 
         // Slowest files first, so the cap keeps the rows that matter.
         let mut files: Vec<_> = metrics.files.iter().collect();
@@ -164,30 +175,58 @@ impl PostgresStore {
     /// The dashboard build list. `status` and the diagnostic counts come from the
     /// stored columns: hardcoding "succeeded" here painted every failed build
     /// green, which is exactly what the failed-build column exists to show.
-    pub fn dashboard_snapshot(&mut self) -> Result<Value, StoreError> { let rows=self.client.query("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate,status,error_count,warning_count FROM builds ORDER BY received_at DESC LIMIT 100",&[])?; Ok(serde_json::json!({"builds":rows.iter().map(|r|serde_json::json!({"id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"project":r.get::<_,String>(2),"category":r.get::<_,String>(3),"total_seconds":r.get::<_,f64>(4),"status":r.get::<_,Option<String>>(6),"raw_warnings":r.get::<_,i32>(8),"errors":r.get::<_,i32>(7),"cache_hit_rate":r.get::<_,Option<f64>>(5)})).collect::<Vec<_>>() })) }
+    pub fn dashboard_snapshot(&mut self) -> Result<Value, StoreError> { let rows=self.client.query("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate,status,error_count,warning_count,scheme FROM builds ORDER BY received_at DESC LIMIT 100",&[])?; Ok(serde_json::json!({"builds":rows.iter().map(|r|serde_json::json!({"id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"project":r.get::<_,String>(2),"category":r.get::<_,String>(3),"total_seconds":r.get::<_,f64>(4),"status":r.get::<_,Option<String>>(6),"raw_warnings":r.get::<_,i32>(8),"errors":r.get::<_,i32>(7),"cache_hit_rate":r.get::<_,Option<f64>>(5),"scheme":r.get::<_,Option<String>>(9)})).collect::<Vec<_>>() })) }
     pub fn duration_trend_for(&mut self, limit:i64, project:Option<&str>) -> Result<Value,StoreError> { let rows=if let Some(project)=project {self.client.query("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate FROM builds WHERE project=$1 ORDER BY received_at DESC LIMIT $2",&[&project,&limit])?} else {self.client.query("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate FROM builds ORDER BY received_at DESC LIMIT $1",&[&limit])?}; Ok(serde_json::json!({"items":rows.iter().rev().map(|r|serde_json::json!({"id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"project":r.get::<_,String>(2),"category":r.get::<_,String>(3),"total_seconds":r.get::<_,f64>(4),"cache_hit_rate":r.get::<_,Option<f64>>(5)})).collect::<Vec<_>>() })) }
 
-    /// One build with its targets, phases and collected metadata — the detail
-    /// view a developer opens after spotting a slow build in the trend.
+    /// One build with everything recorded about it — the detail view a
+    /// developer opens after spotting a slow or failed build in the trend.
+    ///
+    /// Returns per-build files, Swift type-check timings, diagnostics and test
+    /// results alongside targets and phases. The Performance tab shows the same
+    /// dimensions averaged over many builds, which is the right shape for a
+    /// trend and the wrong shape for a diagnosis: an average hides the one file
+    /// that regressed today, and a failed build's error does not appear in it
+    /// at all.
     ///
     /// `Ok(None)` for an unknown key rather than an error: "no such build" is
     /// a normal answer to a stale dashboard link, and a caller should not have
     /// to read error text to tell it apart from a real database failure.
     pub fn build_snapshot(&mut self, key:&str) -> Result<Option<Value>,StoreError> {
-        let Some(r)=self.client.query_opt("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate,compiled_count,machine_id,xcode_version,platform,architecture,status,error_count,warning_count FROM builds WHERE build_key=$1",&[&key])? else {
+        let Some(r)=self.client.query_opt("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate,compiled_count,machine_id,xcode_version,platform,architecture,status,error_count,warning_count,scheme FROM builds WHERE build_key=$1",&[&key])? else {
             return Ok(None);
         };
         let targets=self.client.query("SELECT name,seconds,category,fetched_from_cache,compiled_count FROM build_targets WHERE build_key=$1 ORDER BY seconds DESC LIMIT 100",&[&key])?;
         let phases=self.client.query("SELECT name,seconds FROM build_phases WHERE build_key=$1 ORDER BY seconds DESC LIMIT 50",&[&key])?;
         let metadata=self.client.query("SELECT key,value FROM build_metadata WHERE build_key=$1 ORDER BY key",&[&key])?;
+        let files=self.client.query("SELECT file,target,seconds,occurrences,step_type FROM build_files WHERE build_key=$1 ORDER BY seconds DESC LIMIT 50",&[&key])?;
+        let swift=self.client.query("SELECT file,line,symbol,kind,milliseconds,target FROM build_swift_timings WHERE build_key=$1 ORDER BY milliseconds DESC LIMIT 50",&[&key])?;
+        // Errors before warnings: a failed build's reason is the first thing
+        // this page has to answer, and ordering by occurrences alone can bury
+        // a single fatal error under a repeated warning.
+        let diagnostics=self.client.query(
+            "SELECT fingerprint,severity,category,message,file,line,target,occurrences FROM build_diagnostics WHERE build_key=$1
+             ORDER BY (severity='error') DESC,occurrences DESC LIMIT 50",&[&key])?;
+        // Failures first for the same reason, then slowest.
+        let tests=self.client.query(
+            "SELECT suite,name,status,seconds,message FROM build_tests WHERE build_key=$1
+             ORDER BY (status='failed') DESC,seconds DESC NULLS LAST LIMIT 50",&[&key])?;
+        let test_totals=self.client.query_one(
+            "SELECT COUNT(*)::bigint,
+                    COUNT(*) FILTER (WHERE status='failed')::bigint,
+                    COALESCE(SUM(seconds),0.0) FROM build_tests WHERE build_key=$1",&[&key])?;
         Ok(Some(serde_json::json!({
             "id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"project":r.get::<_,String>(2),"category":r.get::<_,String>(3),
             "total_seconds":r.get::<_,f64>(4),"cache_hit_rate":r.get::<_,Option<f64>>(5),"compiled_count":r.get::<_,i32>(6),
             "machine_id":r.get::<_,Option<String>>(7),"xcode_version":r.get::<_,Option<String>>(8),"platform":r.get::<_,Option<String>>(9),
-            "architecture":r.get::<_,Option<String>>(10),"status":r.get::<_,Option<String>>(11),"errors":r.get::<_,i32>(12),"raw_warnings":r.get::<_,i32>(13),
+            "architecture":r.get::<_,Option<String>>(10),"status":r.get::<_,Option<String>>(11),"errors":r.get::<_,i32>(12),"raw_warnings":r.get::<_,i32>(13),"scheme":r.get::<_,Option<String>>(14),
             "targets":targets.iter().map(|t|serde_json::json!({"name":t.get::<_,String>(0),"seconds":t.get::<_,f64>(1),"category":t.get::<_,String>(2),"fetched_from_cache":t.get::<_,bool>(3),"compiled_count":t.get::<_,i32>(4)})).collect::<Vec<_>>(),
             "phases":phases.iter().map(|p|serde_json::json!({"name":p.get::<_,String>(0),"seconds":p.get::<_,f64>(1)})).collect::<Vec<_>>(),
             "metadata":metadata.iter().map(|m|(m.get::<_,String>(0),Value::String(m.get::<_,String>(1)))).collect::<serde_json::Map<_,_>>(),
+            "files":files.iter().map(|f|serde_json::json!({"file":f.get::<_,String>(0),"target":f.get::<_,Option<String>>(1),"seconds":f.get::<_,f64>(2),"compilations":f.get::<_,i32>(3),"step_type":f.get::<_,String>(4)})).collect::<Vec<_>>(),
+            "swift":swift.iter().map(|s|serde_json::json!({"file":s.get::<_,String>(0),"line":s.get::<_,i32>(1),"symbol":s.get::<_,Option<String>>(2),"kind":s.get::<_,String>(3),"milliseconds":s.get::<_,f64>(4),"target":s.get::<_,Option<String>>(5)})).collect::<Vec<_>>(),
+            "diagnostics":diagnostics.iter().map(|d|serde_json::json!({"fingerprint":d.get::<_,String>(0),"severity":d.get::<_,String>(1),"category":d.get::<_,String>(2),"message":d.get::<_,String>(3),"file":d.get::<_,Option<String>>(4),"line":d.get::<_,Option<i32>>(5),"target":d.get::<_,Option<String>>(6),"occurrences":d.get::<_,i32>(7)})).collect::<Vec<_>>(),
+            "tests":tests.iter().map(|t|serde_json::json!({"suite":t.get::<_,String>(0),"test":t.get::<_,String>(1),"status":t.get::<_,String>(2),"seconds":t.get::<_,Option<f64>>(3),"message":t.get::<_,Option<String>>(4)})).collect::<Vec<_>>(),
+            "test_totals":serde_json::json!({"total":test_totals.get::<_,i64>(0),"failed":test_totals.get::<_,i64>(1),"seconds":test_totals.get::<_,f64>(2)}),
         })))
     }
 

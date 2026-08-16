@@ -230,6 +230,7 @@ mod tests {
             build_id: Some("sha:abc".into()),
             source_log: Some("/Users/someone/DerivedData/App-x/Logs/Build/a.xcactivitylog".into()),
             project: None,
+            scheme: None,
             source_kind: MetricsSourceKind::Xcactivitylog,
             category: BuildCategory::Clean,
             compiled_count: 10,

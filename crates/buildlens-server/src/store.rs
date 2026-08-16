@@ -99,7 +99,8 @@ impl PostgresStore {
             ALTER TABLE builds ADD COLUMN IF NOT EXISTS warning_count INTEGER NOT NULL DEFAULT 0;
             -- Nullable: a text log states no verdict, and NULL must read as
             -- unknown rather than as success.
-            ALTER TABLE builds ADD COLUMN IF NOT EXISTS status TEXT;",
+            ALTER TABLE builds ADD COLUMN IF NOT EXISTS status TEXT;
+            ALTER TABLE builds ADD COLUMN IF NOT EXISTS scheme TEXT;",
         )?;
         Ok(())
     }

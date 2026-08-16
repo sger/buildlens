@@ -63,6 +63,7 @@ fn metrics(id: &str, seconds: f64, started_at: f64) -> BuildMetrics {
         build_id: Some(id.into()),
         source_log: Some("<home>/DerivedData/App-x/Logs/Build/a.xcactivitylog".into()),
         project: Some("App".into()),
+        scheme: None,
         source_kind: MetricsSourceKind::Xcactivitylog,
         category: BuildCategory::Clean,
         compiled_count: 10,
@@ -169,6 +170,107 @@ fn saves_a_build_with_all_its_local_detail() {
     // Collected metadata must survive as a keyed object, not a flat list —
     // the detail page renders it by key.
     assert_eq!(snapshot["metadata"]["git.branch"], "main");
+}
+
+/// The detail page has to answer "why was *this* build slow, and why did it
+/// fail" without leaving the page. The Performance tab averages these same
+/// dimensions across many builds, which hides both answers, so the snapshot
+/// must carry the per-build rows too.
+#[test]
+fn a_build_snapshot_carries_its_files_hotspots_diagnostics_and_tests() {
+    let Some(mut store) = connect("detail_rows") else { return };
+    assert!(store.save_analysis(&analysis("d1", 100.0, 1_700_000_000.0), "App", None, false).unwrap());
+
+    let snapshot = store.build_snapshot("d1").unwrap().expect("build exists");
+
+    let files = snapshot["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["file"], "<repo>/Sources/Slow.swift");
+    assert_eq!(files[0]["target"], "Core");
+
+    // The type-check hotspots the -warn-long-* flags produce. Milliseconds,
+    // not seconds: these are per-function, and rounding them to seconds would
+    // collapse every hotspot to 0.
+    let swift = snapshot["swift"].as_array().expect("swift array");
+    assert_eq!(swift.len(), 1);
+    assert_eq!(swift[0]["symbol"], "slowFunction()");
+    assert_eq!(swift[0]["milliseconds"], 900.0);
+    assert_eq!(swift[0]["line"], 42);
+
+    let diagnostics = snapshot["diagnostics"].as_array().expect("diagnostics array");
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["severity"], "warning");
+    assert_eq!(diagnostics[0]["occurrences"], 3);
+    assert_eq!(diagnostics[0]["message"], "non-sendable type crosses actor boundary");
+
+    let tests = snapshot["tests"].as_array().expect("tests array");
+    assert_eq!(tests.len(), 1);
+    assert_eq!(tests[0]["suite"], "CoreTests");
+    assert_eq!(tests[0]["status"], "failed");
+    assert_eq!(tests[0]["message"], "boom");
+
+    // Totals are computed over every stored row, not over the 50 returned, so
+    // a build with hundreds of tests still reports an honest failure count.
+    assert_eq!(snapshot["test_totals"]["total"], 1);
+    assert_eq!(snapshot["test_totals"]["failed"], 1);
+}
+
+/// A build with nothing recorded in these dimensions must return empty arrays
+/// rather than null. The UI maps over them, and a null renders as a crash
+/// instead of an empty state.
+#[test]
+fn absent_detail_rows_are_empty_arrays_not_null() {
+    let Some(mut store) = connect("detail_empty") else { return };
+    let mut bare = BuildAnalysis {
+        metrics: Some(metrics("d2", 10.0, 1_700_000_000.0)),
+        ..Default::default()
+    };
+    bare.metrics.as_mut().unwrap().files.clear();
+    bare.metrics.as_mut().unwrap().swift_timings.clear();
+    assert!(store.save_analysis(&bare, "App", None, false).unwrap());
+
+    let snapshot = store.build_snapshot("d2").unwrap().expect("build exists");
+    for key in ["files", "swift", "diagnostics", "tests"] {
+        assert_eq!(snapshot[key].as_array().map(Vec::len), Some(0), "{key} should be an empty array");
+    }
+    assert_eq!(snapshot["test_totals"]["failed"], 0);
+}
+
+/// A failed build's error must not sit below a repeated warning: the reason
+/// the build failed is the first thing the page has to answer.
+#[test]
+fn errors_are_ordered_ahead_of_more_frequent_warnings() {
+    let Some(mut store) = connect("detail_severity") else { return };
+    let mut mixed = analysis("d3", 100.0, 1_700_000_000.0);
+    mixed.diagnostics.diagnostics = vec![
+        DiagnosticAggregate {
+            fingerprint: "warn:many".into(),
+            severity: DiagnosticSeverity::Warning,
+            category: DiagnosticCategory::SwiftConcurrency,
+            occurrences: 99,
+            example: DiagnosticExample {
+                file: None, line: None, column: None,
+                message: "a very repetitive warning".into(),
+                target: None,
+            },
+        },
+        DiagnosticAggregate {
+            fingerprint: "err:one".into(),
+            severity: DiagnosticSeverity::Error,
+            category: DiagnosticCategory::Unknown,
+            occurrences: 1,
+            example: DiagnosticExample {
+                file: None, line: None, column: None,
+                message: "the single reason the build failed".into(),
+                target: None,
+            },
+        },
+    ];
+    assert!(store.save_analysis(&mixed, "App", None, false).unwrap());
+
+    let snapshot = store.build_snapshot("d3").unwrap().expect("build exists");
+    let diagnostics = snapshot["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics[0]["severity"], "error", "the error must come first despite occurring 1× to the warning's 99×");
 }
 
 /// Re-collecting the same activity log must not double-count it. The whole

@@ -2,6 +2,22 @@
 pub struct IdeActivityLog {
     pub version: u64,
     pub main_section: Option<IdeSection>,
+    /// Toolchain facts scraped from compiler invocations while parsing.
+    ///
+    /// Collected during the parse rather than from a retained
+    /// `command_detail_desc`, because those strings are dropped unless
+    /// `--detail full` — and the environment is wanted at every detail level.
+    /// Only the extracted values are kept, never the invocation itself, which
+    /// would carry source paths.
+    pub toolchain: Toolchain,
+}
+
+/// Xcode version, SDK and architecture, as named by the commands the build ran.
+#[derive(Debug, Default, Clone)]
+pub struct Toolchain {
+    pub xcode_version: Option<String>,
+    pub sdk: Option<String>,
+    pub architecture: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]

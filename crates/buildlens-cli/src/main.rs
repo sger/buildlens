@@ -1041,6 +1041,21 @@ fn reject_unusable_metrics(
                 .unwrap_or_else(|| "no work".into())
         );
     }
+    // A partial decode is not a timing problem, so the "still being written"
+    // advice would send the reader down the wrong path: the file is complete
+    // and BuildLens could not read all of it. Say so, and say what survived,
+    // because the fragment is the evidence for a bug report.
+    if metrics.decoded_partially() {
+        bail!(
+            "{} decoded only partially ({}), leaving {} phase(s), no targets and nothing \
+             compiled. That fragment is not a build, and recording it would put a near-empty \
+             row next to the same build collected from a complete log. This is a parser gap \
+             rather than a problem with your build — please report the log.",
+            log.display(),
+            metrics.warnings.join("; "),
+            metrics.phases.len()
+        );
+    }
     let detail = if metrics.warnings.is_empty() {
         "no build sections were found".to_owned()
     } else {

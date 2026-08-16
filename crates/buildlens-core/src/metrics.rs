@@ -186,6 +186,10 @@ pub struct BuildMetrics {
     /// stays zero-config.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// The scheme this build ran, from the activity log's preparation section
+    /// (`Workspace X | Scheme Y | Destination Z`). `None` for text logs and
+    /// for logs that never named one.
+    pub scheme: Option<String>,
     pub source_kind: MetricsSourceKind,
     pub category: BuildCategory,
     pub compiled_count: usize,
@@ -246,6 +250,7 @@ impl BuildMetrics {
             build_id: None,
             source_log: None,
             project: None,
+            scheme: None,
             source_kind,
             category: BuildCategory::Unknown,
             compiled_count: 0,
@@ -292,10 +297,36 @@ impl BuildMetrics {
         if !self.files.is_empty() || !self.swift_timings.is_empty() {
             return true;
         }
-        if self.timed_no_work() {
+        if self.timed_no_work() || self.decoded_partially() {
             return false;
         }
         self.total_seconds.is_some() && (!self.targets.is_empty() || !self.phases.is_empty())
+    }
+
+    /// True for a log whose decode aborted partway and left only a fragment.
+    ///
+    /// An activity log is parsed sequentially, so an unrecognized record stops
+    /// the parse and keeps whatever preceded it. That fragment can still look
+    /// plausible: an `IDELogDocumentLocation` 478 bytes into a 52KB log left a
+    /// real build reporting one phase, no targets, no files and a duration —
+    /// enough to satisfy every other check here. It was stored keyed by a
+    /// content hash (no id had been read yet) and appeared in the dashboard as
+    /// a second, near-empty row beside the same build collected from a log
+    /// Xcode wrote differently.
+    ///
+    /// The parser records the abort in `warnings`, so a partial decode is
+    /// detectable rather than a matter of guessing from the shape. Requiring
+    /// evidence of compilation is what separates a fragment from a genuine
+    /// phase-only log, which `-showBuildTimingSummary` text logs legitimately
+    /// are.
+    pub fn decoded_partially(&self) -> bool {
+        const ABORTED: &[&str] = &["keeping partial result", "truncated", "unknown SLF"];
+        self.targets.is_empty()
+            && self.files.is_empty()
+            && self.compiled_count == 0
+            && self.warnings.iter().any(|warning| {
+                ABORTED.iter().any(|marker| warning.contains(marker))
+            })
     }
 
     /// True for a log that timed something other than a build: `xcodebuild
@@ -416,4 +447,94 @@ pub struct MetricRegression {
     pub caveats: Vec<RegressionCaveat>,
     /// Human-readable explanation. Never parsed.
     pub reason: String,
+}
+
+#[cfg(test)]
+mod usability_tests {
+    use super::*;
+
+    /// The shape a build has after its parse aborted: a duration, whatever
+    /// phase happened to precede the failure, and nothing else.
+    fn partial(warning: &str) -> BuildMetrics {
+        let mut metrics =
+            BuildMetrics::empty(MetricsSourceKind::Xcactivitylog, vec![warning.to_owned()]);
+        metrics.total_seconds = Some(5.4);
+        metrics.phases = vec![PhaseMetric {
+            name: "Resolving package dependencies".into(),
+            seconds: 5.4,
+            started_at: None,
+            ended_at: None,
+        }];
+        metrics
+    }
+
+    /// The bug this guards: an `IDELogDocumentLocation` 478 bytes into a real
+    /// 52KB log left exactly this shape. It has a duration and a phase, so
+    /// every other check passed, and it reached the dashboard as a near-empty
+    /// row beside the same build read from a log Xcode wrote differently.
+    #[test]
+    fn a_fragment_from_an_aborted_parse_is_not_a_usable_build() {
+        let metrics = partial("unknown SLF location class 'IDELogDocumentLocation' at byte 478; keeping partial result");
+        assert!(metrics.decoded_partially());
+        assert!(!metrics.is_usable(), "a one-phase fragment is not a build");
+        // Not the clean-log case: that message would misdirect the reader.
+        assert!(!metrics.timed_no_work());
+    }
+
+    /// A complete parse that merely warned about something must still count.
+    /// Warnings are common and mostly benign; only the abort markers mean the
+    /// decode stopped early.
+    #[test]
+    fn an_unrelated_warning_does_not_condemn_a_build() {
+        let mut metrics = partial("redacted 3 absolute paths");
+        metrics.targets = vec![TargetMetric {
+            fingerprint: "f".into(),
+            name: "App".into(),
+            seconds: 5.0,
+            started_at: None,
+            ended_at: None,
+            fetched_from_cache: false,
+            category: BuildCategory::Clean,
+            compiled_count: 12,
+            steps: Vec::new(),
+        }];
+        metrics.compiled_count = 12;
+        assert!(!metrics.decoded_partially());
+        assert!(metrics.is_usable());
+    }
+
+    /// Evidence of compilation outranks the warning: a log that aborted near
+    /// its end still measured real work, and discarding it would lose a build
+    /// that was almost entirely readable.
+    #[test]
+    fn an_abort_after_real_work_still_yields_a_build() {
+        let mut metrics = partial("log truncated; keeping partial result");
+        metrics.compiled_count = 274;
+        metrics.files = vec![FileMetric {
+            file: "App.swift".into(),
+            seconds: 1.0,
+            target: Some("App".into()),
+            step_type: "swiftCompilation".into(),
+            architecture: None,
+            occurrences: 1,
+        }];
+        assert!(!metrics.decoded_partially(), "real measurements were recorded");
+        assert!(metrics.is_usable());
+    }
+
+    /// A phase-only text log is legitimate: `-showBuildTimingSummary` reports
+    /// phases without targets, and that must not be mistaken for a fragment.
+    #[test]
+    fn a_phase_only_text_log_is_still_usable() {
+        let mut metrics = BuildMetrics::empty(MetricsSourceKind::XcodebuildText, Vec::new());
+        metrics.total_seconds = Some(42.0);
+        metrics.phases = vec![PhaseMetric {
+            name: "Compile Swift source files".into(),
+            seconds: 42.0,
+            started_at: None,
+            ended_at: None,
+        }];
+        assert!(!metrics.decoded_partially());
+        assert!(metrics.is_usable());
+    }
 }

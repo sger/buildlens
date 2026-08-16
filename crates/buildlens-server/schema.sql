@@ -28,6 +28,7 @@ ALTER TABLE builds ADD COLUMN IF NOT EXISTS warning_count INTEGER NOT NULL DEFAU
 -- rather than as success.
 ALTER TABLE builds ADD COLUMN IF NOT EXISTS status TEXT;
 
+
 -- Local-only detail below. A team server never receives these rows: source
 -- paths and per-file timings expose a repository's layout, which is exactly
 -- why `buildlens_core::wire::WireBuild` omits them. Writing them here is safe
@@ -67,6 +68,9 @@ ALTER TABLE builds ADD COLUMN IF NOT EXISTS warning_count INTEGER NOT NULL DEFAU
 -- Xcode's own verdict. Nullable: a text log never states one, and NULL must
 -- read as unknown rather than as success.
 ALTER TABLE builds ADD COLUMN IF NOT EXISTS status TEXT;
+-- The scheme a build ran, from the activity log's preparation section. Absent
+-- for text logs, which never name one.
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS scheme TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_files_file ON build_files (file);
 CREATE INDEX IF NOT EXISTS idx_swift_file ON build_swift_timings (file);

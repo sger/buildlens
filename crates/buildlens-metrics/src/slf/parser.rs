@@ -1,5 +1,5 @@
 use super::lexer::{Lexer, Token};
-use super::model::{DvtLocation, IdeActivityLog, IdeMessage, IdeSection};
+use super::model::{DvtLocation, IdeActivityLog, IdeMessage, IdeSection, Toolchain};
 
 const SECTION_CLASSES: &[&str] = &[
     "IDEActivityLogSection",
@@ -26,6 +26,13 @@ pub struct ParseOptions {
     pub keep_text: bool,
 }
 
+/// The text between two markers, when both are present in order.
+fn between<'t>(haystack: &'t str, start: &str, end: &str) -> Option<&'t str> {
+    let after = haystack.split_once(start)?.1;
+    let value = after.split_once(end)?.0;
+    (!value.is_empty()).then_some(value)
+}
+
 pub fn parse(bytes: &[u8], options: &ParseOptions) -> (IdeActivityLog, Vec<String>) {
     let mut log = IdeActivityLog::default();
     let mut lexer = match Lexer::new(bytes) {
@@ -41,6 +48,7 @@ pub fn parse(bytes: &[u8], options: &ParseOptions) -> (IdeActivityLog, Vec<Strin
         version: 0,
         is_command_line_log: false,
         peeked: None,
+        toolchain: Toolchain::default(),
     };
     log.version = parser.read_int().unwrap_or(0);
     if log.version > MAX_KNOWN_VERSION {
@@ -51,6 +59,7 @@ pub fn parse(bytes: &[u8], options: &ParseOptions) -> (IdeActivityLog, Vec<Strin
     }
     parser.version = log.version;
     log.main_section = parser.read_section();
+    log.toolchain = parser.toolchain;
     let warnings = parser.warnings;
     (log, warnings)
 }
@@ -65,9 +74,40 @@ struct Parser<'a, 'b> {
     version: u64,
     is_command_line_log: bool,
     peeked: Option<Token<'a>>,
+    toolchain: Toolchain,
 }
 
 impl<'a> Parser<'a, '_> {
+    /// Records toolchain facts named by a compiler invocation.
+    ///
+    /// Xcode never states its own version, SDK or architecture as a field; the
+    /// only place they appear is inside the commands it ran. Each is taken
+    /// from the first invocation that names it — every step in one build shares
+    /// a toolchain — so this costs one scan of a few early strings, not a scan
+    /// of the whole log.
+    ///
+    /// Only the extracted values are kept. The invocation itself carries source
+    /// paths and never leaves this function.
+    fn note_toolchain(&mut self, detail: &str) {
+        if self.toolchain.xcode_version.is_none()
+            && let Some(version) = between(detail, "/Applications/Xcode-", ".app")
+        {
+            self.toolchain.xcode_version = Some(version.to_owned());
+        }
+        if self.toolchain.sdk.is_none()
+            && let Some(sdk) = detail
+                .rsplit_once(".sdk")
+                .and_then(|(before, _)| before.rsplit('/').next())
+        {
+            self.toolchain.sdk = Some(sdk.to_owned());
+        }
+        if self.toolchain.architecture.is_none()
+            && let Some(arch) = between(detail, "-target ", "-apple")
+        {
+            self.toolchain.architecture = Some(arch.to_owned());
+        }
+    }
+
     fn fail(&mut self, reason: String) {
         if !self.fatal {
             self.fatal = true;
@@ -228,6 +268,9 @@ impl<'a> Parser<'a, '_> {
         section.subtitle = self.read_string_after_optional_int().unwrap_or_default();
         section.location = self.read_location();
         let command_detail = self.read_string();
+        if let Some(detail) = command_detail.as_deref() {
+            self.note_toolchain(detail);
+        }
         section.command_detail_desc = if self.keep_text { command_detail } else { None };
         section.unique_identifier = self.read_string().unwrap_or_default();
         section.localized_result_string = self.read_string().unwrap_or_default();
@@ -332,7 +375,18 @@ impl<'a> Parser<'a, '_> {
     fn read_location(&mut self) -> Option<DvtLocation> {
         let class_name = self.read_instance_class()?;
         let is_text = class_name == "DVTTextDocumentLocation";
-        if !is_text && class_name != "DVTDocumentLocation" {
+        // Every location class begins with a document URL and a timestamp; the
+        // text variant then adds line/column fields. `IDELogDocumentLocation`
+        // is what Xcode.app emits for a clickable `x-xcode-log://` link back
+        // into the log itself, and shares the plain two-field prefix.
+        //
+        // Rejecting it aborted the whole parse: one such record 478 bytes into
+        // a 52KB log left a build with no id, no scheme and no targets, which
+        // then landed in the dashboard as a content-hash-keyed phantom row
+        // next to the real build. An unrecognized location is not a reason to
+        // discard a build.
+        if !is_text && !matches!(class_name.as_str(), "DVTDocumentLocation" | "IDELogDocumentLocation")
+        {
             self.fail(format!("unknown SLF location class '{class_name}'"));
             return None;
         }
@@ -487,6 +541,100 @@ mod tests {
         assert!(log.main_section.unwrap().sub_sections[0].was_fetched_from_cache);
     }
 
+    /// A message body carrying one location record of the given class.
+    fn message_with_location(location_class: &str) -> String {
+        [
+            string("a message"), // title
+            string("a message"), // shortTitle
+            "0#".to_string(),    // timeEmitted
+            "0#".to_string(),    // rangeEndInSectionText
+            "0#".to_string(),    // rangeStartInSectionText
+            "-".to_string(),     // subMessages
+            "0#".to_string(),    // severity
+            "-".to_string(),     // type
+            // location: class registration, then url + timestamp
+            format!("{}%{}3@", location_class.len(), location_class),
+            string("x-xcode-log://ABC"),
+            double(2.0),
+            "-".to_string(), // categoryIdent
+            "-".to_string(), // secondaryLocations
+            "-".to_string(), // additionalDescription
+        ]
+        .concat()
+    }
+
+    /// A section whose only message carries `location_class`. Mirrors
+    /// [`section_body`] but with a populated `messages` field, since the
+    /// location that triggered the bug lives inside a message.
+    fn log_with_message_location(location_class: &str) -> String {
+        let body = [
+            "0#".to_string(),  // sectionType
+            string("domain"),  // domainType
+            string("Build App"), // title
+            string("Build App"), // signature
+            double(1.0),       // timeStartedRecording
+            double(3.5),       // timeStoppedRecording
+            "-".to_string(),   // subSections
+            "-".to_string(),   // text
+            // messages: one entry, registering the message class inline
+            format!(
+                "1({}%IDEActivityLogMessage2@{}",
+                "IDEActivityLogMessage".len(),
+                message_with_location(location_class)
+            ),
+            "0#".to_string(),  // wasCancelled
+            "0#".to_string(),  // isQuiet
+            "0#".to_string(),  // wasFetchedFromCache
+            "-".to_string(),   // subtitle
+            "-".to_string(),   // location
+            "-".to_string(),   // commandDetailDesc
+            string("UID"),     // uniqueIdentifier
+            "-".to_string(),   // localizedResultString
+            "-".to_string(),   // xcbuildSignature
+            "-".to_string(),   // attachments
+        ]
+        .concat();
+        format!("SLF012#21%IDEActivityLogSection1@{body}")
+    }
+
+    /// Xcode.app writes `IDELogDocumentLocation` for the clickable
+    /// `x-xcode-log://` links it puts in a build log; `xcodebuild` does not.
+    /// Rejecting the class aborted the parse at the first such record, which
+    /// turned a complete 52KB log of a real build into a one-phase fragment
+    /// that still passed the usability checks and reached the dashboard as a
+    /// near-empty duplicate row.
+    #[test]
+    fn xcode_app_log_locations_do_not_abort_the_parse() {
+        for class in ["DVTDocumentLocation", "IDELogDocumentLocation"] {
+            let input = log_with_message_location(class);
+            let (log, warnings) = parse(input.as_bytes(), &ParseOptions { keep_text: false });
+            assert_eq!(warnings, Vec::<String>::new(), "{class} produced warnings");
+            let main = log.main_section.unwrap_or_else(|| panic!("{class}: no main section"));
+            // The whole section must survive, not just the part before the
+            // location — that prefix is exactly what the bug left behind.
+            assert_eq!(main.unique_identifier, "UID", "{class}: parse stopped early");
+            assert_eq!(main.messages.len(), 1, "{class}: message lost");
+            assert_eq!(
+                main.messages[0].location.as_ref().map(|l| l.document_url.as_str()),
+                Some("x-xcode-log://ABC"),
+                "{class}: location not read"
+            );
+        }
+    }
+
+    /// A genuinely unknown location class must still be reported rather than
+    /// silently skipped: quietly mis-reading its fields would desync the
+    /// stream and corrupt everything after it.
+    #[test]
+    fn a_still_unknown_location_class_is_reported() {
+        let input = log_with_message_location("MysteryLocation");
+        let (_, warnings) = parse(input.as_bytes(), &ParseOptions { keep_text: false });
+        assert!(
+            warnings.iter().any(|w| w.contains("MysteryLocation")),
+            "expected a warning naming the class, got {warnings:?}"
+        );
+    }
+
     #[test]
     fn unknown_class_becomes_warning_not_panic() {
         let input = "SLF012#12%MysteryClass1@";
@@ -508,5 +656,31 @@ mod tests {
         assert!(!warnings.is_empty());
         let main = log.main_section.expect("partial main section survives");
         assert_eq!(main.sub_sections[0].title, "Build target Kept");
+    }
+}
+
+#[cfg(test)]
+mod toolchain_tests {
+    use super::between;
+
+    #[test]
+    fn extracts_text_between_two_markers() {
+        assert_eq!(between("a/Applications/Xcode-26.3.0.app/b", "/Applications/Xcode-", ".app"), Some("26.3.0"));
+        assert_eq!(between("-target arm64-apple-ios", "-target ", "-apple"), Some("arm64"));
+    }
+
+    /// A missing marker must yield nothing rather than the rest of the string,
+    /// which would put a whole compiler invocation into a version field.
+    #[test]
+    fn a_missing_marker_yields_nothing() {
+        assert_eq!(between("no markers here", "/Applications/Xcode-", ".app"), None);
+        assert_eq!(between("/Applications/Xcode-26.3.0", "/Applications/Xcode-", ".app"), None);
+        assert_eq!(between("", "a", "b"), None);
+    }
+
+    /// An empty span is not a value: `Xcode-.app` names no version.
+    #[test]
+    fn an_empty_span_is_not_a_value() {
+        assert_eq!(between("/Applications/Xcode-.app", "/Applications/Xcode-", ".app"), None);
     }
 }

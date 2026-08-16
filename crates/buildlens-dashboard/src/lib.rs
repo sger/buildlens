@@ -324,6 +324,31 @@ mod tests {
         }
     }
 
+    /// The sidebar's three views must be real routes, not decorative buttons.
+    ///
+    /// They shipped as `<button>` elements with no onClick: clicking did
+    /// nothing while looking interactive. Each is now a hash route, so this
+    /// checks the bundle carries all three plus the routing that reads them.
+    #[test]
+    fn every_sidebar_view_is_a_real_route() {
+        for tab in ["builds", "trends", "diagnostics"] {
+            assert!(
+                UI_SOURCE.contains(&format!("id:\"{tab}\"")),
+                "the UI source lost the {tab} view"
+            );
+            assert!(INDEX.contains(tab), "the bundle lost the {tab} view");
+        }
+        // A deep link like /#/trends reaches the server as "/", so the views
+        // only resolve while "/" keeps serving the app.
+        assert!(UI_SOURCE.contains("hashchange"), "views must react to hash changes");
+        // The nav must *call* openTab, not merely define it: the original bug
+        // was buttons that rendered fine and did nothing on click.
+        assert!(
+            UI_SOURCE.contains("onClick={()=>openTab("),
+            "the sidebar renders its views but never navigates to them"
+        );
+    }
+
     /// The bundle must announce that it is generated, or the first instinct on
     /// opening a 224KB HTML file in the Rust tree is to edit it — and the next
     /// build discards the change.

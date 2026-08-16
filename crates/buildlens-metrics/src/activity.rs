@@ -36,9 +36,43 @@ pub fn map(log: &IdeActivityLog, warnings: Vec<String>, options: &MapOptions) ->
     metrics.started_at = main.time_started.map(cf_to_unix);
     metrics.ended_at = main.time_stopped.map(cf_to_unix);
     metrics.total_seconds = duration(main);
+    (metrics.scheme, metrics.environment.platform) = scheme_and_destination(main);
+    // Scraped from compiler invocations during the parse; see
+    // `slf::Parser::note_toolchain`.
+    metrics.environment.xcode_version = log.toolchain.xcode_version.clone();
+    metrics.environment.sdk = log.toolchain.sdk.clone();
+    metrics.environment.architecture = log.toolchain.architecture.clone();
     collect(main, None, &mut metrics);
     finish(&mut metrics, options);
     metrics
+}
+
+/// The scheme and destination Xcode recorded for this build.
+///
+/// Both live in the subtitle of the XCBuild preparation section, formatted as
+/// `Workspace X | Scheme Y | Destination Z`. Nothing else in the log states the
+/// scheme, so without this the dashboard's scheme column is permanently empty.
+///
+/// Parsed by splitting on `|` and matching the label rather than by position:
+/// a build with no workspace omits that segment entirely, and a positional
+/// read would then report the scheme as the workspace.
+fn scheme_and_destination(main: &IdeSection) -> (Option<String>, Option<String>) {
+    fn labelled(subtitle: &str, label: &str) -> Option<String> {
+        subtitle
+            .split('|')
+            .filter_map(|part| part.trim().strip_prefix(label))
+            .map(|value| value.trim().to_owned())
+            .find(|value| !value.is_empty())
+    }
+    for section in &main.sub_sections {
+        if section.subtitle.contains("Scheme ") {
+            return (
+                labelled(&section.subtitle, "Scheme "),
+                labelled(&section.subtitle, "Destination "),
+            );
+        }
+    }
+    (None, None)
 }
 
 /// Xcode's verdict for the build, reduced to the bare word: "Build succeeded"
@@ -504,6 +538,43 @@ mod tests {
 
     /// The exact strings Xcode writes, verified against real logs: a failing
     /// sample-app build and the packagesbench fixture.
+    /// The scheme lives only in the preparation section's subtitle. Nothing
+    /// else in the log names it, so without this the dashboard's scheme column
+    /// is permanently empty.
+    #[test]
+    fn the_scheme_and_destination_come_from_the_preparation_subtitle() {
+        let mut main = IdeSection::default();
+        main.sub_sections.push(IdeSection {
+            subtitle: "Workspace TVToday | Scheme MyScheme | Destination iPhone 17 Pro".into(),
+            ..Default::default()
+        });
+        let (scheme, destination) = scheme_and_destination(&main);
+        assert_eq!(scheme.as_deref(), Some("MyScheme"));
+        assert_eq!(destination.as_deref(), Some("iPhone 17 Pro"));
+    }
+
+    /// A build with no workspace omits that segment, so reading by position
+    /// would report the scheme as the workspace.
+    #[test]
+    fn a_missing_workspace_segment_does_not_shift_the_scheme() {
+        let mut main = IdeSection::default();
+        main.sub_sections.push(IdeSection {
+            subtitle: "Scheme OnlyScheme | Destination My Mac".into(),
+            ..Default::default()
+        });
+        assert_eq!(scheme_and_destination(&main).0.as_deref(), Some("OnlyScheme"));
+    }
+
+    /// A log that never names a scheme reports none rather than an empty
+    /// string, which would render as a blank column that looks like data.
+    #[test]
+    fn a_log_without_a_scheme_reports_none() {
+        assert_eq!(scheme_and_destination(&IdeSection::default()), (None, None));
+        let mut main = IdeSection::default();
+        main.sub_sections.push(IdeSection { subtitle: "Prepare build".into(), ..Default::default() });
+        assert_eq!(scheme_and_destination(&main), (None, None));
+    }
+
     #[test]
     fn build_status_matches_xcodes_own_verdict() {
         assert_eq!(build_status("Build failed").as_deref(), Some("failed"));
@@ -605,6 +676,7 @@ mod tests {
 
     fn build(targets: Vec<IdeSection>) -> IdeActivityLog {
         IdeActivityLog {
+            toolchain: Default::default(),
             version: 12,
             main_section: Some(IdeSection {
                 title: "Build App".into(),
@@ -854,6 +926,7 @@ mod swift_timing_tests {
             })
             .collect();
         let log = IdeActivityLog {
+            toolchain: Default::default(),
             version: 12,
             main_section: Some(IdeSection {
                 title: "Build SlowApp".into(),

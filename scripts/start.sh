@@ -139,7 +139,10 @@ say "==> Dashboard on http://127.0.0.1:$PORT"
 echo $! >"$RUN_DIR/dashboard.pid"
 
 say "==> Watching $BUILD_DIR"
-./target/debug/buildlens collect --watch --collect-all \
+# --watch-interval 2 rather than the 5s default: this watcher exists so a build
+# shows up while you are still looking at the dashboard, and a scan is a cheap
+# directory stat.
+./target/debug/buildlens collect --watch --collect-all --watch-interval 2 \
   --build-dir "$BUILD_DIR" --db "$DB" >"$RUN_DIR/watcher.log" 2>&1 &
 echo $! >"$RUN_DIR/watcher.pid"
 
