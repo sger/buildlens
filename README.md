@@ -22,10 +22,11 @@ cargo test --workspace         # confirm the build is sound
 One binary, no services, nothing to configure. Copy `target/release/buildlens`
 onto your `PATH`, or run it through `cargo run --` as the examples below do.
 
-The dashboard UI is a React app bundled into a single HTML file that
-`buildlens-dashboard` embeds at compile time. The bundle is committed, so a
-plain `cargo build` needs no Node toolchain. Rebuild it only after editing
-`dashboard-ui/src`:
+The dashboard UI is a React app bundled into a single HTML file at
+`crates/buildlens-dashboard/assets/index.html`, which the crate embeds with
+`include_str!`. That bundle is generated output, committed so a plain
+`cargo build` needs no Node toolchain — do not edit it directly. Rebuild it
+after editing `dashboard-ui/src`:
 
 ```sh
 cd dashboard-ui && npm install && node build.mjs
