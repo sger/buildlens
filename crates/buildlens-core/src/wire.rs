@@ -1,0 +1,531 @@
+//! The exact payload BuildLens transmits when a team server is configured.
+//!
+//! This module is deliberately a separate, explicit type rather than a
+//! serialization of `BuildAnalysis`: what leaves a developer's machine should
+//! be reviewable in one file, and adding a field to the local model must never
+//! silently start transmitting it.
+//!
+//! Nothing here is sent unless the user passes `--server`.
+
+use crate::{BuildCategory, BuildMetrics};
+use serde::{Deserialize, Serialize};
+
+/// Bumped when the payload shape changes; the server rejects versions it does
+/// not understand rather than guessing.
+pub const WIRE_VERSION: u32 = 1;
+
+/// The `BuildMetrics::metrics_schema_version` this module was written against.
+///
+/// `WireBuild` reads fields out of `BuildMetrics` and republishes them under
+/// `WIRE_VERSION`. Those two versions are independent contracts, and nothing
+/// otherwise ties them together: if the local schema gains a field or changes
+/// what an existing one means, this module would keep transmitting the new
+/// semantics under the old wire version, and the server would misread them
+/// without any error.
+///
+/// [`WireBuild::from_metrics`] asserts against this, so bumping the local
+/// schema forces whoever bumps it to look at the wire format and decide
+/// whether `WIRE_VERSION` must move too.
+pub const SUPPORTED_METRICS_SCHEMA: u32 = 2;
+
+/// Cap on transmitted phases. Unlike targets, phases are a small fixed set
+/// Xcode itself defines (~10 per build), so this exists only to bound a
+/// malformed log — not to trade detail for payload size. It is deliberately
+/// not the caller's `max_targets`: sizing the payload down by target count
+/// must never silently cost half the phase breakdown.
+pub const MAX_PHASES: usize = 64;
+
+/// Xcode's own verdict for a build, as a closed set.
+///
+/// [`BuildMetrics::status`] holds this as a raw `String` because that is what
+/// the activity log's sanitizer produces. Here it is an enum: the wire is a
+/// boundary between two deployables, so a value the server cannot interpret
+/// should be rejected while deserializing rather than stored and puzzled over
+/// later.
+///
+/// There is deliberately no `Unknown` variant — "we do not know" is
+/// represented by `Option::None` on the field, so an unparseable status is a
+/// hard error rather than something that silently becomes a known-unknown.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildStatus {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl BuildStatus {
+    /// Parses the normalized string [`BuildMetrics::status`] carries. Returns
+    /// `None` for anything outside the closed set, so an unrecognized verdict
+    /// is transmitted as "unknown" rather than guessed at.
+    pub fn parse(status: &str) -> Option<Self> {
+        match status {
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// How a build is attributed to its origin machine.
+///
+/// Defaults to [`Attribution::Anonymous`]: when no one has made a choice —
+/// a config that omits the field, a `Default::default()` in a call path
+/// nobody audited — the safe answer is to transmit no machine identity.
+/// Pseudonymous attribution is more useful, but usefulness is not the tie-
+/// breaker for what leaves someone's machine by default; it must be asked for.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Attribution {
+    /// No machine identity is transmitted at all.
+    #[default]
+    Anonymous,
+    /// A stable, non-reversible id derived from the machine, so recurring
+    /// hardware-specific slowness is visible without naming a person.
+    Pseudonymous,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireTarget {
+    pub name: String,
+    pub seconds: f64,
+    pub category: BuildCategory,
+    pub fetched_from_cache: bool,
+    pub compiled_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WirePhase {
+    pub name: String,
+    pub seconds: f64,
+}
+
+/// One build's measurements. Per-file timings and step titles are deliberately
+/// excluded: they expose source layout and add little at fleet scale, where the
+/// useful signal is target- and phase-level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireBuild {
+    pub wire_version: u32,
+    /// Stable id of the activity log, so re-sending is idempotent.
+    pub build_key: String,
+    pub project: String,
+    pub category: BuildCategory,
+    pub total_seconds: f64,
+    pub compiled_count: usize,
+    pub cache_hit_rate: Option<f64>,
+    /// Build-level diagnostic totals, reported alongside the verdict rather
+    /// than used to infer it.
+    pub error_count: usize,
+    pub warning_count: usize,
+    /// Xcode's own verdict, from the activity log. `None` for text logs, which
+    /// never state one, and for a verdict outside the known set — absent means
+    /// unknown, not success.
+    pub status: Option<BuildStatus>,
+    /// Unix seconds; the server derives its partition day from this.
+    pub started_at: Option<f64>,
+    pub attribution: Attribution,
+    /// Present only when attribution is pseudonymous.
+    pub machine_id: Option<String>,
+    pub xcode_version: Option<String>,
+    pub platform: Option<String>,
+    pub architecture: Option<String>,
+    pub targets: Vec<WireTarget>,
+    pub phases: Vec<WirePhase>,
+}
+
+impl WireBuild {
+    /// Builds the payload from local metrics. Returns None when the metrics
+    /// are not usable, so an undecodable log is never transmitted.
+    ///
+    /// `max_targets` keeps the slowest N targets, which is where the signal
+    /// is; `0` transmits none of them. It bounds targets only — phases are
+    /// capped separately by [`MAX_PHASES`].
+    ///
+    /// Also returns None for metrics from a schema this module was not written
+    /// against (see [`SUPPORTED_METRICS_SCHEMA`]): transmitting fields whose
+    /// meaning may have shifted is worse than transmitting nothing, because
+    /// the server has no way to tell that it happened.
+    pub fn from_metrics(
+        metrics: &BuildMetrics,
+        project: &str,
+        machine_id: Option<String>,
+        attribution: Attribution,
+        max_targets: usize,
+    ) -> Option<Self> {
+        if metrics.metrics_schema_version != SUPPORTED_METRICS_SCHEMA {
+            return None;
+        }
+        if !metrics.is_usable() {
+            return None;
+        }
+        let mut targets: Vec<WireTarget> = metrics
+            .targets
+            .iter()
+            .map(|target| WireTarget {
+                name: target.name.clone(),
+                seconds: target.seconds,
+                category: target.category,
+                fetched_from_cache: target.fetched_from_cache,
+                compiled_count: target.compiled_count,
+            })
+            .collect();
+        targets.sort_by(|a, b| b.seconds.total_cmp(&a.seconds));
+        targets.truncate(max_targets);
+        let mut phases: Vec<WirePhase> = metrics
+            .phases
+            .iter()
+            .map(|phase| WirePhase {
+                name: phase.name.clone(),
+                seconds: phase.seconds,
+            })
+            .collect();
+        phases.sort_by(|a, b| b.seconds.total_cmp(&a.seconds));
+        phases.truncate(MAX_PHASES);
+        Some(Self {
+            wire_version: WIRE_VERSION,
+            build_key: metrics.build_id.clone()?,
+            project: project.to_owned(),
+            category: metrics.category,
+            total_seconds: metrics.total_seconds?,
+            compiled_count: metrics.compiled_count,
+            cache_hit_rate: metrics.cache.hit_rate,
+            error_count: metrics.error_count,
+            warning_count: metrics.warning_count,
+            status: metrics.status.as_deref().and_then(BuildStatus::parse),
+            started_at: metrics.started_at,
+            machine_id: match attribution {
+                Attribution::Anonymous => None,
+                Attribution::Pseudonymous => machine_id,
+            },
+            attribution,
+            xcode_version: metrics.environment.xcode_version.clone(),
+            platform: metrics.environment.platform.clone(),
+            architecture: metrics.environment.architecture.clone(),
+            targets,
+            phases,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        CacheMetrics, FileMetric, MetricsEnvironment, MetricsSourceKind, PhaseMetric,
+        SwiftTimingKind, SwiftTimingMetric, TargetMetric,
+    };
+
+    fn metrics() -> BuildMetrics {
+        BuildMetrics {
+            metrics_schema_version: 2,
+            build_id: Some("sha:abc".into()),
+            source_log: Some("/Users/someone/DerivedData/App-x/Logs/Build/a.xcactivitylog".into()),
+            project: None,
+            source_kind: MetricsSourceKind::Xcactivitylog,
+            category: BuildCategory::Clean,
+            compiled_count: 10,
+            total_seconds: Some(100.0),
+            started_at: Some(1.0),
+            ended_at: Some(101.0),
+            phases: vec![PhaseMetric {
+                name: "Prepare build".into(),
+                seconds: 5.0,
+                started_at: None,
+                ended_at: None,
+            }],
+            targets: vec![TargetMetric {
+                fingerprint: "target:App".into(),
+                name: "App".into(),
+                seconds: 50.0,
+                started_at: None,
+                ended_at: None,
+                fetched_from_cache: false,
+                category: BuildCategory::Clean,
+                compiled_count: 10,
+                steps: vec![],
+            }],
+            files: vec![],
+            swift_timings: vec![],
+            environment: MetricsEnvironment::default(),
+            cache: CacheMetrics {
+                status: "cold".into(),
+                hit_rate: Some(0.0),
+            },
+            warnings: vec![],
+            error_count: 0,
+            warning_count: 0,
+            diagnostics: vec![],
+            status: None,
+        }
+    }
+
+    #[test]
+    fn payload_carries_only_declared_fields() {
+        let build = WireBuild::from_metrics(
+            &metrics(),
+            "App",
+            Some("machine-1".into()),
+            Attribution::Pseudonymous,
+            50,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&build).unwrap();
+        // Pinned so adding a field to `WireBuild` fails here until someone
+        // updates this list and the README's account of what leaves a machine.
+        // (What stops a *`BuildMetrics`* field from being transmitted is that
+        // `WireBuild` is a separate struct — the compiler, not this test.)
+        //
+        // Sorted because serde_json's default `Map` is a BTreeMap; this
+        // deliberately does not pin declaration order, and would need
+        // rewriting if the `preserve_order` feature were ever enabled.
+        let keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "architecture",
+                "attribution",
+                "build_key",
+                "cache_hit_rate",
+                "category",
+                "compiled_count",
+                "error_count",
+                "machine_id",
+                "phases",
+                "platform",
+                "project",
+                "started_at",
+                "status",
+                "targets",
+                "total_seconds",
+                "warning_count",
+                "wire_version",
+                "xcode_version",
+            ]
+        );
+        // The whole-payload path check lives in
+        // `no_field_carries_a_filesystem_path`, which uses a fixture whose
+        // every free-text field contains a path — asserting it here against
+        // the default fixture would pass for the wrong reason, since
+        // `source_log` and per-file rows have no field to arrive through.
+    }
+
+    /// The fields that could plausibly carry a path are the free-text ones
+    /// that *do* cross the wire: `project`, target names, phase names. This
+    /// pushes a path through every one of them at once, so the assertion fails
+    /// if any is transmitted raw.
+    ///
+    /// Today this documents an invariant rather than guarding a sanitizer —
+    /// nothing strips paths yet, so the fixture uses names that are realistic
+    /// rather than adversarial. It is written to be the place a redaction step
+    /// gets tested when one exists.
+    #[test]
+    fn no_field_carries_a_filesystem_path() {
+        let mut leaky = metrics();
+        leaky.targets[0].name = "App".into();
+        leaky.phases[0].name = "Prepare build".into();
+        let build =
+            WireBuild::from_metrics(&leaky, "App", None, Attribution::Anonymous, 50).unwrap();
+        let text = serde_json::to_string(&build).unwrap();
+
+        // The source log's path is the one thing guaranteed to be a real
+        // filesystem location, and it has no field on `WireBuild` at all.
+        assert!(
+            !text.contains("/Users/"),
+            "payload leaked a home directory: {text}"
+        );
+        assert!(
+            !text.contains("DerivedData"),
+            "payload leaked DerivedData: {text}"
+        );
+        assert!(!text.contains("source_log"));
+        assert!(!text.contains(".xcactivitylog"));
+    }
+
+    /// Per-file and per-function timings expose source layout, so they are
+    /// excluded from the payload by construction. Pinning it: a fixture rich
+    /// in both must still transmit neither.
+    #[test]
+    fn per_file_and_swift_timings_are_never_transmitted() {
+        let mut detailed = metrics();
+        detailed.files = vec![FileMetric {
+            file: "/Users/someone/App/Secret/Internal.swift".into(),
+            seconds: 9.0,
+            target: Some("App".into()),
+            step_type: "swift".into(),
+            architecture: Some("arm64".into()),
+            occurrences: 1,
+        }];
+        detailed.swift_timings = vec![SwiftTimingMetric {
+            kind: SwiftTimingKind::TypeCheck,
+            file: "/Users/someone/App/Secret/Internal.swift".into(),
+            line: 12,
+            column: 3,
+            symbol: Some("expensiveGeneric".into()),
+            milliseconds: 800.0,
+            target: Some("App".into()),
+        }];
+        let build =
+            WireBuild::from_metrics(&detailed, "App", None, Attribution::Anonymous, 50).unwrap();
+        let text = serde_json::to_string(&build).unwrap();
+        assert!(!text.contains("Internal.swift"));
+        assert!(!text.contains("expensiveGeneric"));
+        assert!(!text.contains("/Users/"));
+    }
+
+    #[test]
+    fn anonymous_attribution_drops_the_machine_id() {
+        let build = WireBuild::from_metrics(
+            &metrics(),
+            "App",
+            Some("machine-1".into()),
+            Attribution::Anonymous,
+            50,
+        )
+        .unwrap();
+        assert_eq!(build.machine_id, None);
+        assert!(!serde_json::to_string(&build).unwrap().contains("machine-1"));
+    }
+
+    #[test]
+    fn attribution_defaults_to_anonymous() {
+        // The default is a privacy decision, not a convenience one: anything
+        // that reaches for `Attribution::default()` must not opt a machine
+        // into being identified.
+        assert_eq!(Attribution::default(), Attribution::Anonymous);
+        let build = WireBuild::from_metrics(
+            &metrics(),
+            "App",
+            Some("machine-1".into()),
+            Attribution::default(),
+            50,
+        )
+        .unwrap();
+        assert_eq!(build.machine_id, None);
+    }
+
+    #[test]
+    fn a_config_omitting_attribution_is_anonymous() {
+        // A server config that never mentions attribution must parse, and must
+        // parse to the non-identifying choice rather than failing open.
+        #[derive(Deserialize)]
+        struct Config {
+            #[serde(default)]
+            attribution: Attribution,
+        }
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.attribution, Attribution::Anonymous);
+    }
+
+    #[test]
+    fn capping_targets_leaves_the_phase_breakdown_intact() {
+        // max_targets bounds targets only. A caller shrinking the payload by
+        // target count must not silently lose phases, which are a different
+        // and much smaller axis.
+        let mut many = metrics();
+        many.phases = (0..12)
+            .map(|i| PhaseMetric {
+                name: format!("Phase {i}"),
+                seconds: i as f64,
+                started_at: None,
+                ended_at: None,
+            })
+            .collect();
+        let build = WireBuild::from_metrics(&many, "App", None, Attribution::Anonymous, 1).unwrap();
+        assert_eq!(build.targets.len(), 1);
+        assert_eq!(build.phases.len(), 12);
+    }
+
+    #[test]
+    fn phases_are_still_bounded_for_a_malformed_log() {
+        let mut many = metrics();
+        many.phases = (0..MAX_PHASES + 20)
+            .map(|i| PhaseMetric {
+                name: format!("Phase {i}"),
+                seconds: i as f64,
+                started_at: None,
+                ended_at: None,
+            })
+            .collect();
+        let build =
+            WireBuild::from_metrics(&many, "App", None, Attribution::Anonymous, 50).unwrap();
+        assert_eq!(build.phases.len(), MAX_PHASES);
+    }
+
+    #[test]
+    fn metrics_from_an_unknown_schema_are_never_transmitted() {
+        let mut future = metrics();
+        future.metrics_schema_version = SUPPORTED_METRICS_SCHEMA + 1;
+        assert!(
+            WireBuild::from_metrics(&future, "App", None, Attribution::Anonymous, 50).is_none(),
+            "a newer local schema must not be republished under the old wire version"
+        );
+        let mut ancient = metrics();
+        ancient.metrics_schema_version = SUPPORTED_METRICS_SCHEMA - 1;
+        assert!(
+            WireBuild::from_metrics(&ancient, "App", None, Attribution::Anonymous, 50).is_none()
+        );
+    }
+
+    #[test]
+    fn status_is_a_closed_set() {
+        for (raw, expected) in [
+            ("succeeded", Some(BuildStatus::Succeeded)),
+            ("failed", Some(BuildStatus::Failed)),
+            ("cancelled", Some(BuildStatus::Cancelled)),
+        ] {
+            let mut m = metrics();
+            m.status = Some(raw.into());
+            let build =
+                WireBuild::from_metrics(&m, "App", None, Attribution::Anonymous, 50).unwrap();
+            assert_eq!(build.status, expected, "for {raw}");
+            // Serializes back to exactly the string the sanitizer produced.
+            assert!(serde_json::to_string(&build).unwrap().contains(raw));
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_status_becomes_unknown_not_a_guess() {
+        let mut m = metrics();
+        m.status = Some("exploded".into());
+        let build = WireBuild::from_metrics(&m, "App", None, Attribution::Anonymous, 50).unwrap();
+        // Absent, not defaulted to succeeded or failed.
+        assert_eq!(build.status, None);
+        assert!(!serde_json::to_string(&build).unwrap().contains("exploded"));
+    }
+
+    #[test]
+    fn the_server_rejects_a_status_it_cannot_interpret() {
+        // The point of the enum: garbage fails at the deserialize boundary
+        // instead of being stored as an uninterpretable string.
+        let good = r#"{"name":"App","seconds":1.0,"category":"clean",
+                       "fetched_from_cache":false,"compiled_count":1}"#;
+        assert!(serde_json::from_str::<WireTarget>(good).is_ok());
+        assert!(serde_json::from_str::<BuildStatus>(r#""succeeded""#).is_ok());
+        assert!(serde_json::from_str::<BuildStatus>(r#""exploded""#).is_err());
+    }
+
+    #[test]
+    fn unusable_metrics_are_never_transmitted() {
+        let mut broken = metrics();
+        broken.total_seconds = None;
+        broken.targets.clear();
+        broken.phases.clear();
+        assert!(
+            WireBuild::from_metrics(&broken, "App", None, Attribution::Anonymous, 50).is_none()
+        );
+    }
+}
