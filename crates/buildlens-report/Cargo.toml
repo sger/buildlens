@@ -6,6 +6,4 @@ license.workspace = true
 
 [dependencies]
 buildlens-core = { path = "../buildlens-core" }
-buildlens-metrics = { path = "../buildlens-metrics" }
-serde.workspace = true
 serde_json.workspace = true

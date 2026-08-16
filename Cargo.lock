@@ -247,8 +247,6 @@ name = "buildlens-report"
 version = "0.0.1"
 dependencies = [
  "buildlens-core",
- "buildlens-metrics",
- "serde",
  "serde_json",
 ]
 

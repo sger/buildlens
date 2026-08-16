@@ -19,11 +19,23 @@ pub struct TargetTiming {
     pub seconds: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Which kind of log the metrics were decoded from.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricsSourceKind {
     XcodebuildText,
     Xcactivitylog,
+}
+
+impl MetricsSourceKind {
+    /// Stable spelling for display; must match the serde renaming so a report
+    /// and the JSON of the same run do not disagree on the source's name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::XcodebuildText => "xcodebuild_text",
+            Self::Xcactivitylog => "xcactivitylog",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
