@@ -1,0 +1,25 @@
+# PostgreSQL-only development setup. The API runs locally with cargo.
+#
+# Shares `buildlens-pgdata` with docker-compose.yml on purpose: switching
+# between the two files must not appear to lose your build history. The only
+# difference is that this file sets no container_name, so `start.sh` falls back
+# to connecting directly rather than `exec`-ing into a named container.
+services:
+  postgres:
+    image: quay.io/sclorg/postgresql-16-c9s:latest
+    environment:
+      POSTGRESQL_USER: buildlens
+      POSTGRESQL_PASSWORD: buildlens
+      POSTGRESQL_DATABASE: buildlens
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - buildlens-pgdata:/var/lib/pgsql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U buildlens -d buildlens"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  buildlens-pgdata:

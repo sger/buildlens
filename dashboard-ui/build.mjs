@@ -1,0 +1,40 @@
+// Bundles the dashboard UI into a single HTML file.
+//
+//   node build.mjs           # write the bundle
+//   node build.mjs --check   # fail if the checked-in bundle is stale
+//
+// `--check` exists because the output is committed: editing main.tsx without
+// rebuilding leaves a stale UI that still compiles and still passes every test.
+import { build } from "esbuild";
+import { readFile, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+// Resolve against this file rather than the shell's cwd, so `node
+// dashboard-ui/build.mjs` works from the repo root as well as from here.
+const here = dirname(fileURLToPath(import.meta.url));
+const src = (...parts) => join(here, "src", ...parts);
+
+const result = await build({ entryPoints: [src("main.tsx")], bundle: true, minify: true, format: "iife", write: false, jsx: "automatic" });
+const css = await readFile(src("styles.css"), "utf8");
+const js = result.outputFiles[0].text;
+const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BuildLens</title><style>${css}</style></head><body><div id="root"></div><script>${js}</script></body></html>`;
+// Emitted into buildlens-dashboard, which embeds it with include_str!. Both
+// the CLI's `dashboard` command and buildlens-server serve that one crate, so
+// the UI cannot differ between them.
+const target = join(here, "..", "crates", "buildlens-dashboard", "src", "index.html");
+
+if (process.argv.includes("--check")) {
+  const current = await readFile(target, "utf8").catch(() => null);
+  if (current === html) {
+    console.log("dashboard bundle is up to date");
+  } else {
+    console.error(
+      `${target} is stale.\n` +
+        "Run `node dashboard-ui/build.mjs` and commit the result.",
+    );
+    process.exit(1);
+  }
+} else {
+  await writeFile(target, html);
+}

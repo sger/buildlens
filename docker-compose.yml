@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: quay.io/sclorg/postgresql-16-c9s:latest
+    container_name: buildlens_db
+    environment:
+      POSTGRESQL_USER: buildlens
+      POSTGRESQL_PASSWORD: buildlens
+      POSTGRESQL_DATABASE: buildlens
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - buildlens-pgdata:/var/lib/pgsql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U buildlens -d buildlens"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  buildlens-pgdata:

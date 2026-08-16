@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": { "build": "node build.mjs" },
+  "dependencies": { "react": "^19.1.1", "react-dom": "^19.1.1" },
+  "devDependencies": { "@types/react": "^19.1.10", "@types/react-dom": "^19.1.7", "esbuild": "^0.25.9", "typescript": "^5.9.2" }
+}
