@@ -68,10 +68,41 @@ pub struct CollectedMetadata {
     pub warnings: Vec<String>,
 }
 
+/// What a parsed log says about whether the build worked.
+///
+/// A closed set rather than a `String`, for the same reason as
+/// [`crate::wire::BuildStatus`]. Note the meaning is weaker than Xcode's own
+/// verdict: a text log rarely states one outright, so [`AnalysisStatus::Passed`]
+/// means "nothing in this log said otherwise", not "Xcode reported success".
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisStatus {
+    /// No failure was observed anywhere in the log.
+    #[default]
+    Passed,
+    /// An error, failing test, or crash was observed.
+    Failed,
+}
+
+impl AnalysisStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Records that a failure was seen. Once failed, always failed — a later
+    /// passing test does not undo an earlier error.
+    pub fn mark_failed(&mut self) {
+        *self = Self::Failed;
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BuildAnalysis {
     pub schema_version: String,
-    pub status: String,
+    pub status: AnalysisStatus,
     pub build: BuildMetadata,
     pub packages: Vec<PackageInfo>,
     pub graph: TargetGraphSummary,
@@ -92,7 +123,7 @@ impl Default for BuildAnalysis {
     fn default() -> Self {
         Self {
             schema_version: "3".into(),
-            status: "passed".into(),
+            status: AnalysisStatus::default(),
             build: Default::default(),
             packages: vec![],
             graph: Default::default(),

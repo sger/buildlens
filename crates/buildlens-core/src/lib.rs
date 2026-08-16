@@ -23,8 +23,8 @@ pub mod testing;
 pub mod wire;
 
 pub use analysis::{
-    AnalyzeOptions, BuildAnalysis, BuildMetadata, CollectedMetadata, Detail, HistoryComparison,
-    Investigation, PackageInfo, TimelineEvent,
+    AnalysisStatus, AnalyzeOptions, BuildAnalysis, BuildMetadata, CollectedMetadata, Detail,
+    HistoryComparison, Investigation, PackageInfo, TimelineEvent,
 };
 pub use diagnostics::{
     DiagnosticAggregate, DiagnosticCategory, DiagnosticExample, DiagnosticSeverity,

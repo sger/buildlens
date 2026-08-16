@@ -222,6 +222,7 @@ version = "0.0.1"
 dependencies = [
  "buildlens-core",
  "buildlens-diagnostics",
+ "buildlens-graph",
  "criterion",
  "regex",
  "serde",

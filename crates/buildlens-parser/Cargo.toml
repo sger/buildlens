@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 buildlens-core = { path = "../buildlens-core" }
 buildlens-diagnostics = { path = "../buildlens-diagnostics" }
+buildlens-graph = { path = "../buildlens-graph" }
 regex.workspace = true
 serde.workspace = true
 thiserror.workspace = true
