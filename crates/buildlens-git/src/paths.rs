@@ -5,43 +5,7 @@
 
 use std::path::Path;
 
-/// Normalizes separators so a Windows-style path compares against the
-/// forward-slash paths git reports.
-pub fn normalize_separators(path: &str) -> String {
-    path.replace('\\', "/")
-}
-
-/// True when a diagnostic's file refers to the same file as a repo-relative
-/// path from `git diff --name-only`.
-///
-/// A diagnostic carries an absolute path (`/Users/x/proj/Sources/App/Foo.swift`)
-/// while git reports repo-relative (`Sources/App/Foo.swift`), so one is a
-/// suffix of the other. The match must fall on a path boundary: comparing raw
-/// suffixes made `Sources/a.swift` match a diagnostic in `.../xa.swift`,
-/// because `"xa.swift".ends_with("a.swift")` is true. That silently attributed
-/// a diagnostic to an unrelated file.
-pub fn same_file(diagnostic_path: &str, changed_path: &str) -> bool {
-    let diagnostic = normalize_separators(diagnostic_path);
-    let changed = normalize_separators(changed_path);
-    if diagnostic == changed {
-        return true;
-    }
-    is_path_suffix(&diagnostic, &changed) || is_path_suffix(&changed, &diagnostic)
-}
-
-/// True when `suffix` is a trailing *path segment* sequence of `full`, i.e.
-/// the character before the match is a separator.
-fn is_path_suffix(full: &str, suffix: &str) -> bool {
-    if suffix.is_empty() || full.len() <= suffix.len() {
-        return false;
-    }
-    full.ends_with(suffix) && full.as_bytes()[full.len() - suffix.len() - 1] == b'/'
-}
-
-/// True when any changed file refers to the same file as this diagnostic.
-pub fn matches_any(diagnostic_path: &str, changed: &[String]) -> bool {
-    changed.iter().any(|path| same_file(diagnostic_path, path))
-}
+pub use buildlens_core::sourcepath::{matches_any, normalize_separators, same_file};
 
 /// Pulls the first `File.swift:line` location out of a test failure message.
 ///
@@ -94,55 +58,6 @@ pub fn is_package_manifest(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_absolute_diagnostic_path_matches_its_repo_relative_change() {
-        assert!(same_file(
-            "/Users/me/proj/Sources/App/Foo.swift",
-            "Sources/App/Foo.swift"
-        ));
-    }
-
-    #[test]
-    fn identical_paths_match() {
-        assert!(same_file("Sources/App/Foo.swift", "Sources/App/Foo.swift"));
-    }
-
-    /// The bug this function exists to prevent: a raw `ends_with` made
-    /// `xa.swift` match a change to `a.swift`.
-    #[test]
-    fn a_partial_filename_does_not_match() {
-        assert!(!same_file("/repo/Sources/xa.swift", "a.swift"));
-        assert!(!same_file("/repo/Sources/EvilFoo.swift", "Foo.swift"));
-        assert!(!same_file("Foo.swift", "/repo/Sources/EvilFoo.swift"));
-    }
-
-    #[test]
-    fn different_directories_do_not_match() {
-        assert!(!same_file("/repo/Vendor/Foo.swift", "Sources/Foo.swift"));
-    }
-
-    #[test]
-    fn windows_separators_normalize() {
-        assert!(same_file(
-            r"C:\proj\Sources\App\Foo.swift",
-            "Sources/App/Foo.swift"
-        ));
-    }
-
-    #[test]
-    fn an_empty_path_matches_nothing() {
-        assert!(!same_file("", "Sources/Foo.swift"));
-        assert!(!same_file("Sources/Foo.swift", ""));
-    }
-
-    #[test]
-    fn matches_any_finds_one_of_several() {
-        let changed = vec!["Sources/A.swift".to_owned(), "Sources/B.swift".to_owned()];
-        assert!(matches_any("/repo/Sources/B.swift", &changed));
-        assert!(!matches_any("/repo/Sources/C.swift", &changed));
-        assert!(!matches_any("/repo/Sources/B.swift", &[]));
-    }
 
     #[test]
     fn extracts_a_file_and_line_from_a_failure_message() {

@@ -265,14 +265,92 @@ impl BuildMetrics {
     }
 }
 
+/// How much to trust a regression measurement.
+///
+/// A closed set rather than a `String`: consumers weight regressions by this,
+/// and an unrecognized spelling silently fell through to the lowest weight,
+/// so a typo would quietly discount a high-confidence regression.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RegressionConfidence {
+    /// Same build category, comparable baseline, stable environment.
+    High,
+    /// Comparable, but with a caveat that widens the error bars.
+    Medium,
+    /// Too little history, or a baseline that is not really comparable.
+    Low,
+}
+
+impl RegressionConfidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+}
+
+/// What a regression was measured over.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricKind {
+    Target,
+    Phase,
+    File,
+    Build,
+}
+
+impl MetricKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Target => "target",
+            Self::Phase => "phase",
+            Self::File => "file",
+            Self::Build => "build",
+        }
+    }
+}
+
+/// A caveat that undercuts a regression rather than explaining it.
+///
+/// These were previously detected by substring-matching the free-text
+/// `reason`, a contract with no producer — so the signal was dead, and would
+/// have silently stayed dead if the wording ever drifted.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum RegressionCaveat {
+    /// The machine, Xcode version, or SDK differs from the baseline's, so the
+    /// timing difference may not be attributable to the code.
+    EnvironmentShifted,
+    /// The baseline is a different build category, so the comparison is weak.
+    CategoryMismatch,
+    /// Too few historical samples for the baseline to mean much.
+    ThinBaseline,
+}
+
+impl RegressionCaveat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::EnvironmentShifted => "environment_shifted",
+            Self::CategoryMismatch => "category_mismatch",
+            Self::ThinBaseline => "thin_baseline",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MetricRegression {
-    pub metric_kind: String,
+    pub metric_kind: MetricKind,
     pub name: String,
     pub previous_seconds: f64,
     pub current_seconds: f64,
     pub delta_seconds: f64,
     pub delta_percent: f64,
-    pub confidence: String,
+    pub confidence: RegressionConfidence,
+    /// Machine-readable caveats. Consumers must branch on these rather than
+    /// on `reason`, which is prose for humans and free to be reworded.
+    pub caveats: Vec<RegressionCaveat>,
+    /// Human-readable explanation. Never parsed.
     pub reason: String,
 }

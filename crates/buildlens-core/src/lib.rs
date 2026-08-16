@@ -16,6 +16,7 @@ pub mod git;
 pub mod graph;
 pub mod intel;
 pub mod metrics;
+pub mod sourcepath;
 /// Named `testing` rather than `tests` so it is never mistaken for a
 /// `#[cfg(test)]` module — these are the shipped types describing test runs.
 pub mod testing;
@@ -31,12 +32,14 @@ pub use diagnostics::{
 };
 pub use git::{GitCorrelation, GitOwnership, LikelyRelated};
 pub use graph::{TargetDependency, TargetGraphSummary, TargetNode};
-pub use intel::{Bottleneck, EvidenceChain, EvidenceLink, Intelligence, TargetImpact};
+pub use intel::{Bottleneck, EvidenceChain, EvidenceLink, Intelligence, MatchKind, TargetImpact};
 pub use metrics::{
     BuildCategory, BuildMetrics, BuildStepMetric, CacheMetrics, FileMetric, MetricDiagnostic,
-    MetricRegression, MetricsEnvironment, MetricsSourceKind, PhaseMetric, SwiftTimingKind,
-    SwiftTimingMetric, TargetMetric, TargetTiming, TimingSummary,
+    MetricKind, MetricRegression, MetricsEnvironment, MetricsSourceKind, PhaseMetric,
+    RegressionCaveat, RegressionConfidence, SwiftTimingKind, SwiftTimingMetric, TargetMetric,
+    TargetTiming, TimingSummary,
 };
+pub use sourcepath::{matches_any, normalize_separators, same_file};
 pub use testing::{
     CrashType, FailureCluster, FlakyTestSummary, TestCrash, TestDurationRegression, TestResult,
     TestStatus, TestSummary,

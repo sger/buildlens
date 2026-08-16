@@ -142,6 +142,30 @@ impl TargetGraph {
         self.walk(target, Direction::Outgoing)
     }
 
+    /// Targets depending on `target` directly — its fan-in, one edge out.
+    pub fn direct_dependents(&self, target: &TargetNode) -> Vec<&TargetNode> {
+        self.neighbours(target, Direction::Incoming)
+    }
+
+    /// Targets `target` depends on directly — its fan-out, one edge out.
+    pub fn direct_dependencies(&self, target: &TargetNode) -> Vec<&TargetNode> {
+        self.neighbours(target, Direction::Outgoing)
+    }
+
+    fn neighbours(&self, target: &TargetNode, direction: Direction) -> Vec<&TargetNode> {
+        let Some(&start) = self.index.get(target) else {
+            return Vec::new();
+        };
+        let mut found: Vec<&TargetNode> = self
+            .graph
+            .neighbors_directed(start, direction)
+            .map(|node| &self.graph[node])
+            .collect();
+        found.sort();
+        found.dedup();
+        found
+    }
+
     /// Breadth-first traversal, cycle-safe: the seed is marked seen up front,
     /// so a cycle back to it terminates and never reports a target as its own
     /// dependent.
