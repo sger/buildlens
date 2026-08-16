@@ -6,9 +6,6 @@ license.workspace = true
 
 [dependencies]
 buildlens-core = { path = "../buildlens-core" }
+# The regexes live in buildlens-parser; this crate exposes them behind a
+# trait rather than keeping a second copy that would drift.
 buildlens-parser = { path = "../buildlens-parser" }
-regex.workspace = true
-serde.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true

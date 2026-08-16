@@ -9,7 +9,10 @@ mod metadata;
 mod packages;
 mod timeline;
 mod timing;
-mod xctest;
+/// Test-log line parsing, public so `buildlens-tests` can expose it behind
+/// its `TestLogParser` trait rather than keeping a second copy of these
+/// regexes.
+pub mod xctest;
 
 use buildlens_core::{
     AnalyzeOptions, BuildAnalysis, Detail, DiagnosticAggregate, DiagnosticSeverity, FailureCluster,

@@ -282,9 +282,6 @@ version = "0.0.1"
 dependencies = [
  "buildlens-core",
  "buildlens-parser",
- "regex",
- "serde",
- "serde_json",
 ]
 
 [[package]]
