@@ -14,6 +14,8 @@ buildlens-core = { path = "../buildlens-core" }
 buildlens-dashboard = { path = "../buildlens-dashboard" }
 buildlens-storage = { path = "../buildlens-storage" }
 postgres.workspace = true
+r2d2.workspace = true
+r2d2_postgres.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

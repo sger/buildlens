@@ -95,9 +95,11 @@ enum Command {
     },
     /// Find the newest Xcode activity log, wait until it is fully written, and save it
     Collect {
-        /// DerivedData root, a project's DerivedData directory, or a Logs/Build directory
-        #[arg(long, default_value = "~/Library/Developer/Xcode/DerivedData")]
-        build_dir: String,
+        /// DerivedData root, a project's DerivedData directory, or a Logs/Build directory.
+        /// Defaults to `$BUILD_DIR`'s logs when Xcode set it — so a scheme post-action
+        /// collects the build Xcode just ran — and to the DerivedData root otherwise.
+        #[arg(long)]
+        build_dir: Option<String>,
         /// Only consider DerivedData entries whose name starts with this prefix.
         /// Distinct from `--project`, which names the build recorded in
         /// history: this one chooses *which log to read*.
@@ -784,7 +786,11 @@ fn run() -> Result<std::process::ExitCode> {
             collect,
         } => {
             warn_if_token_came_from_the_command_line(token.as_deref());
-            let root = expand_home(&build_dir);
+            let explicit = build_dir.as_deref().map(expand_home);
+            let root = collect::search_root(
+                explicit.as_deref(),
+                &expand_home(DEFAULT_DERIVED_DATA),
+            );
             // Before the lookup below: a watcher must survive an empty
             // DerivedData and wait for the first build, not exit.
             if watch {
@@ -1000,6 +1006,10 @@ fn metric_regression_summary(comparison: &buildlens_core::HistoryComparison) -> 
     text
 }
 
+/// Where Xcode.app keeps DerivedData, and so where a scan starts when neither
+/// `--build-dir` nor `$BUILD_DIR` says otherwise.
+const DEFAULT_DERIVED_DATA: &str = "~/Library/Developer/Xcode/DerivedData";
+
 /// Unix seconds `keep_days` before now. Builds recorded before this go.
 ///
 /// `--keep-days 0` would delete everything except the per-project baselines,
@@ -1187,6 +1197,13 @@ fn watch_loop(
         std::collections::HashSet::new();
     let mut first_scan = true;
     println!("Watching {} — press Ctrl-C to stop", root.display());
+    // Said once, at startup, rather than on every scan: a watcher pointed at a
+    // DerivedData that `xcodebuild` writes no logs into would otherwise sit
+    // silent forever, which is indistinguishable from "no builds yet" and is
+    // exactly the state that looks like a bug in the watcher.
+    if let Some(hint) = collect::shared_derived_data_hint(root) {
+        eprintln!("warning: {hint}");
+    }
     loop {
         match collect::list_activity_logs(root, match_project) {
             Ok(logs) => {

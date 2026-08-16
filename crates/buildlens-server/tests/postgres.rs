@@ -88,14 +88,14 @@ fn stores_queries_and_deduplicates_builds() {
     let mut store = buildlens_server_store(&url);
 
     // A fresh build is stored...
-    assert!(store.insert(&build("a", 100.0, Some(1_700_000_000.0), Some("m1"))).unwrap());
+    assert!(store.store().insert(&build("a", 100.0, Some(1_700_000_000.0), Some("m1"))).unwrap());
     // ...and re-sending it is a no-op, so a client retry cannot double-count.
-    assert!(!store.insert(&build("a", 100.0, Some(1_700_000_000.0), Some("m1"))).unwrap());
+    assert!(!store.store().insert(&build("a", 100.0, Some(1_700_000_000.0), Some("m1"))).unwrap());
 
-    store.insert(&build("b", 200.0, Some(1_700_000_000.0), Some("m2"))).unwrap();
-    store.insert(&build("c", 300.0, Some(1_700_000_000.0), Some("m2"))).unwrap();
+    store.store().insert(&build("b", 200.0, Some(1_700_000_000.0), Some("m2"))).unwrap();
+    store.store().insert(&build("c", 300.0, Some(1_700_000_000.0), Some("m2"))).unwrap();
 
-    let builds = store.builds(10).unwrap();
+    let builds = store.store().builds(10).unwrap();
     assert_eq!(builds["items"].as_array().unwrap().len(), 3);
 
     // Children are attached to their build.
@@ -118,8 +118,8 @@ fn partitions_by_the_build_start_day() {
     let url = isolated_url(&url, "t_partition");
     let mut store = buildlens_server_store(&url);
     // 2023-11-14 and 2023-11-15 in Unix seconds.
-    store.insert(&build("day1", 100.0, Some(1_700_000_000.0), Some("m1"))).unwrap();
-    store.insert(&build("day2", 100.0, Some(1_700_090_000.0), Some("m1"))).unwrap();
+    store.store().insert(&build("day1", 100.0, Some(1_700_000_000.0), Some("m1"))).unwrap();
+    store.store().insert(&build("day2", 100.0, Some(1_700_090_000.0), Some("m1"))).unwrap();
 
     let mut client = Client::connect(&url, NoTls).unwrap();
     let days: Vec<String> = client
@@ -148,17 +148,17 @@ fn stats_report_percentiles_and_machine_counts() {
     for (index, seconds) in [100.0, 200.0, 300.0, 400.0, 500.0].iter().enumerate() {
         let machine = if index % 2 == 0 { "m1" } else { "m2" };
         store
-            .insert(&build(&format!("s{index}"), *seconds, Some(today), Some(machine)))
+            .store().insert(&build(&format!("s{index}"), *seconds, Some(today), Some(machine)))
             .unwrap();
     }
-    let stats = store.stats(30).unwrap();
+    let stats = store.store().stats(30).unwrap();
     let item = &stats["items"].as_array().unwrap()[0];
     assert_eq!(item["project"], "App");
     assert_eq!(item["builds"], 5);
     assert_eq!(item["p50"], 300.0);
     assert_eq!(item["machines"], 2);
 
-    let slowest = store.slowest_targets(30, 5).unwrap();
+    let slowest = store.store().slowest_targets(30, 5).unwrap();
     let target = &slowest["items"].as_array().unwrap()[0];
     assert_eq!(target["name"], "Core");
     assert_eq!(target["observations"], 5);
@@ -166,8 +166,26 @@ fn stats_report_percentiles_and_machine_counts() {
 
 /// The store lives in the binary crate, so tests reach it through a thin
 /// re-export module compiled into the test binary.
-fn buildlens_server_store(url: &str) -> store::PostgresStore {
-    store::PostgresStore::connect(url).expect("connect and migrate")
+///
+/// Owns a connection and lends it to a [`store::PostgresStore`] per call. In
+/// the server the connection comes from a pool and is borrowed for one
+/// request; a test wants one connection for the whole test, so this holds it
+/// and hands out the borrow. `store()` is called per operation rather than
+/// held, matching the request-scoped lifetime the server gives it.
+struct TestStore {
+    client: postgres::Client,
+}
+
+impl TestStore {
+    fn store(&mut self) -> store::PostgresStore<'_> {
+        store::PostgresStore::new(&mut self.client)
+    }
+}
+
+fn buildlens_server_store(url: &str) -> TestStore {
+    TestStore {
+        client: store::connect_and_migrate(url).expect("connect and migrate"),
+    }
 }
 
 #[path = "../src/store.rs"]
@@ -194,10 +212,10 @@ fn build_status_round_trips_through_the_text_column() {
     for (key, status, _) in cases {
         let mut wire = build(key, 10.0, Some(1_700_000_000.0), Some("m1"));
         wire.status = status;
-        store.insert(&wire).unwrap();
+        store.store().insert(&wire).unwrap();
     }
 
-    let items = store.builds(10).unwrap();
+    let items = store.store().builds(10).unwrap();
     let found: std::collections::BTreeMap<String, Option<String>> = items["items"]
         .as_array()
         .unwrap()
@@ -234,9 +252,9 @@ fn build_detail_reports_both_diagnostic_counts() {
     let mut wire = build("counts", 10.0, Some(1_700_000_000.0), Some("m1"));
     wire.error_count = 7;
     wire.warning_count = 3;
-    store.insert(&wire).unwrap();
+    store.store().insert(&wire).unwrap();
 
-    let detail = store.build_detail("counts").unwrap().expect("build exists");
+    let detail = store.store().build_detail("counts").unwrap().expect("build exists");
     assert_eq!(detail["error_count"], 7, "the error count was being dropped");
     assert_eq!(detail["warning_count"], 3);
     // The child rows belong in the same call, or the page renders empty.
@@ -252,7 +270,7 @@ fn build_detail_is_absent_for_an_unknown_key() {
     };
     let url = isolated_url(&url, "t_detail_missing");
     let mut store = buildlens_server_store(&url);
-    assert!(store.build_detail("nope").unwrap().is_none());
+    assert!(store.store().build_detail("nope").unwrap().is_none());
 }
 
 /// `day > CURRENT_DATE - $1` excluded the boundary day, so days=N covered
@@ -273,16 +291,16 @@ fn the_day_window_is_inclusive_of_its_boundary() {
     // Exactly 7 days back, which the old strict comparison dropped.
     let seven_days_ago = now - 7.0 * 86_400.0;
     store
-        .insert(&build("edge", 100.0, Some(seven_days_ago), Some("m1")))
+        .store().insert(&build("edge", 100.0, Some(seven_days_ago), Some("m1")))
         .unwrap();
 
-    let stats = store.stats(7).unwrap();
+    let stats = store.store().stats(7).unwrap();
     assert_eq!(
         stats["items"].as_array().unwrap().len(),
         1,
         "a build exactly 7 days old must fall inside a 7-day window"
     );
-    let slowest = store.slowest_targets(7, 5).unwrap();
+    let slowest = store.store().slowest_targets(7, 5).unwrap();
     assert_eq!(slowest["items"].as_array().unwrap().len(), 1);
 }
 
@@ -299,14 +317,14 @@ fn ranked_queries_scope_to_a_project() {
 
     let mut ours = build("ours", 100.0, Some(1_700_000_000.0), Some("m1"));
     ours.project = "Ours".into();
-    store.insert(&ours).unwrap();
+    store.store().insert(&ours).unwrap();
 
     let mut theirs = build("theirs", 100.0, Some(1_700_000_000.0), Some("m2"));
     theirs.project = "Theirs".into();
     theirs.targets[0].name = "TheirTarget".into();
-    store.insert(&theirs).unwrap();
+    store.store().insert(&theirs).unwrap();
 
-    let scoped = store.ranked_targets(100, 10, Some("Ours")).unwrap();
+    let scoped = store.store().ranked_targets(100, 10, Some("Ours")).unwrap();
     let names: Vec<&str> = scoped["items"]
         .as_array()
         .unwrap()
@@ -316,10 +334,10 @@ fn ranked_queries_scope_to_a_project() {
     assert_eq!(names, vec!["Core"], "another project's target leaked in");
 
     // No project means every project.
-    let all = store.ranked_targets(100, 10, None).unwrap();
+    let all = store.store().ranked_targets(100, 10, None).unwrap();
     assert_eq!(all["items"].as_array().unwrap().len(), 2);
 
-    let phases = store.ranked_phases(100, 10, Some("Ours")).unwrap();
+    let phases = store.store().ranked_phases(100, 10, Some("Ours")).unwrap();
     assert_eq!(phases["items"].as_array().unwrap().len(), 1);
 }
 
@@ -336,7 +354,7 @@ fn percentiles_report_whether_there_is_enough_history() {
 
     for index in 0..3 {
         store
-            .insert(&build(
+            .store().insert(&build(
                 &format!("p{index}"),
                 100.0,
                 Some(1_700_000_000.0),
@@ -344,13 +362,13 @@ fn percentiles_report_whether_there_is_enough_history() {
             ))
             .unwrap();
     }
-    let thin = store.percentiles(100, None).unwrap();
+    let thin = store.store().percentiles(100, None).unwrap();
     assert_eq!(thin["builds"], 3);
     assert_eq!(thin["enough_history"], false);
 
     for index in 3..8 {
         store
-            .insert(&build(
+            .store().insert(&build(
                 &format!("p{index}"),
                 100.0,
                 Some(1_700_000_000.0),
@@ -358,7 +376,7 @@ fn percentiles_report_whether_there_is_enough_history() {
             ))
             .unwrap();
     }
-    let full = store.percentiles(100, None).unwrap();
+    let full = store.store().percentiles(100, None).unwrap();
     assert_eq!(full["builds"], 8);
     assert_eq!(full["enough_history"], true);
     assert_eq!(full["p50"], 100.0);
@@ -375,13 +393,13 @@ fn an_empty_database_answers_every_query() {
     let url = isolated_url(&url, "t_empty");
     let mut store = buildlens_server_store(&url);
 
-    assert_eq!(store.builds(10).unwrap()["items"].as_array().unwrap().len(), 0);
-    assert_eq!(store.stats(30).unwrap()["items"].as_array().unwrap().len(), 0);
+    assert_eq!(store.store().builds(10).unwrap()["items"].as_array().unwrap().len(), 0);
+    assert_eq!(store.store().stats(30).unwrap()["items"].as_array().unwrap().len(), 0);
     assert_eq!(
-        store.daily(30, None).unwrap()["items"].as_array().unwrap().len(),
+        store.store().daily(30, None).unwrap()["items"].as_array().unwrap().len(),
         0
     );
-    let percentiles = store.percentiles(100, None).unwrap();
+    let percentiles = store.store().percentiles(100, None).unwrap();
     assert_eq!(percentiles["builds"], 0);
     assert_eq!(percentiles["enough_history"], false);
     assert!(percentiles["p50"].is_null(), "no builds means no percentile");
@@ -398,12 +416,12 @@ fn migrating_an_existing_schema_is_idempotent() {
     let url = isolated_url(&url, "t_migrate");
     let mut first = buildlens_server_store(&url);
     first
-        .insert(&build("before", 10.0, Some(1_700_000_000.0), Some("m1")))
+        .store().insert(&build("before", 10.0, Some(1_700_000_000.0), Some("m1")))
         .unwrap();
     // Reconnecting re-runs migrate() against a populated schema.
     let mut second = buildlens_server_store(&url);
     assert_eq!(
-        second.builds(10).unwrap()["items"].as_array().unwrap().len(),
+        second.store().builds(10).unwrap()["items"].as_array().unwrap().len(),
         1,
         "re-migrating must not disturb existing rows"
     );

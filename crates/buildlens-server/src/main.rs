@@ -1,24 +1,46 @@
 //! Optional team server: receives already-parsed build metrics and stores them
 //! in Postgres. Deliberately minimal — no queue, no object storage, no raw logs.
 //! Clients parse locally and send a small JSON payload, so there is no slow
-//! work to defer to a worker.
+//! work to defer to a worker. That is why there is no Redis here and no
+//! background worker: nothing arriving on this endpoint is slow enough to be
+//! worth deferring, and a queue would only add a path where a client is told
+//! "stored" before the row exists.
 //!
-//! Requests are handled one at a time on a single thread, and the store sits
-//! behind one connection. That is a real throughput ceiling, stated here rather
-//! than discovered: this is an ingest endpoint for a team's CI, not a service
-//! tier. A slow analytical query blocks ingest behind it.
+//! Requests are served by a fixed pool of worker threads over a shared
+//! connection pool, so an analytical query on one thread does not block ingest
+//! on another. Concurrency is bounded at both ends on purpose — see
+//! [`WORKER_THREADS`] and [`POOL_SIZE`] — because the backstop for overload
+//! should be a queue in the accept loop, not an unbounded thread spawn.
 
 mod store;
 
 use anyhow::{Context, Result};
 use buildlens_core::wire::{WIRE_VERSION, WireBuild};
 use std::io::Read;
-use std::sync::{Arc, Mutex};
-use store::{PostgresStore, ServerError};
+use std::sync::Arc;
+use store::{Pool, PooledConnection, PostgresStore, ServerError};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+
+mod ratelimit;
+use ratelimit::RateLimiter;
 
 /// Refuse payloads larger than this; a metrics document is a few KB.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Worker threads serving requests, and connections in the pool.
+///
+/// Threads never exceed pool size: a thread that cannot get a connection is
+/// blocked anyway, so extra threads would add context switching and no
+/// throughput. Both are overridable for a machine with a different Postgres
+/// `max_connections` — a NAS running other services wants a smaller pool.
+const WORKER_THREADS: usize = 8;
+const POOL_SIZE: u32 = 8;
+
+/// Ingest attempts allowed per client per minute.
+///
+/// Generous for CI — a busy pipeline pushes one document per build — but low
+/// enough that a misconfigured retry loop cannot fill the database.
+const INGEST_PER_MINUTE: u32 = 120;
 
 /// An outcome ready to send: HTTP status plus a JSON body.
 struct Reply {
@@ -52,6 +74,8 @@ enum Failure {
     BadRequest(String),
     /// The payload exceeded [`MAX_BODY_BYTES`].
     TooLarge,
+    /// The client exceeded [`INGEST_PER_MINUTE`].
+    TooManyRequests,
     /// Ours. The detail goes to the log, not the response.
     Internal(anyhow::Error),
 }
@@ -63,6 +87,12 @@ impl Failure {
             Self::BadRequest(message) => (Reply::error(400, &message), None),
             Self::TooLarge => (
                 Reply::error(413, "payload exceeds the 1 MiB limit"),
+                None,
+            ),
+            // Rate limiting is a client-visible condition it can act on by
+            // backing off, so unlike an internal failure it is described.
+            Self::TooManyRequests => (
+                Reply::error(429, "too many requests, slow down"),
                 None,
             ),
             Self::Internal(error) => (
@@ -81,6 +111,27 @@ impl From<ServerError> for Failure {
     }
 }
 
+/// Reads a positive integer from the environment, falling back to `default`.
+///
+/// A value that is present but unparsable is an error rather than a silent
+/// fallback: someone who sets `BUILDLENS_THREADS=eight` has a mistaken belief
+/// about their configuration, and starting anyway preserves it.
+fn env_size(name: &str, default: usize) -> Result<usize> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(raw) => {
+            let value: usize = raw
+                .trim()
+                .parse()
+                .with_context(|| format!("{name} must be a positive integer, got {raw:?}"))?;
+            if value == 0 {
+                anyhow::bail!("{name} must be greater than zero");
+            }
+            Ok(value)
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let database_url = std::env::var("DATABASE_URL")
         .context("DATABASE_URL must be set (postgres://user:pass@host/db)")?;
@@ -93,48 +144,113 @@ fn main() -> Result<()> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
+    // Running without a token has to be chosen, not defaulted into.
+    //
+    // A loopback check would be the obvious rule, but it is the wrong one for
+    // a container: the server must bind 0.0.0.0 for Docker's port mapping to
+    // reach it, so every containerised run would trip it. An explicit opt-out
+    // instead means a forgotten variable fails closed rather than silently
+    // accepting writes from anyone who can route to the box.
+    let allow_anonymous = std::env::var("BUILDLENS_ALLOW_ANONYMOUS").is_ok_and(|v| v.trim() == "1");
+    if token.is_none() && !allow_anonymous {
+        anyhow::bail!(
+            "BUILDLENS_TOKEN is not set, so this server would accept writes from anyone who \
+             can reach it. Set BUILDLENS_TOKEN, or set BUILDLENS_ALLOW_ANONYMOUS=1 to run \
+             without authentication on a trusted network."
+        );
+    }
     if token.is_none() {
         eprintln!(
-            "warning: BUILDLENS_TOKEN is not set, so this server accepts writes from anyone \
-             who can reach it. Set it, or keep the server on a trusted network."
+            "warning: running without authentication (BUILDLENS_ALLOW_ANONYMOUS=1). Anyone who \
+             can reach {bind} can write builds."
         );
     }
 
-    let store = Arc::new(Mutex::new(
-        PostgresStore::connect(&database_url).context("connecting to Postgres")?,
-    ));
-    let server = Server::http(&bind).map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    eprintln!("BuildLens server listening on {bind}");
-
-    for request in server.incoming_requests() {
-        if let Err(error) = handle(request, &store, token.as_deref()) {
-            eprintln!("request failed: {error}");
-        }
+    let pool_size = env_size("BUILDLENS_POOL_SIZE", POOL_SIZE as usize)?;
+    let threads = env_size("BUILDLENS_THREADS", WORKER_THREADS)?;
+    if threads > pool_size {
+        // Not fatal, but it buys nothing: the surplus threads block waiting for
+        // a connection that a busy pool cannot hand out.
+        eprintln!(
+            "warning: BUILDLENS_THREADS ({threads}) exceeds BUILDLENS_POOL_SIZE ({pool_size}); \
+             the extra threads will block waiting for connections."
+        );
     }
+
+    // Migrations run once, here, on their own connection — not per pooled
+    // connection, which would re-apply every ALTER for each one the pool opens.
+    store::connect_and_migrate(&database_url).context("connecting to Postgres")?;
+    let pool = store::pool(&database_url, pool_size as u32).context("building the connection pool")?;
+
+    let server =
+        Arc::new(Server::http(&bind).map_err(|error| anyhow::anyhow!(error.to_string()))?);
+    let limiter = Arc::new(RateLimiter::new(INGEST_PER_MINUTE));
+    eprintln!(
+        "BuildLens server listening on {bind} ({threads} threads, {pool_size} connections)"
+    );
+
+    // Every worker runs the same accept loop; `recv` hands each request to
+    // whichever thread asks first. Scoped threads so the pool and limiter can
+    // be borrowed rather than cloned into each worker.
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let server = Arc::clone(&server);
+            let limiter = Arc::clone(&limiter);
+            let pool = &pool;
+            let token = token.as_deref();
+            scope.spawn(move || {
+                loop {
+                    match server.recv() {
+                        Ok(request) => {
+                            if let Err(error) = handle(request, pool, token, &limiter) {
+                                eprintln!("request failed: {error}");
+                            }
+                        }
+                        // The server socket is closed or broken; this worker
+                        // has nothing left to do. Other workers see the same
+                        // and wind down too.
+                        Err(error) => {
+                            eprintln!("accept failed, worker stopping: {error}");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
     Ok(())
 }
 
 fn handle(
     mut request: Request,
-    store: &Arc<Mutex<PostgresStore>>,
+    pool: &Pool,
     token: Option<&str>,
+    limiter: &RateLimiter,
 ) -> Result<()> {
+    let (path, query) = match request.url().split_once('?') {
+        Some((path, query)) => (path.to_owned(), query.to_owned()),
+        None => (request.url().to_owned(), String::new()),
+    };
+
+    // The health check is exempt, and only the health check. A container
+    // healthcheck has no credential to present, so gating it behind the token
+    // marks the server unhealthy and restart-loops a working deployment. It
+    // reveals nothing: a fixed string, no database access, and reachability is
+    // already observable to anyone who can open the port.
+    let exempt_from_auth = path == "/health";
     let presented = request
         .headers()
         .iter()
         .find(|header| header.field.equiv("Authorization"))
         .map(|header| header.value.as_str().to_owned());
-    if !is_authorized(token, presented.as_deref()) {
+    if !exempt_from_auth && !is_authorized(token, presented.as_deref()) {
         return respond(request, Reply::error(401, "unauthorized"));
     }
 
-    let (path, query) = match request.url().split_once('?') {
-        Some((path, query)) => (path.to_owned(), query.to_owned()),
-        None => (request.url().to_owned(), String::new()),
-    };
     let method = request.method().clone();
+    let client_key = client_key(&request);
 
-    let reply = match route(&method, &path, &query, &mut request, store) {
+    let reply = match route(&method, &path, &query, &mut request, pool, limiter, &client_key) {
         Ok(reply) => reply,
         Err(failure) => {
             let (reply, detail) = failure.into_reply();
@@ -157,63 +273,82 @@ fn route(
     path: &str,
     query: &str,
     request: &mut Request,
-    store: &Arc<Mutex<PostgresStore>>,
+    pool: &Pool,
+    limiter: &RateLimiter,
+    client_key: &str,
 ) -> Result<Reply, Failure> {
     match (method, path) {
+        // Deliberately before any database work: a health check that fails
+        // when Postgres is briefly unreachable would make the container
+        // restart loop, taking down an endpoint that was about to recover.
         (Method::Get, "/health") => Ok(Reply::ok(
             serde_json::json!({ "status": "ok" }).to_string(),
         )),
         (Method::Post, "/v1/metrics") => {
+            // Checked before reading the body, so a client in a retry loop is
+            // refused without the server buffering a megabyte per attempt.
+            if !limiter.allow(client_key) {
+                return Err(Failure::TooManyRequests);
+            }
             let payload = read_body(request)?;
-            ingest(&payload, store).map(Reply::ok)
+            ingest(&payload, pool).map(Reply::ok)
         }
         (Method::Get, "/v1/builds") => {
             let limit = param(query, "limit").unwrap_or(100).clamp(1, 1000);
-            let snapshot = locked(store)?.builds(limit)?;
+            let mut connection = connection(pool)?;
+            let snapshot = PostgresStore::new(&mut connection).builds(limit)?;
             Ok(Reply::ok(snapshot.to_string()))
         }
         (Method::Get, "/v1/builds/detail") => {
             let Some(key) = text_param(query, "build_key") else {
                 return Err(Failure::BadRequest("build_key is required".to_owned()));
             };
-            match locked(store)?.build_detail(&key)? {
+            let mut connection = connection(pool)?;
+            match PostgresStore::new(&mut connection).build_detail(&key)? {
                 Some(detail) => Ok(Reply::ok(detail.to_string())),
                 None => Err(Failure::BadRequest("no such build".to_owned())),
             }
         }
         (Method::Get, "/v1/stats") => {
             let days = param(query, "days").unwrap_or(30).clamp(1, 365);
-            let snapshot = locked(store)?.stats(days)?;
+            let mut connection = connection(pool)?;
+            let snapshot = PostgresStore::new(&mut connection).stats(days)?;
             Ok(Reply::ok(snapshot.to_string()))
         }
         (Method::Get, "/v1/stats/daily") => {
             let limit = param(query, "limit").unwrap_or(30).clamp(1, 365);
-            let snapshot = locked(store)?.daily(limit, text_param(query, "project").as_deref())?;
+            let mut connection = connection(pool)?;
+            let snapshot = PostgresStore::new(&mut connection)
+                .daily(limit, text_param(query, "project").as_deref())?;
             Ok(Reply::ok(snapshot.to_string()))
         }
         (Method::Get, "/v1/stats/percentiles") => {
             let limit = param(query, "limit").unwrap_or(100).clamp(1, 1000);
-            let snapshot =
-                locked(store)?.percentiles(limit, text_param(query, "project").as_deref())?;
+            let mut connection = connection(pool)?;
+            let snapshot = PostgresStore::new(&mut connection)
+                .percentiles(limit, text_param(query, "project").as_deref())?;
             Ok(Reply::ok(snapshot.to_string()))
         }
         (Method::Get, "/v1/targets/slowest") => {
             let days = param(query, "days").unwrap_or(30).clamp(1, 365);
             let limit = param(query, "limit").unwrap_or(20).clamp(1, 200);
-            let snapshot = locked(store)?.slowest_targets(days, limit)?;
+            let mut connection = connection(pool)?;
+            let snapshot = PostgresStore::new(&mut connection).slowest_targets(days, limit)?;
             Ok(Reply::ok(snapshot.to_string()))
         }
         (Method::Get, "/v1/targets/ranked") => {
             let builds = param(query, "builds").unwrap_or(100).clamp(1, 1000);
             let top = param(query, "top").unwrap_or(20).clamp(1, 200);
-            let snapshot = locked(store)?
+            let mut connection = connection(pool)?;
+            let snapshot = PostgresStore::new(&mut connection)
                 .ranked_targets(builds, top, text_param(query, "project").as_deref())?;
             Ok(Reply::ok(snapshot.to_string()))
         }
         (Method::Get, "/v1/phases/ranked") => {
             let builds = param(query, "builds").unwrap_or(100).clamp(1, 1000);
             let top = param(query, "top").unwrap_or(20).clamp(1, 200);
-            let snapshot = locked(store)?
+            let mut connection = connection(pool)?;
+            let snapshot = PostgresStore::new(&mut connection)
                 .ranked_phases(builds, top, text_param(query, "project").as_deref())?;
             Ok(Reply::ok(snapshot.to_string()))
         }
@@ -221,19 +356,27 @@ fn route(
     }
 }
 
-/// Takes the store lock, recovering from poisoning.
+/// Borrows a connection for one query.
 ///
-/// A panic in one handler would otherwise poison the mutex and make every
-/// later request panic too, turning one failed request into a permanent
-/// outage. The data behind the lock is a database connection, not an
-/// invariant-bearing structure, so continuing is sound.
-fn locked(
-    store: &Arc<Mutex<PostgresStore>>,
-) -> Result<std::sync::MutexGuard<'_, PostgresStore>, Failure> {
-    Ok(store.lock().unwrap_or_else(|poisoned| {
-        eprintln!("warning: recovering the store lock after a panic");
-        poisoned.into_inner()
-    }))
+/// Returns the guard rather than a `PostgresStore` because the store borrows
+/// the connection: the caller holds this alive for the length of its query and
+/// the connection returns to the pool at the end of the statement.
+fn connection(pool: &Pool) -> Result<PooledConnection, Failure> {
+    Ok(pool.get().map_err(ServerError::from)?)
+}
+
+/// Identifies a client for rate limiting.
+///
+/// Uses the source address, which is what is available without trusting a
+/// header. Behind a reverse proxy every request appears to come from the proxy
+/// and the limit becomes global — correct to know before putting one in front.
+/// `X-Forwarded-For` is deliberately *not* consulted: unvalidated, it lets any
+/// client mint an identity per request and bypass the limit entirely.
+fn client_key(request: &Request) -> String {
+    request
+        .remote_addr()
+        .map(|address| address.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Reads the request body, rejecting anything past the limit.
@@ -304,9 +447,10 @@ fn parse_payload(payload: &str) -> Result<WireBuild, Failure> {
     Ok(build)
 }
 
-fn ingest(payload: &str, store: &Arc<Mutex<PostgresStore>>) -> Result<String, Failure> {
+fn ingest(payload: &str, pool: &Pool) -> Result<String, Failure> {
     let build = parse_payload(payload)?;
-    let stored = locked(store)?.insert(&build)?;
+    let mut connection = connection(pool)?;
+    let stored = PostgresStore::new(&mut connection).insert(&build)?;
     Ok(serde_json::json!({
         "stored": stored,
         "build_key": build.build_key,
@@ -522,6 +666,42 @@ mod tests {
         assert!(is_authorized(Some("secret"), Some("secret ")));
     }
 
+    // --- the health-check exemption ---
+
+    /// `/health` must answer without a token, or a container healthcheck —
+    /// which has no credential to present — marks a working server unhealthy
+    /// and restart-loops it.
+    ///
+    /// Mirrors the predicate in [`handle`] rather than calling it, because
+    /// `handle` needs a live `Request`. The duplication is the point: if the
+    /// exemption there is ever widened, this test still describes what the
+    /// exemption is supposed to be, and the two disagreeing is the signal.
+    #[test]
+    fn only_the_health_path_skips_authentication() {
+        let exempt = |path: &str| path == "/health";
+        assert!(exempt("/health"));
+        // Every data path stays gated, including the ones that only read.
+        for path in [
+            "/v1/metrics",
+            "/v1/builds",
+            "/v1/builds/detail",
+            "/v1/stats",
+            "/v1/stats/daily",
+            "/v1/stats/percentiles",
+            "/v1/targets/slowest",
+            "/v1/targets/ranked",
+            "/v1/phases/ranked",
+            // Near-misses must not slip through a prefix or suffix match.
+            "/health/../v1/builds",
+            "/healthz",
+            "/v1/health",
+            "",
+            "/",
+        ] {
+            assert!(!exempt(path), "{path} must require a token");
+        }
+    }
+
     // --- numeric query parameters ---
 
     #[test]
@@ -676,6 +856,63 @@ mod tests {
             reply.body
         );
         assert!(detail.is_some(), "the detail must still reach the log");
+    }
+
+    /// Pool exhaustion is our problem, not the client's, and its message names
+    /// the host and port it failed to reach — which must not be echoed.
+    #[test]
+    fn pool_errors_map_to_internal_failures() {
+        let failure = Failure::from(store::pool_error_for_tests());
+        assert!(matches!(failure, Failure::Internal(_)));
+        let (reply, detail) = failure.into_reply();
+        assert_eq!(reply.status, 500);
+        assert_eq!(reply.body, r#"{"error":"internal error"}"#);
+        assert!(detail.is_some(), "the detail must still reach the log");
+    }
+
+    /// A throttled client is told to back off — unlike an internal failure,
+    /// this is a condition it can act on.
+    #[test]
+    fn rate_limiting_is_described_to_the_client() {
+        let (reply, detail) = Failure::TooManyRequests.into_reply();
+        assert_eq!(reply.status, 429);
+        assert!(reply.body.contains("too many requests"), "{}", reply.body);
+        assert!(detail.is_none(), "a throttled client needs no server-side log");
+    }
+
+    // --- configuration ---
+
+    /// A malformed size must stop startup rather than silently fall back: the
+    /// operator who set it believes it took effect.
+    #[test]
+    fn an_unparsable_size_is_rejected() {
+        // SAFETY: single-threaded test, and the variable is removed before it
+        // returns so no other test observes it.
+        unsafe { std::env::set_var("BUILDLENS_TEST_SIZE_BAD", "eight") };
+        let error = env_size("BUILDLENS_TEST_SIZE_BAD", 4).expect_err("not a number");
+        unsafe { std::env::remove_var("BUILDLENS_TEST_SIZE_BAD") };
+        assert!(error.to_string().contains("positive integer"), "{error}");
+    }
+
+    #[test]
+    fn zero_is_not_a_usable_size() {
+        unsafe { std::env::set_var("BUILDLENS_TEST_SIZE_ZERO", "0") };
+        let error = env_size("BUILDLENS_TEST_SIZE_ZERO", 4).expect_err("zero is unusable");
+        unsafe { std::env::remove_var("BUILDLENS_TEST_SIZE_ZERO") };
+        assert!(error.to_string().contains("greater than zero"), "{error}");
+    }
+
+    #[test]
+    fn an_absent_size_falls_back_to_the_default() {
+        assert_eq!(env_size("BUILDLENS_TEST_SIZE_ABSENT", 7).unwrap(), 7);
+    }
+
+    #[test]
+    fn a_configured_size_overrides_the_default() {
+        unsafe { std::env::set_var("BUILDLENS_TEST_SIZE_OK", " 16 ") };
+        let value = env_size("BUILDLENS_TEST_SIZE_OK", 4).unwrap();
+        unsafe { std::env::remove_var("BUILDLENS_TEST_SIZE_OK") };
+        assert_eq!(value, 16, "surrounding whitespace must be tolerated");
     }
 
     #[test]

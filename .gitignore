@@ -13,3 +13,9 @@ flamegraph.svg
 # Editors
 .idea/
 *.swp
+
+# Local secrets. compose reads BUILDLENS_TOKEN from here, so this file holds a
+# real credential and must never be committed.
+.env
+.env.*
+!.env.example

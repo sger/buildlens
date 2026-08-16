@@ -1,5 +1,6 @@
 use buildlens_core::wire::WireBuild;
 use postgres::{Client, NoTls};
+use r2d2_postgres::PostgresConnectionManager;
 use thiserror::Error;
 
 /// Everything the store can fail with.
@@ -12,40 +13,70 @@ use thiserror::Error;
 pub enum ServerError {
     #[error("database error: {0}")]
     Database(#[from] postgres::Error),
+    /// The pool could not hand out a connection within its timeout — every
+    /// connection is busy, or Postgres is unreachable. Distinct from
+    /// [`ServerError::Database`] because the cause is capacity, not a query.
+    #[error("no database connection available: {0}")]
+    Pool(#[from] r2d2::Error),
 }
 
-pub struct PostgresStore {
-    client: Client,
+/// A pool of Postgres connections shared by every worker thread.
+///
+/// This replaced a single `Mutex<Client>`. With one connection behind a global
+/// lock, every request — reads included — serialised against every other, so a
+/// slow analytical query blocked ingest behind it. Connections are cheap
+/// relative to that contention, and each request borrows one for its duration.
+pub type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
+
+/// One borrowed connection, returned to the pool when dropped.
+pub type PooledConnection = r2d2::PooledConnection<PostgresConnectionManager<NoTls>>;
+
+/// Builds the pool. Does not run migrations — see [`migrate`], which the
+/// caller runs once on a dedicated connection before serving traffic.
+pub fn pool(url: &str, size: u32) -> Result<Pool, ServerError> {
+    let manager = PostgresConnectionManager::new(url.parse::<postgres::Config>()?, NoTls);
+    // `min_idle(1)` keeps one connection warm so the first request after an
+    // idle period does not pay connection setup. The pool reconnects on its
+    // own if Postgres restarts under us, which is the other reason this is a
+    // pool rather than N long-lived clients.
+    Ok(r2d2::Pool::builder()
+        .max_size(size)
+        .min_idle(Some(1))
+        .build(manager)?)
 }
 
-impl PostgresStore {
-    pub fn connect(url: &str) -> Result<Self, ServerError> {
-        let client = Client::connect(url, NoTls)?;
-        let mut store = Self { client };
-        store.migrate()?;
-        Ok(store)
-    }
+/// Idempotent schema creation, run once at startup.
+///
+/// Deliberately not called per-connection: with a pool, that would re-run
+/// every ALTER on every connection the pool opens, for no benefit. The
+/// advisory lock still guards against *other* BuildLens processes starting
+/// against the same database concurrently.
+///
+/// `builds` is partitioned by day so that dropping old data becomes a
+/// partition drop and day-scoped queries can skip whole ranges. Note that
+/// only a DEFAULT partition is created here: until per-day partitions are
+/// added, every row lands in the default and neither benefit applies. The
+/// declaration is in place so adding them later needs no table rewrite.
+pub fn migrate(client: &mut Client) -> Result<(), ServerError> {
+    // Serialised against every other BuildLens process on this database:
+    // concurrent starts would run the same ALTER TABLEs and deadlock.
+    client.execute("SELECT pg_advisory_lock($1)", &[&0x6275_696c_i64])?;
+    let result = migrate_locked(client);
+    let unlock = client.execute("SELECT pg_advisory_unlock($1)", &[&0x6275_696c_i64]);
+    result?;
+    unlock?;
+    Ok(())
+}
 
-    /// Idempotent schema creation.
-    ///
-    /// `builds` is partitioned by day so that dropping old data becomes a
-    /// partition drop and day-scoped queries can skip whole ranges. Note that
-    /// only a DEFAULT partition is created here: until per-day partitions are
-    /// added, every row lands in the default and neither benefit applies. The
-    /// declaration is in place so adding them later needs no table rewrite.
-    fn migrate(&mut self) -> Result<(), ServerError> {
-        // Serialised against every other BuildLens process on this database:
-        // concurrent starts would run the same ALTER TABLEs and deadlock.
-        self.client.execute("SELECT pg_advisory_lock($1)", &[&0x6275_696c_i64])?;
-        let result = self.migrate_locked();
-        let unlock = self.client.execute("SELECT pg_advisory_unlock($1)", &[&0x6275_696c_i64]);
-        result?;
-        unlock?;
-        Ok(())
-    }
+/// Connects once and applies the schema. Used at startup and by tests.
+pub fn connect_and_migrate(url: &str) -> Result<Client, ServerError> {
+    let mut client = Client::connect(url, NoTls)?;
+    migrate(&mut client)?;
+    Ok(client)
+}
 
-    fn migrate_locked(&mut self) -> Result<(), ServerError> {
-        self.client.batch_execute(
+fn migrate_locked(client: &mut Client) -> Result<(), ServerError> {
+    client.batch_execute(
             "CREATE TABLE IF NOT EXISTS builds (
                 build_key TEXT NOT NULL,
                 day DATE NOT NULL,
@@ -101,8 +132,25 @@ impl PostgresStore {
             -- unknown rather than as success.
             ALTER TABLE builds ADD COLUMN IF NOT EXISTS status TEXT;
             ALTER TABLE builds ADD COLUMN IF NOT EXISTS scheme TEXT;",
-        )?;
-        Ok(())
+    )?;
+    Ok(())
+}
+
+/// The query surface, over one connection borrowed from the [`Pool`] for the
+/// life of a single request.
+///
+/// Holds a `&mut Client` rather than owning one: the connection belongs to the
+/// pool, and tying the borrow to this struct's lifetime is what guarantees it
+/// goes back when the request ends.
+pub struct PostgresStore<'a> {
+    client: &'a mut Client,
+}
+
+impl<'a> PostgresStore<'a> {
+    /// Wraps a borrowed connection. Runs no migrations — the schema is applied
+    /// once at startup by [`migrate`].
+    pub fn new(client: &'a mut Client) -> Self {
+        Self { client }
     }
 
     /// Stores a build. Re-sending the same build is a no-op, so a client that
@@ -475,6 +523,26 @@ fn civil_from_days(days: i64) -> String {
 #[cfg(test)]
 pub fn connect_error_for_tests() -> ServerError {
     Client::connect("postgres://127.0.0.1:1/nodb", NoTls)
+        .err()
+        .expect("connecting to a closed port fails")
+        .into()
+}
+
+/// A real `ServerError::Pool`, for the test asserting that pool exhaustion is
+/// reported as an internal failure rather than described to the client. A pool
+/// pointed at a closed port fails its connection timeout.
+#[cfg(test)]
+pub fn pool_error_for_tests() -> ServerError {
+    let manager = PostgresConnectionManager::new(
+        "postgres://127.0.0.1:1/nodb".parse().expect("valid config"),
+        NoTls,
+    );
+    r2d2::Pool::builder()
+        .max_size(1)
+        .min_idle(Some(0))
+        .connection_timeout(std::time::Duration::from_millis(50))
+        .build_unchecked(manager)
+        .get()
         .err()
         .expect("connecting to a closed port fails")
         .into()

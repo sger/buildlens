@@ -125,6 +125,70 @@ phase names, and optional hardware facts — never source paths, per-file
 timings, or log contents.
 </details>
 
+## Running the team server in a container
+
+Only for a shared backend — collecting your own builds needs none of this.
+
+The server receives already-parsed metrics: clients parse locally and push a
+JSON document under 1 MiB, so there is no slow server-side work and no queue,
+worker or object store to run. Postgres is the only dependency.
+
+```sh
+printf 'BUILDLENS_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
+podman compose -f docker-compose.server.yml up -d --build
+curl -fsS http://127.0.0.1:8788/health          # {"status":"ok"}
+```
+
+`docker-compose.server.yml` runs Postgres *and* the server;
+`docker-compose.yml` runs Postgres alone and is what the local workflow above
+uses. Both share the `buildlens-pgdata` volume, so a machine that has been
+collecting locally keeps its history when it starts serving a team.
+
+Push a build to it:
+
+```sh
+cargo run -- collect --project MyApp --collect-all \
+  --server http://127.0.0.1:8788 --token "$(grep BUILDLENS_TOKEN .env | cut -d= -f2)"
+```
+
+**Configuration.** `BUILDLENS_TOKEN` is required: without it the server refuses
+to start rather than accepting writes from anyone who can reach the port. To run
+unauthenticated on a trusted network, opt out explicitly with
+`BUILDLENS_ALLOW_ANONYMOUS=1`. `BUILDLENS_POOL_SIZE` and `BUILDLENS_THREADS`
+(both 8) size the Postgres connection pool and the worker threads; threads above
+pool size only block waiting for a connection. `/v1/metrics` is rate limited to
+120 requests per minute per source address.
+
+`/health` is the one route that needs no token — a container healthcheck has no
+credential to present — and it answers without touching Postgres, so a brief
+database blip does not restart a server that is otherwise fine.
+
+**No TLS.** The token crosses the network in cleartext, so keep this on a
+trusted network or a VPN, or terminate TLS in a reverse proxy in front of it.
+The compose file binds `127.0.0.1:8788`; change it to `8788:8788` to accept
+connections from other machines, and understand the above before you do.
+
+<details>
+<summary>Deploying to a Synology NAS</summary>
+
+The NAS is x86_64 while an Apple Silicon Mac is not, so build for the target
+architecture explicitly:
+
+```sh
+podman build --platform linux/amd64 -t buildlens:local .
+podman save buildlens:local | ssh nas 'docker load'
+```
+
+Then copy `docker-compose.server.yml` and a `.env` holding the token to the NAS
+and start it from Container Manager or `docker compose`. Postgres is not
+published to the host in that file, both to keep the surface small and because
+DSM ships its own PostgreSQL that may already hold port 5433.
+
+Base images come from `ghcr.io` rather than Docker Hub. Both stages are Debian
+12 and share a glibc — mixing distributions between builder and runtime
+produces a binary that will not start.
+</details>
+
 Diagnostics and Swift type-check timings live in the *text* log, which the
 collector never sees, so those panels need a paired save:
 
@@ -140,6 +204,50 @@ Swift hotspots additionally need `-Xfrontend -warn-long-function-bodies=100
 
 To wire collection to an Xcode scheme post-action instead of running a watcher,
 see the install instructions at the top of `scripts/xcode-post-action.sh`.
+
+### Collecting from `xcodebuild` (terminal and CI)
+
+**`xcodebuild` often writes no build log at all.** Xcode.app always writes one;
+`xcodebuild` frequently does not, even when it recompiles — a build with four
+compile tasks can still leave `Logs/Build/` empty. The symptom is silence: the
+watcher polls, nothing appears, and there is nothing to find because nothing
+was written.
+
+Two flags fix it, for two different reasons:
+
+```sh
+xcodebuild -scheme MyApp -destination '...' \
+  -derivedDataPath build/DerivedData \
+  -resultBundlePath build/result.xcresult \
+  build
+
+cargo run -- collect --build-dir build/DerivedData --db "$DB"
+```
+
+`-resultBundlePath` is what makes Xcode write the `.xcactivitylog`.
+`-derivedDataPath` controls *where* it lands, keeping it out of the shared
+`~/Library/Developer/Xcode/DerivedData/Build/` where no `Logs/Build` exists.
+Whether `-derivedDataPath` alone suffices varies by project, so pass both.
+
+`-resultBundlePath` fails if the bundle already exists — remove it first, or
+use a fresh path per run.
+
+Two logs that are *not* builds and are deliberately skipped: `Logs/Package`
+entries (SPM dependency resolution), and the log `xcodebuild clean` writes,
+which times a second or two and compiles nothing. Recording either would put a
+phantom entry beside real builds of the same project.
+
+When a DerivedData root holds only a shared `Build/` and no logs anywhere,
+BuildLens names that case rather than reporting an empty result — from
+`collect`, and once at watcher startup.
+
+`--build-dir` is otherwise optional. When Xcode sets `$BUILD_DIR` — in a scheme
+post-action, or any build script Xcode spawns — the log directory is resolved
+from it by searching upward for a `Logs/Build` sibling. That is one code path
+for local Xcode.app builds, terminal `xcodebuild`, and CI: the same variable and
+the same search, with no per-caller special cases. It follows
+`-derivedDataPath` wherever you point it, and handles archive builds, whose
+`$BUILD_DIR` sits several levels deeper than a normal build's.
 
 ## Commands
 

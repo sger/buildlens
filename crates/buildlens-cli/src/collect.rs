@@ -2,6 +2,20 @@
 //! DerivedData, wait until Xcode finishes writing it, and hand it to the
 //! normal save pipeline. Nothing is copied or uploaded — logs are read in
 //! place and only derived metrics reach PostgreSQL.
+//!
+//! # Finding the log
+//!
+//! Two ways in, deliberately sharing one implementation so a build collected
+//! from a scheme post-action, a terminal `xcodebuild`, and CI all resolve the
+//! same log the same way:
+//!
+//! 1. `$BUILD_DIR`, when Xcode set it — the case that needs no guessing,
+//!    because Xcode is naming the build it just ran. See [`logs_dir_for_build_dir`].
+//! 2. Otherwise a scan of DerivedData, which has to guess which
+//!    `<Project>-<hash>` directory is relevant.
+//!
+//! The first is strictly better when available: it is exact, and it follows
+//! `-derivedDataPath` to wherever the caller put it.
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -10,6 +24,70 @@ use std::time::{Duration, Instant};
 /// The log must keep the same size/mtime for this long to count as finished.
 const STABLE_FOR: Duration = Duration::from_secs(1);
 const POLL_EVERY: Duration = Duration::from_millis(250);
+
+/// How far up from `$BUILD_DIR` to look for a `Logs/Build` sibling.
+///
+/// Deliberately a search rather than a fixed number of parent hops. The depth
+/// genuinely varies — `<dd>/Build/Products` for a normal build,
+/// `<dd>/Build/Intermediates.noindex/ArchiveIntermediates/<Scheme>/BuildProductsPath`
+/// when archiving — and hard-coding either count silently resolves to a
+/// non-existent directory under the other layout, which reads as "no builds
+/// yet" rather than as a bug. Six covers both with room to spare.
+const MAX_ASCENT: usize = 6;
+
+/// Resolves the directory holding build logs from Xcode's `$BUILD_DIR`.
+///
+/// Walks up looking for a `Logs/Build` sibling and returns the first that
+/// exists, so both the normal and archive layouts resolve without knowing
+/// which one produced this build.
+///
+/// Returns `None` when no ancestor has one. That is the signature of a
+/// default-DerivedData `xcodebuild` run, which writes products under the
+/// shared `DerivedData/Build/` and no build log anywhere — see
+/// [`shared_derived_data_hint`].
+pub fn logs_dir_for_build_dir(build_dir: &Path) -> Option<PathBuf> {
+    let mut current = build_dir;
+    for _ in 0..MAX_ASCENT {
+        let candidate = current.join("Logs/Build");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        current = current.parent()?;
+    }
+    None
+}
+
+/// Explains the one failure that otherwise looks exactly like "no builds yet".
+///
+/// `xcodebuild` without `-derivedDataPath` puts products in the *shared*
+/// `DerivedData/Build/` and writes no build activity log at all — only
+/// `Logs/Package` entries for dependency resolution, which are not builds.
+/// Xcode.app always writes one, so this bites only terminal and CI builds,
+/// and the symptom is silence: the watcher polls forever and no build appears.
+///
+/// Returns a message when `root` shows that shape, so the caller can say what
+/// to change instead of reporting an empty result.
+pub fn shared_derived_data_hint(root: &Path) -> Option<String> {
+    let build = root.join("Build");
+    if !build.is_dir() || logs_in(&build) {
+        return None;
+    }
+    // A shared `Build/` is only evidence of the broken case when nothing else
+    // under this root has build logs. A developer's DerivedData routinely
+    // holds both: per-project directories written by Xcode.app, and a stray
+    // `Build/` left by some earlier `xcodebuild`. Warning there would tell
+    // someone to add a flag for a problem they do not have, on every start.
+    if !collect_candidates(root, None).is_ok_and(|logs| logs.is_empty()) {
+        return None;
+    }
+    Some(format!(
+        "{} contains a shared Build/ directory but no build logs. That is what \
+         `xcodebuild` produces without `-derivedDataPath`: it writes products \
+         there and no .xcactivitylog anywhere. Re-run with \
+         `-derivedDataPath <path>` (Xcode.app builds are unaffected).",
+        root.display()
+    ))
+}
 
 /// Every activity log under `root`, newest first. Unlike [`find_activity_logs`]
 /// an empty result is not an error: a watcher polling a DerivedData that has
@@ -38,6 +116,12 @@ pub fn find_activity_logs(root: &Path, project: Option<&str>) -> Result<Vec<Path
         )
     });
     if logs.is_empty() {
+        // The shared-DerivedData case is by far the most common reason for an
+        // empty result, and the least guessable, so it is named rather than
+        // left as "found nothing".
+        if let Some(hint) = shared_derived_data_hint(root) {
+            bail!("{hint}");
+        }
         bail!(
             "no .xcactivitylog found under {} (project filter: {})",
             root.display(),
@@ -45,6 +129,30 @@ pub fn find_activity_logs(root: &Path, project: Option<&str>) -> Result<Vec<Path
         );
     }
     Ok(logs)
+}
+
+/// The search root, preferring what Xcode said over what we would guess.
+///
+/// When `$BUILD_DIR` is set — a scheme post-action, or any build script Xcode
+/// spawned — it names the build that just finished, so the log it points at is
+/// the right one by construction. This is what makes a post-action, a terminal
+/// `xcodebuild` and CI resolve identically: the same environment variable, the
+/// same ascent, no per-caller special cases.
+///
+/// `explicit` is the `--build-dir` flag. A caller who named a directory means
+/// it, so it always wins; `$BUILD_DIR` only fills in for the default.
+pub fn search_root(explicit: Option<&Path>, default_root: &Path) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    if let Some(from_xcode) = std::env::var_os("BUILD_DIR")
+        .map(PathBuf::from)
+        .as_deref()
+        .and_then(logs_dir_for_build_dir)
+    {
+        return from_xcode;
+    }
+    default_root.to_path_buf()
 }
 
 /// Newest build activity log under `root`.
@@ -198,6 +306,135 @@ mod tests {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(bytes).unwrap();
         encoder.finish().unwrap()
+    }
+
+    // --- resolving $BUILD_DIR to a logs directory ---
+
+    /// The normal build layout: `$BUILD_DIR` is `<dd>/Build/Products`, two
+    /// levels below the `Logs/Build` sibling.
+    #[test]
+    fn resolves_the_normal_build_layout() {
+        let root = scratch("bd-normal");
+        std::fs::create_dir_all(root.join("Logs/Build")).unwrap();
+        let build_dir = root.join("Build/Products");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        assert_eq!(
+            logs_dir_for_build_dir(&build_dir),
+            Some(root.join("Logs/Build"))
+        );
+    }
+
+    /// Archiving puts `$BUILD_DIR` five levels down instead of two. A fixed
+    /// number of parent hops resolves one layout and silently misses the
+    /// other, which is the bug this ascent exists to avoid.
+    #[test]
+    fn resolves_the_archive_layout_at_a_different_depth() {
+        let root = scratch("bd-archive");
+        std::fs::create_dir_all(root.join("Logs/Build")).unwrap();
+        let build_dir =
+            root.join("Build/Intermediates.noindex/ArchiveIntermediates/App/BuildProductsPath");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        assert_eq!(
+            logs_dir_for_build_dir(&build_dir),
+            Some(root.join("Logs/Build"))
+        );
+    }
+
+    /// The shared-DerivedData case: products exist, no `Logs/Build` anywhere
+    /// above them. Must be `None` rather than a path that does not exist.
+    #[test]
+    fn a_missing_logs_directory_resolves_to_nothing() {
+        let root = scratch("bd-missing");
+        let build_dir = root.join("Build/Products");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        assert_eq!(logs_dir_for_build_dir(&build_dir), None);
+    }
+
+    /// The ascent must stop rather than walking to the filesystem root and
+    /// matching some unrelated `Logs/Build` far above the build.
+    #[test]
+    fn the_ascent_is_bounded() {
+        let root = scratch("bd-bounded");
+        std::fs::create_dir_all(root.join("Logs/Build")).unwrap();
+        // Deeper than MAX_ASCENT below the directory holding Logs/Build.
+        let mut deep = root.join("Build");
+        for level in 0..MAX_ASCENT + 2 {
+            deep = deep.join(format!("level{level}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(logs_dir_for_build_dir(&deep), None);
+    }
+
+    // --- choosing the search root ---
+
+    /// An explicitly named directory always wins: a caller who passed
+    /// `--build-dir` meant that directory, whatever Xcode's environment says.
+    #[test]
+    fn an_explicit_build_dir_beats_the_environment() {
+        let explicit = PathBuf::from("/explicit/path");
+        let chosen = search_root(Some(&explicit), Path::new("/default"));
+        assert_eq!(chosen, explicit);
+    }
+
+    /// With nothing explicit and no usable `$BUILD_DIR`, the DerivedData root
+    /// is the fallback — the behaviour before `$BUILD_DIR` was consulted.
+    #[test]
+    fn the_default_root_is_used_when_nothing_else_applies() {
+        // SAFETY: single-threaded test; the variable is removed before return.
+        unsafe { std::env::remove_var("BUILD_DIR") };
+        assert_eq!(
+            search_root(None, Path::new("/default")),
+            PathBuf::from("/default")
+        );
+    }
+
+    // --- the shared-DerivedData diagnostic ---
+
+    /// A `Build/` directory with no logs is the shape `xcodebuild` leaves
+    /// without `-derivedDataPath`, and the one case worth naming: the symptom
+    /// is silence, and the fix is a flag nobody guesses.
+    #[test]
+    fn the_shared_derived_data_shape_is_explained() {
+        let root = scratch("hint-shared");
+        std::fs::create_dir_all(root.join("Build/Products")).unwrap();
+        let hint = shared_derived_data_hint(&root).expect("the shared layout must be recognised");
+        assert!(hint.contains("-derivedDataPath"), "{hint}");
+    }
+
+    /// A DerivedData with no `Build/` at all is just empty, not misconfigured,
+    /// and must not be blamed on `xcodebuild`.
+    #[test]
+    fn an_ordinary_empty_root_gets_no_hint() {
+        let root = scratch("hint-empty");
+        assert_eq!(shared_derived_data_hint(&root), None);
+    }
+
+    /// A developer's DerivedData routinely holds both a stray `Build/` from
+    /// some earlier `xcodebuild` and per-project directories Xcode.app filled
+    /// with real logs. Warning there tells someone to fix a problem they do
+    /// not have — and the watcher would repeat it on every start.
+    #[test]
+    fn a_stray_build_directory_beside_real_logs_gets_no_hint() {
+        let root = scratch("hint-mixed");
+        std::fs::create_dir_all(root.join("Build/Products")).unwrap();
+        let project = root.join("App-abc123/Logs/Build");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.xcactivitylog"), b"x").unwrap();
+        assert_eq!(
+            shared_derived_data_hint(&root),
+            None,
+            "a root that already yields logs is not the shared-DerivedData case"
+        );
+    }
+
+    /// A `Build/` that does hold logs is a normal layout, not the broken one.
+    #[test]
+    fn a_build_directory_holding_logs_gets_no_hint() {
+        let root = scratch("hint-haslogs");
+        let logs = root.join("Build");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("a.xcactivitylog"), b"x").unwrap();
+        assert_eq!(shared_derived_data_hint(&root), None);
     }
 
     #[test]

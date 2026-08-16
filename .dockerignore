@@ -1,0 +1,16 @@
+# target/ is the big one: a local debug build is gigabytes, and sending it as
+# build context would both slow every build and risk macOS-built artifacts
+# shadowing the Linux ones inside the image.
+target/
+dashboard-ui/node_modules/
+
+.git/
+.github/
+*.md
+!README.md
+
+# Local state that must never reach an image.
+.env
+.env.*
+*.log
+fixtures/
