@@ -29,7 +29,7 @@ pub use diagnostics::{
     DiagnosticAggregate, DiagnosticCategory, DiagnosticExample, DiagnosticSeverity,
     DiagnosticSummary, Swift6Summary,
 };
-pub use git::{GitCorrelation, GitOwnership};
+pub use git::{GitCorrelation, GitOwnership, LikelyRelated};
 pub use graph::{TargetDependency, TargetGraphSummary, TargetNode};
 pub use intel::{Bottleneck, EvidenceChain, EvidenceLink, Intelligence, TargetImpact};
 pub use metrics::{
