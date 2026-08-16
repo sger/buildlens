@@ -6,6 +6,11 @@ license.workspace = true
 
 [dependencies]
 buildlens-core = { path = "../buildlens-core" }
+# For the hardened `redact_text`, so plugin values are scrubbed by the same
+# implementation that scrubs parsed metrics rather than a weaker copy.
+buildlens-metrics = { path = "../buildlens-metrics" }
 anyhow.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true

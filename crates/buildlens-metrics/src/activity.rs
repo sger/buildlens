@@ -12,7 +12,9 @@ const MAX_FILES: usize = 50;
 const MAX_SWIFT_TIMINGS: usize = 50;
 const MAX_PHASES: usize = 100;
 
-/// Step types excluded when computing the clean/incremental/noop category.
+/// Step types excluded when computing the clean/incremental/noop category:
+/// they run regardless of whether anything was recompiled, so counting them
+/// would make every build look incremental.
 const NON_COMPILATION_STEP_TYPES: &[&str] = &["other", "scriptExecution", "copySwiftLibs"];
 
 pub struct MapOptions {
@@ -502,7 +504,6 @@ mod tests {
 
     /// The exact strings Xcode writes, verified against real logs: a failing
     /// sample-app build and the packagesbench fixture.
-    /// and its timings are unreliable.
     #[test]
     fn build_status_matches_xcodes_own_verdict() {
         assert_eq!(build_status("Build failed").as_deref(), Some("failed"));

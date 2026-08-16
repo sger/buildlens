@@ -207,9 +207,8 @@ pub struct BuildMetrics {
     /// whose diagnostics the text parser handles directly.
     pub diagnostics: Vec<MetricDiagnostic>,
     /// Xcode's own verdict for the build, from the activity log's main section
-    /// (`localizedResultString`, e.g. "Build failed"), normalized the same way
-    /// reduced to the bare verdict:
-    /// "Clean" and trim, leaving "succeeded" / "failed" / "cancelled".
+    /// (`localizedResultString`, e.g. "Build failed"), reduced to the bare
+    /// verdict: "succeeded" / "failed" / "cancelled".
     ///
     /// `None` for text logs, which carry no such statement. Absent means
     /// unknown — never assume success.
