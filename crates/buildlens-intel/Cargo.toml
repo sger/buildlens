@@ -1,0 +1,12 @@
+[package]
+name = "buildlens-intel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+buildlens-core = { path = "../buildlens-core" }
+buildlens-graph = { path = "../buildlens-graph" }
+
+[dev-dependencies]
+serde_json.workspace = true

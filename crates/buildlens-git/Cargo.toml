@@ -1,0 +1,9 @@
+[package]
+name = "buildlens-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+buildlens-core = { path = "../buildlens-core" }
+thiserror.workspace = true

@@ -1,0 +1,32 @@
+[package]
+name = "buildlens-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "buildlens"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+buildlens-core = { path = "../buildlens-core" }
+buildlens-diagnostics = { path = "../buildlens-diagnostics" }
+buildlens-graph = { path = "../buildlens-graph" }
+buildlens-intel = { path = "../buildlens-intel" }
+buildlens-git = { path = "../buildlens-git" }
+buildlens-parser = { path = "../buildlens-parser" }
+buildlens-plugins = { path = "../buildlens-plugins" }
+buildlens-metrics = { path = "../buildlens-metrics" }
+buildlens-report = { path = "../buildlens-report" }
+buildlens-dashboard = { path = "../buildlens-dashboard" }
+buildlens-storage = { path = "../buildlens-storage" }
+buildlens-tests = { path = "../buildlens-tests" }
+clap.workspace = true
+flate2.workspace = true
+ureq.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "buildlens-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+buildlens-core = { path = "../buildlens-core" }
+petgraph.workspace = true
+
