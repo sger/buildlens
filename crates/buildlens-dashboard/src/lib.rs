@@ -1,0 +1,530 @@
+use buildlens_storage::{PostgresStore, StoreError};
+use std::sync::Arc;
+use tiny_http::{Method, Response, Server, StatusCode};
+
+const INDEX: &str = include_str!("index.html");
+const MAX_LIMIT: i64 = 500;
+
+pub fn serve(store: PostgresStore, port: u16) -> anyhow::Result<()> {
+    let server = Server::http(("127.0.0.1", port)).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let store = Arc::new(std::sync::Mutex::new(store));
+    eprintln!("BuildLens dashboard: http://127.0.0.1:{port}");
+    for request in server.incoming_requests() {
+        let routed = if request.method() == &Method::Get {
+            let (path, query) = split_url(request.url());
+            route(&path, &query, &store)
+        } else {
+            Routed {
+                status: 405,
+                content_type: "application/json",
+                body: serde_json::json!({ "error": "method not allowed" }).to_string(),
+            }
+        };
+        // Logged, not propagated: `respond` fails when the client disconnects
+        // mid-response, and a closed browser tab must not shut the dashboard
+        // down.
+        if let Err(error) = request.respond(
+            Response::from_string(routed.body)
+                .with_status_code(StatusCode(routed.status))
+                .with_header(header(routed.content_type))
+                .with_header(no_cache()),
+        ) {
+            eprintln!("dashboard: could not send a response: {error}");
+        }
+    }
+    Ok(())
+}
+
+pub struct Routed {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub body: String,
+}
+
+fn header(content_type: &'static str) -> tiny_http::Header {
+    tiny_http::Header::from_bytes(b"Content-Type", content_type.as_bytes()).expect("valid header")
+}
+
+/// The UI is compiled into the binary, so upgrading BuildLens changes the page
+/// while its URL stays `http://127.0.0.1:8787/`. Without this, a browser keeps
+/// serving the previous build's bundle from cache and the new dashboard simply
+/// never appears — which reads as "the data is missing" rather than "the page
+/// is stale". API responses are live data and must not be cached either.
+fn no_cache() -> tiny_http::Header {
+    tiny_http::Header::from_bytes(b"Cache-Control", b"no-store, must-revalidate")
+        .expect("valid header")
+}
+
+fn split_url(url: &str) -> (String, String) {
+    url.split_once('?').map(|(a, b)| (a.to_owned(), b.to_owned())).unwrap_or((url.to_owned(), String::new()))
+}
+
+/// Percent-decoded string query parameter. Project names contain spaces and
+/// non-ASCII characters, so a raw read would fail to match the stored name.
+fn text_param(query: &str, name: &str) -> Option<String> {
+    let raw = query.split('&').filter_map(|pair| pair.split_once('=')).find(|(key, _)| *key == name)?.1;
+    Some(percent_decode(raw))
+}
+
+/// Decodes `%XX` escapes and `+` as a space.
+///
+/// Shared by the query parameters and the `/api/build/<key>` path segment, so
+/// a project name and a build key are decoded by one implementation rather
+/// than two that could disagree.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 3 <= bytes.len() => match u8::from_str_radix(&raw[index + 1..index + 3], 16) {
+                Ok(byte) => {
+                    decoded.push(byte);
+                    index += 3;
+                }
+                Err(_) => {
+                    decoded.push(b'%');
+                    index += 1;
+                }
+            },
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn not_found(message: &str) -> Routed {
+    Routed {
+        status: 404,
+        content_type: "application/json",
+        body: serde_json::json!({ "error": message }).to_string(),
+    }
+}
+
+fn number_param(query: &str, name: &str, default: i64) -> i64 {
+    text_param(query, name).and_then(|value| value.parse().ok()).unwrap_or(default).clamp(1, MAX_LIMIT)
+}
+
+/// Renders a store result as a JSON response.
+///
+/// Two rules, both about not lying to the page:
+///
+/// A serialization failure is a 500, not `{}` with status 200. An empty object
+/// is a *valid, successful* answer, so the page would render empty panels and
+/// the reader would conclude there is no data rather than that the request
+/// failed.
+///
+/// A store error is reported as a bare message. `StoreError::Database` wraps a
+/// `postgres::Error` whose `Display` can name tables, constraints and
+/// connection details; the detail goes to the log the operator can read.
+fn json<T: serde::Serialize>(value: Result<T, StoreError>) -> Routed {
+    match value {
+        Ok(value) => match serde_json::to_string(&value) {
+            Ok(body) => Routed { status: 200, content_type: "application/json", body },
+            Err(error) => {
+                eprintln!("dashboard: could not serialize a response: {error}");
+                error_response("could not render this result")
+            }
+        },
+        Err(error) => {
+            eprintln!("dashboard: store query failed: {error}");
+            error_response("query failed")
+        }
+    }
+}
+
+/// A 500 whose body says only what a browser needs to know.
+fn error_response(message: &str) -> Routed {
+    Routed {
+        status: 500,
+        content_type: "application/json",
+        body: serde_json::json!({ "error": message }).to_string(),
+    }
+}
+
+/// Read-only routing over store snapshots; separated from HTTP for testability.
+///
+/// Every project-scoped endpoint must thread `project` through, or a 400s
+/// project's numbers leak into a 12s project's panel — a recurring bug class
+/// here, guarded by `project_filter_reaches_every_project_scoped_route`.
+pub fn route(path: &str, query: &str, store: &Arc<std::sync::Mutex<PostgresStore>>) -> Routed {
+    let limit = number_param(query, "limit", 100);
+    let builds = number_param(query, "builds", 30);
+    let top = number_param(query, "top", 8).min(20);
+    // Empty or absent "project" means every project.
+    let project = text_param(query, "project").filter(|value| !value.is_empty());
+    let project = project.as_deref();
+    // A panic in one request would otherwise poison the mutex and make every
+    // later request panic too, turning one failure into a permanent outage.
+    // Behind the lock is a database connection, not an invariant-bearing
+    // structure, so continuing is sound.
+    let mut store = store.lock().unwrap_or_else(|poisoned| {
+        eprintln!("dashboard: recovering the store lock after a panic");
+        poisoned.into_inner()
+    });
+    match path {
+        "/" => Routed { status: 200, content_type: "text/html", body: INDEX.into() },
+        "/health" => Routed { status: 200, content_type: "application/json", body: "{\"status\":\"ok\"}".into() },
+        "/api/summary" | "/api/builds" => json(store.dashboard_snapshot()),
+        "/api/projects" => json(store.projects()),
+        "/api/trends/duration" => json(store.duration_trend_for(limit.min(200), project)),
+        "/api/trends/percentiles" => json(store.duration_percentiles_for(limit, project)),
+        "/api/trends/daily" => json(store.daily_percentiles_for(limit.min(90), project)),
+        "/api/trends/targets" => json(store.target_trend(builds, top, project)),
+        "/api/trends/phases" => json(store.phase_trend(builds, top, project)),
+        "/api/trends/diagnostics" => json(store.diagnostic_trend_for(limit, project)),
+        "/api/files/slowest" => json(store.slowest_files(builds, limit.min(50), project)),
+        "/api/swift/slowest" => json(store.slowest_swift_timings(builds, limit.min(50), project)),
+        "/api/diagnostics/clusters" => json(store.diagnostic_clusters(builds, limit.min(50), project)),
+        "/api/tests/flaky" => json(store.flaky_tests(builds, limit.min(50), project)),
+        "/api/regressions" => json(store.target_regressions(builds, limit.min(50), project)),
+        "/api/environment" => json(store.environment_breakdown(builds, project)),
+        "/api/git" => json(store.git_context(builds, project)),
+        p if p.starts_with("/api/build/") => {
+            // Percent-decoded: a build key comes from an activity log and can
+            // contain characters the browser escapes, which would otherwise
+            // never match the stored value.
+            let key = percent_decode(p.trim_start_matches("/api/build/"));
+            if key.is_empty() {
+                return Routed {
+                    status: 400,
+                    content_type: "application/json",
+                    body: serde_json::json!({ "error": "missing build id" }).to_string(),
+                };
+            }
+            // `None` is a stale link, not a failure, so it is a clean 404.
+            match store.build_snapshot(&key) {
+                Ok(Some(snapshot)) => json(Ok::<_, StoreError>(snapshot)),
+                Ok(None) => not_found("no such build"),
+                Err(error) => {
+                    eprintln!("dashboard: store query failed: {error}");
+                    error_response("query failed")
+                }
+            }
+        }
+        _ => not_found("not found"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every project-scoped route must accept and apply `project`. A route
+    /// that silently ignores it mixes one project's builds into another's
+    /// numbers, which is why this list is enumerated rather than sampled.
+    const PROJECT_SCOPED: &[&str] = &[
+        "/api/trends/duration",
+        "/api/trends/percentiles",
+        "/api/trends/daily",
+        "/api/trends/targets",
+        "/api/trends/phases",
+        "/api/trends/diagnostics",
+        "/api/files/slowest",
+        "/api/swift/slowest",
+        "/api/diagnostics/clusters",
+        "/api/tests/flaky",
+        "/api/regressions",
+        "/api/environment",
+        "/api/git",
+    ];
+
+    /// A project-scoped route must actually accept the filter.
+    ///
+    /// `PROJECT_SCOPED` is hand-maintained, and scraping the source for match
+    /// arms proved unreliable — it matched paths written in doc comments too.
+    /// Instead each listed route is exercised through `route()` twice, with
+    /// and without a project, and must answer both: a route that ignored the
+    /// parameter would still answer, but one that is not routed at all returns
+    /// 404 and fails here.
+    ///
+    /// Needs a database, so it is skipped without one; the `index.html` checks
+    /// below cover the wiring on every run.
+    #[test]
+    fn every_project_scoped_route_is_actually_routed() {
+        let Ok(url) = std::env::var("BUILDLENS_TEST_DATABASE_URL") else {
+            eprintln!("skipping: BUILDLENS_TEST_DATABASE_URL not set");
+            return;
+        };
+        let store = Arc::new(std::sync::Mutex::new(
+            PostgresStore::connect(&url).expect("connect and migrate"),
+        ));
+        for path in PROJECT_SCOPED {
+            for query in ["", "project=App"] {
+                let routed = route(path, query, &store);
+                assert_ne!(
+                    routed.status, 404,
+                    "{path} is listed as project-scoped but is not routed"
+                );
+            }
+        }
+        // The discriminator: an unrouted path really does 404, so the
+        // assertion above is not vacuous.
+        assert_eq!(route("/api/nope", "", &store).status, 404);
+    }
+
+    /// The frontend calls `scope()` for each of these; if a route here is not
+    /// wired in `index.html`, the panel silently shows unfiltered data.
+    #[test]
+    fn every_project_scoped_route_is_requested_by_the_page() {
+        for path in PROJECT_SCOPED {
+            assert!(INDEX.contains(path), "index.html never requests {path}");
+        }
+    }
+
+    /// The page must scope its requests, not just call them. A bare fetch of a
+    /// project-scoped endpoint is the exact bug this guards.
+    ///
+    /// `index.html` is a minified bundle, so `scope` is renamed to something
+    /// like `Tl` and cannot be matched by name. It can still be *identified*:
+    /// `/api/trends/targets` is always scoped, so whatever identifier precedes
+    /// it is the minified `scope`. Every other project-scoped path must then be
+    /// called through that same identifier. A panel that fetched a path
+    /// directly would be preceded by the plain fetch helper instead, and fail.
+    #[test]
+    fn the_page_scopes_its_project_filtered_requests() {
+        let anchor = "/api/trends/targets";
+        let at = INDEX.find(anchor).expect("index.html never requests the anchor route");
+        // Walk back over the opening `("` to the identifier before it.
+        let before = INDEX[..at].trim_end_matches(['"', '\'', '(']);
+        let helper: String = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert!(!helper.is_empty(), "could not identify the scope() helper in the bundle");
+
+        for path in PROJECT_SCOPED {
+            assert!(
+                INDEX.contains(&format!("{helper}(\"{path}\"")) || INDEX.contains(&format!("{helper}('{path}'")),
+                "{path} is fetched without going through scope() (helper `{helper}`)"
+            );
+        }
+        // Sanity-check the discriminator: a deliberately unscoped route must
+        // NOT go through the helper, or the assertion above proves nothing.
+        assert!(
+            !INDEX.contains(&format!("{helper}(\"/api/summary\"")),
+            "/api/summary is project-wide and must not be scoped"
+        );
+    }
+
+    /// The dashboard UI is compiled into the binary and served from a URL that
+    /// never changes, so a cached bundle survives an upgrade and the new page
+    /// never loads. The symptom is misleading — panels render empty and it
+    /// looks like missing data rather than a stale page.
+    #[test]
+    fn responses_are_not_cacheable() {
+        let value = String::from_utf8(no_cache().value.as_bytes().to_vec()).unwrap();
+        assert!(value.contains("no-store"), "index and API responses must not be cached: {value}");
+        let field = format!("{}", no_cache().field);
+        assert_eq!(field.to_ascii_lowercase(), "cache-control");
+    }
+
+    /// The build detail is its own `#/build/<id>` page rather than a section
+    /// appended to the overview. Rendering it inline shifted the layout under
+    /// a fixed scroll position, landing the reader past the panel on blank
+    /// space. Hash routing also keeps a build linkable and the back button
+    /// working, and it stays a single served page — the server has no route to
+    /// add, so `/` must keep serving the app for a deep link to resolve.
+    #[test]
+    fn build_detail_is_a_hash_routed_page() {
+        assert!(INDEX.contains("#/build/"), "index.html lost its build route");
+        assert!(
+            INDEX.contains("hashchange"),
+            "the page must react to hash changes, or the back button breaks"
+        );
+        // A deep link like /#/build/<id> reaches the server as "/", so the
+        // detail page only resolves while "/" keeps serving the app.
+        assert!(INDEX.contains("<div id=\"root\">"), "the app root is gone");
+    }
+
+    #[test]
+    fn percent_encoded_project_names_decode() {
+        assert_eq!(text_param("project=My%20App", "project").as_deref(), Some("My App"));
+        assert_eq!(text_param("project=My+App", "project").as_deref(), Some("My App"));
+        // A value ending in an escape must not lose its final character.
+        assert_eq!(text_param("project=A%2FB", "project").as_deref(), Some("A/B"));
+        assert_eq!(text_param("limit=10", "project"), None);
+    }
+
+    /// Out-of-range values must clamp rather than reaching Postgres as a
+    /// negative LIMIT, which is an error rather than an empty result.
+    #[test]
+    fn numeric_parameters_clamp_to_a_sane_range() {
+        assert_eq!(number_param("limit=999999", "limit", 100), MAX_LIMIT);
+        assert_eq!(number_param("limit=0", "limit", 100), 1);
+        assert_eq!(number_param("limit=-5", "limit", 100), 1);
+        assert_eq!(number_param("limit=abc", "limit", 100), 100);
+        assert_eq!(number_param("", "limit", 100), 100);
+    }
+
+    /// `{}` with status 200 is a *successful, empty* answer, so the page shows
+    /// empty panels and the reader concludes there is no data rather than that
+    /// the request failed.
+    #[test]
+    fn a_serialization_failure_is_an_error_not_an_empty_success() {
+        struct Unserializable;
+        impl serde::Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("cannot serialize"))
+            }
+        }
+        let routed = json(Ok::<_, StoreError>(Unserializable));
+        assert_eq!(routed.status, 500, "body was {}", routed.body);
+        assert_ne!(routed.body, "{}", "an empty object reads as clean data");
+    }
+
+    #[test]
+    fn a_successful_value_serializes_with_status_200() {
+        let routed = json(Ok::<_, StoreError>(serde_json::json!({"items": []})));
+        assert_eq!(routed.status, 200);
+        assert_eq!(routed.content_type, "application/json");
+        assert_eq!(routed.body, r#"{"items":[]}"#);
+    }
+
+    /// A store error must not reach the browser. `StoreError::Database` wraps
+    /// a `postgres::Error` whose `Display` can name tables, constraints and
+    /// connection details.
+    ///
+    /// Uses `UnusableBuild` because it is the one variant constructible
+    /// without a live connection; the response path does not inspect the
+    /// variant, so the property holds for `Database` too.
+    #[test]
+    fn store_errors_are_not_described_to_the_browser() {
+        let leaked = StoreError::UnusableBuild.to_string();
+        assert!(!leaked.is_empty(), "the guard needs a non-empty message");
+        let routed = json(Err::<serde_json::Value, _>(StoreError::UnusableBuild));
+        assert_eq!(routed.status, 500);
+        assert!(
+            !routed.body.contains(&leaked),
+            "the store message reached the browser: {}",
+            routed.body
+        );
+        assert!(routed.body.contains("query failed"));
+    }
+
+    /// Every error body is JSON, so the page can parse one shape rather than
+    /// guessing whether a 500 is text or a document.
+    #[test]
+    fn error_bodies_are_json() {
+        for routed in [error_response("boom"), not_found("gone")] {
+            assert_eq!(routed.content_type, "application/json");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&routed.body).expect("a JSON error body");
+            assert!(parsed["error"].is_string(), "{}", routed.body);
+        }
+    }
+
+    #[test]
+    fn percent_decoding_handles_edge_cases() {
+        assert_eq!(percent_decode("My%20App"), "My App");
+        assert_eq!(percent_decode("A%2FB"), "A/B");
+        assert_eq!(percent_decode("%C3%A9"), "é");
+        // A truncated escape is left alone rather than panicking on the slice.
+        assert_eq!(percent_decode("%4"), "%4");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("abc%"), "abc%");
+        assert_eq!(percent_decode(""), "");
+        // Invalid UTF-8 becomes the replacement character rather than panicking.
+        assert_eq!(percent_decode("%FF"), "\u{fffd}");
+    }
+
+    /// The `/api/build/<key>` segment must be decoded, or a key the browser
+    /// escaped never matches the stored value and the page shows "no such
+    /// build" for a build that exists.
+    ///
+    /// Discriminating: a build is stored under a key containing a space, then
+    /// requested as `%20`. Decoded it is found; undecoded the store is asked
+    /// for the literal "a%20b" and answers nothing.
+    #[test]
+    fn the_build_key_path_segment_is_percent_decoded() {
+        use buildlens_core::BuildCategory;
+        use buildlens_core::wire::{Attribution, WIRE_VERSION, WireBuild};
+
+        let Ok(base) = std::env::var("BUILDLENS_TEST_DATABASE_URL") else {
+            eprintln!("skipping: BUILDLENS_TEST_DATABASE_URL not set");
+            return;
+        };
+        // The key is unique to this test, so it does not matter which schema
+        // the shared test database uses; re-inserting it is a no-op.
+        let mut connected = PostgresStore::connect(&base).expect("connect and migrate");
+        connected
+            .insert(&WireBuild {
+                wire_version: WIRE_VERSION,
+                build_key: "dashboard decode probe".into(),
+                project: "App".into(),
+                category: BuildCategory::Clean,
+                total_seconds: 1.0,
+                compiled_count: 0,
+                cache_hit_rate: None,
+                error_count: 0,
+                warning_count: 0,
+                status: None,
+                started_at: Some(1_700_000_000.0),
+                attribution: Attribution::Anonymous,
+                machine_id: None,
+                xcode_version: None,
+                platform: None,
+                architecture: None,
+                targets: vec![],
+                phases: vec![],
+            })
+            .ok();  // Already present from an earlier run is fine.
+        let store = Arc::new(std::sync::Mutex::new(connected));
+
+        let routed = route("/api/build/dashboard%20decode%20probe", "", &store);
+        assert_eq!(
+            routed.status, 200,
+            "an escaped key must reach the stored build: {}",
+            routed.body
+        );
+        assert!(routed.body.contains("dashboard decode probe"), "{}", routed.body);
+        // An empty key is a client error rather than a lookup.
+        assert_eq!(route("/api/build/", "", &store).status, 400);
+    }
+
+    /// A build key comes from an activity log and can contain characters the
+    /// browser escapes, so the path segment needs the same decoding as a query
+    /// value — one implementation, not two that could disagree.
+    #[test]
+    fn build_keys_and_project_names_decode_identically() {
+        for raw in ["My%20App", "A%2FB", "%C3%A9", "plain"] {
+            assert_eq!(
+                percent_decode(raw),
+                text_param(&format!("project={raw}"), "project").unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn urls_split_into_path_and_query() {
+        assert_eq!(split_url("/api/builds?limit=5"), ("/api/builds".into(), "limit=5".into()));
+        assert_eq!(split_url("/api/builds"), ("/api/builds".into(), String::new()));
+        assert_eq!(split_url("/"), ("/".into(), String::new()));
+        // A trailing `?` yields an empty query rather than a missing one.
+        assert_eq!(split_url("/x?"), ("/x".into(), String::new()));
+    }
+
+    /// An empty `project` is how the page spells "All projects" and must read
+    /// as absent, not as a project literally named "".
+    #[test]
+    fn an_empty_project_means_every_project() {
+        assert_eq!(text_param("project=", "project").as_deref(), Some(""));
+        // `route` is what applies the filter, so that is where it is dropped.
+        assert!(
+            text_param("project=", "project")
+                .filter(|value| !value.is_empty())
+                .is_none()
+        );
+    }
+}
