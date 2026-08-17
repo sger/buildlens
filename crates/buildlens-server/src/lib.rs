@@ -159,6 +159,11 @@ struct Handler<'a> {
 struct DashboardPool {
     connections: Vec<Arc<std::sync::Mutex<buildlens_storage::PostgresStore>>>,
     next: std::sync::atomic::AtomicUsize,
+    /// Shared by every connection in the ring, not one per connection: the
+    /// answers do not depend on which connection produced them, and a per-
+    /// connection cache would miss whenever round-robin moved a repeat request
+    /// to a different one — a 3-in-4 miss rate for the same query.
+    cache: buildlens_dashboard::ResponseCache,
 }
 
 impl DashboardPool {
@@ -173,6 +178,7 @@ impl DashboardPool {
         Ok(Self {
             connections,
             next: std::sync::atomic::AtomicUsize::new(0),
+            cache: buildlens_dashboard::ResponseCache::new(),
         })
     }
 
@@ -423,7 +429,8 @@ fn route(
     // Duplicating its query surface would be two implementations to keep in
     // step, and the UI would silently disagree with itself when they drifted.
     if method == &Method::Get && (path == "/" || path.starts_with("/api/")) {
-        let routed = buildlens_dashboard::route(path, query, dashboard.next());
+        let routed =
+            buildlens_dashboard::route_cached(path, query, dashboard.next(), &dashboard.cache);
         return Ok(Reply::typed(routed.status, routed.body, routed.content_type));
     }
     match (method, path) {
@@ -610,6 +617,13 @@ fn ingest(payload: &str, dashboard: &DashboardPool) -> Result<String, Failure> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(&build)
         .map_err(|error| Failure::Internal(error.into()))?;
+    // A stored build changes almost every aggregate, so the cached answers are
+    // wrong the moment this returns. Dropped only on a real insert: a duplicate
+    // push changed nothing, and clearing on those would let a client in a retry
+    // loop defeat the cache entirely.
+    if stored {
+        dashboard.cache.invalidate();
+    }
     Ok(serde_json::json!({
         "stored": stored,
         "build_key": build.build_key,
@@ -708,6 +722,84 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- dashboard cache ---
+
+    /// A stored build must drop the cached answers, or the panels keep showing
+    /// pre-ingest numbers for up to the cache's TTL.
+    ///
+    /// A duplicate push must *not* drop them: it changed nothing, and a client
+    /// retrying a build it already sent would otherwise clear the cache on every
+    /// attempt and defeat it entirely.
+    #[test]
+    fn ingest_invalidates_the_dashboard_cache_only_when_it_stored_something() {
+        let Ok(url) = std::env::var("BUILDLENS_TEST_DATABASE_URL") else {
+            eprintln!("skipping: BUILDLENS_TEST_DATABASE_URL not set");
+            return;
+        };
+        // Its own schema, and a fresh one each run: the test asserts on a *first*
+        // insert being new, so a build left behind by the previous run would make
+        // the first push a duplicate and fail for the wrong reason.
+        {
+            let mut setup = postgres::Client::connect(&url, postgres::NoTls)
+                .expect("connect to the test database");
+            setup
+                .batch_execute("DROP SCHEMA IF EXISTS t_cache CASCADE; CREATE SCHEMA t_cache;")
+                .expect("create the test schema");
+        }
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let url = format!("{url}{separator}options=-c%20search_path%3Dt_cache");
+        let dashboard = DashboardPool::connect(&url, 1).expect("connect the dashboard");
+        // Serialised from the real type rather than hand-written JSON, so a new
+        // required field cannot make this test fail for a reason unrelated to
+        // what it checks.
+        let payload = serde_json::to_string(&WireBuild {
+            wire_version: WIRE_VERSION,
+            build_key: "cache-invalidation".into(),
+            project: "CacheTest".into(),
+            category: buildlens_core::BuildCategory::Clean,
+            total_seconds: 12.0,
+            compiled_count: 1,
+            cache_hit_rate: None,
+            error_count: 0,
+            warning_count: 0,
+            status: None,
+            started_at: Some(1_700_000_000.0),
+            attribution: buildlens_core::wire::Attribution::Anonymous,
+            machine_id: None,
+            xcode_version: None,
+            platform: None,
+            architecture: None,
+            targets: vec![],
+            phases: vec![],
+            files: vec![],
+            swift_timings: vec![],
+            diagnostics: vec![],
+            tests: vec![],
+        })
+        .expect("serialise the payload");
+
+        // First push stores, so the cache must be dropped.
+        dashboard.cache.invalidate();
+        let sentinel = "/api/summary?";
+        dashboard.cache.put(sentinel.to_owned(), "stale");
+        let first = ingest(&payload, &dashboard).expect("first ingest");
+        assert!(first.contains("\"stored\":true"), "expected a fresh store: {first}");
+        assert!(
+            dashboard.cache.get(sentinel).is_none(),
+            "storing a build must drop the cached answers"
+        );
+
+        // Second push is a duplicate, so the cache must survive.
+        dashboard.cache.put(sentinel.to_owned(), "kept");
+        let second = ingest(&payload, &dashboard).expect("second ingest");
+        assert!(second.contains("\"duplicate\":true"), "expected a duplicate: {second}");
+        assert_eq!(
+            dashboard.cache.get(sentinel).as_deref(),
+            Some("kept"),
+            "a duplicate push changed nothing and must not clear the cache"
+        );
+    }
 
     // --- authorization ---
 

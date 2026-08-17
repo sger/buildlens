@@ -4,9 +4,12 @@
 -- activity log directly and is not bound by the wire payload.
 --
 -- Everything is partitioned by day so that dropping old data becomes a
--- partition drop and day-scoped queries can skip whole ranges. Only DEFAULT
--- partitions are created here: until per-day partitions are added, every row
--- lands in the default and neither benefit applies.
+-- partition drop and day-scoped queries can skip whole ranges. Only the DEFAULT
+-- partitions are declared here; the per-day ones are created by
+-- `buildlens_storage::ensure_day_partitions`, because this file runs before the
+-- migrations and cannot name a day anyway. A default that stays empty is the
+-- healthy state — it is the safety net for a build dated outside the pre-created
+-- window, not where rows are meant to live.
 --
 -- This file IS executed, by both `buildlens_server::store::migrate` and
 -- `buildlens_storage::PostgresStore::migrate`, which `include_str!` it. One
@@ -27,6 +30,24 @@ CREATE TABLE IF NOT EXISTS build_phases (day DATE NOT NULL, build_key TEXT NOT N
 CREATE TABLE IF NOT EXISTS build_phases_default PARTITION OF build_phases DEFAULT;
 CREATE INDEX IF NOT EXISTS idx_builds_project_day ON builds (project, day);
 CREATE INDEX IF NOT EXISTS idx_targets_name ON build_targets (name);
+
+-- Almost every dashboard panel is a "last N builds" window: `ORDER BY
+-- received_at DESC LIMIT n`, optionally scoped to one project. The dashboard
+-- fires fifteen of them every couple of seconds, and none of them had an index
+-- to walk -- `idx_builds_project_day` leads with `project` and then `day`, which
+-- answers a day-range question, not a recency one. Without these, each panel
+-- sorted the whole table to return thirty rows.
+--
+-- Two indexes rather than one because the queries come in both shapes: the
+-- unscoped feed (`/api/summary`) reads straight down the first, and a
+-- project-scoped panel seeks into the second. A single `(project, received_at)`
+-- cannot serve the unscoped form, since `project` leads it.
+--
+-- DESC to match the queries' direction. Postgres can walk an ASC index
+-- backwards, so this is not strictly required, but stating it keeps the index
+-- and the query shape obviously aligned.
+CREATE INDEX IF NOT EXISTS idx_builds_received_at ON builds (received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_builds_project_received_at ON builds (project, received_at DESC);
 
 -- Added after the first release, so these are ALTERs rather than columns in
 -- the CREATE above: an existing database already has the table, and
@@ -77,8 +98,48 @@ CREATE TABLE IF NOT EXISTS build_tests_default PARTITION OF build_tests DEFAULT;
 CREATE TABLE IF NOT EXISTS build_metadata (day DATE NOT NULL, build_key TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (day, build_key, key)) PARTITION BY RANGE (day);
 CREATE TABLE IF NOT EXISTS build_metadata_default PARTITION OF build_metadata DEFAULT;
 
+-- Partition inventory, for answering "is partitioning actually working here".
+--
+-- `estimated_rows` is `reltuples`: an estimate, and -1 until the table has been
+-- analyzed, so it is not a count and must not be reported as one. The number
+-- worth watching is a non-empty `*_default` in steady state, which means builds
+-- are arriving dated outside the pre-created window.
+CREATE OR REPLACE VIEW buildlens_partitions AS
+SELECT parent.relname AS parent,
+       child.relname AS partition,
+       pg_get_expr(child.relpartbound, child.oid) AS bounds,
+       child.reltuples::bigint AS estimated_rows,
+       pg_total_relation_size(child.oid) AS bytes
+FROM pg_inherits
+JOIN pg_class child ON child.oid = pg_inherits.inhrelid
+JOIN pg_class parent ON parent.oid = pg_inherits.inhparent
+-- Scoped by name to BuildLens's own partitioned tables, and by `to_regclass` to
+-- the current `search_path`: a database holding several BuildLens schemas (which
+-- is how the tests isolate themselves) must not have one schema's view report
+-- another's partitions.
+WHERE parent.relname IN ('builds', 'build_targets', 'build_phases', 'build_files',
+                         'build_swift_timings', 'build_diagnostics', 'build_tests',
+                         'build_metadata')
+  AND parent.oid = to_regclass(parent.relname)
+ORDER BY parent.relname, child.relname;
+
 CREATE INDEX IF NOT EXISTS idx_files_file ON build_files (file);
 CREATE INDEX IF NOT EXISTS idx_swift_file ON build_swift_timings (file);
 CREATE INDEX IF NOT EXISTS idx_diagnostics_fingerprint ON build_diagnostics (fingerprint);
 CREATE INDEX IF NOT EXISTS idx_tests_name ON build_tests (suite, name);
 CREATE INDEX IF NOT EXISTS idx_metadata_key ON build_metadata (key);
+
+-- Every detail panel joins a child table to a "recent builds" CTE on
+-- `build_key` alone. The primary keys all lead with `day`, so `build_key` is not
+-- a usable prefix of any of them and each join fell back to a full scan of the
+-- child -- worst on `build_files`, which carries up to 500 rows per build.
+--
+-- `prune`'s row-wise path benefits too: it deletes by `(day, build_key)`, and
+-- these give it an index for the second half of that predicate.
+CREATE INDEX IF NOT EXISTS idx_targets_build ON build_targets (build_key);
+CREATE INDEX IF NOT EXISTS idx_phases_build ON build_phases (build_key);
+CREATE INDEX IF NOT EXISTS idx_files_build ON build_files (build_key);
+CREATE INDEX IF NOT EXISTS idx_swift_build ON build_swift_timings (build_key);
+CREATE INDEX IF NOT EXISTS idx_diagnostics_build ON build_diagnostics (build_key);
+CREATE INDEX IF NOT EXISTS idx_tests_build ON build_tests (build_key);
+CREATE INDEX IF NOT EXISTS idx_metadata_build ON build_metadata (build_key);

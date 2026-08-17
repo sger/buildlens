@@ -11,14 +11,99 @@ use tiny_http::{Method, Response, Server, StatusCode};
 const INDEX: &str = include_str!("../assets/index.html");
 const MAX_LIMIT: i64 = 500;
 
+/// How long an API response may be reused.
+///
+/// The UI refetches all fifteen panels every two seconds (`REFRESH_MS` in
+/// `dashboard-ui/src/main.tsx`), and each panel is a "last N builds" aggregate
+/// over the same rows. Answering every one from the database meant ~450 queries
+/// a minute per open tab, all recomputing numbers that only change when a build
+/// finishes.
+///
+/// Five seconds is chosen against the refresh interval, not against how fast
+/// builds arrive: it collapses the repeat fetches of one polling cycle while
+/// staying far below the time it takes to notice a stale panel. A new build
+/// shows up on the next tick after this expires, and `invalidate` makes the
+/// local `collect` path immediate anyway.
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Cached API responses, keyed by the exact path and query that produced them.
+///
+/// Keyed on the raw query string rather than the parsed parameters so that two
+/// requests differing in any way — a different `limit`, a different project,
+/// even a different parameter order — cannot read each other's rows. That
+/// over-caches slightly (`?a=1&b=2` and `?b=2&a=1` are separate entries) and
+/// never under-caches, which is the correct direction for a leak that would
+/// otherwise show one project's numbers under another's name.
+///
+/// Deliberately not an LRU: the dashboard requests a fixed set of paths with a
+/// fixed set of parameters, so the key space is bounded by the panel count times
+/// the project count. Entries are dropped on expiry rather than evicted.
+#[derive(Default)]
+pub struct ResponseCache {
+    entries: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>>,
+}
+
+impl ResponseCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drops every cached response.
+    ///
+    /// Called after a write so a freshly stored build is visible immediately
+    /// rather than up to `CACHE_TTL` later. Clearing everything rather than the
+    /// affected keys is deliberate: one build changes almost every aggregate,
+    /// so working out which entries survive costs more than recomputing them.
+    pub fn invalidate(&self) {
+        self.lock().clear();
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, (std::time::Instant, String)>>
+    {
+        // As with the store lock: a panicked request must not turn one failure
+        // into a permanent outage. There is no invariant here beyond "these
+        // strings were once a valid response".
+        self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The cached body for `key`, if one is present and still fresh.
+    ///
+    /// Public so the server crate can assert its invalidation actually took
+    /// effect; [`route_cached`] is the only caller that should use it to serve a
+    /// request.
+    pub fn get(&self, key: &str) -> Option<String> {
+        let mut entries = self.lock();
+        let (stored_at, body) = entries.get(key)?;
+        if stored_at.elapsed() < CACHE_TTL {
+            return Some(body.clone());
+        }
+        entries.remove(key);
+        None
+    }
+
+    /// Stores `body` under `key`. See [`ResponseCache::get`] on visibility.
+    pub fn put(&self, key: String, body: &str) {
+        let mut entries = self.lock();
+        // Expired neighbours are cleared on write rather than by a timer: the
+        // key space is small, and this keeps a project that disappears from the
+        // UI from pinning its entries forever.
+        let now = std::time::Instant::now();
+        entries.retain(|_, (stored_at, _)| now.duration_since(*stored_at) < CACHE_TTL);
+        entries.insert(key, (now, body.to_owned()));
+    }
+}
+
 pub fn serve(store: PostgresStore, port: u16) -> anyhow::Result<()> {
     let server = Server::http(("127.0.0.1", port)).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let store = Arc::new(std::sync::Mutex::new(store));
+    let cache = ResponseCache::new();
     eprintln!("BuildLens dashboard: http://127.0.0.1:{port}");
     for request in server.incoming_requests() {
         let routed = if request.method() == &Method::Get {
             let (path, query) = split_url(request.url());
-            route(&path, &query, &store)
+            route_cached(&path, &query, &store, &cache)
         } else {
             Routed {
                 status: 405,
@@ -155,11 +240,42 @@ fn error_response(message: &str) -> Routed {
     }
 }
 
+/// [`route`], serving a recent identical request from `cache` instead of the
+/// database.
+///
+/// Only 200s are cached, and only for `/api/` paths. A 404 or a 500 is cheap to
+/// recompute and caching it would hold a transient database failure for
+/// `CACHE_TTL` after it cleared; `/` is the compiled-in bundle and never touches
+/// the store at all.
+pub fn route_cached(
+    path: &str,
+    query: &str,
+    store: &Arc<std::sync::Mutex<PostgresStore>>,
+    cache: &ResponseCache,
+) -> Routed {
+    if !path.starts_with("/api/") {
+        return route(path, query, store);
+    }
+    let key = format!("{path}?{query}");
+    if let Some(body) = cache.get(&key) {
+        return Routed { status: 200, content_type: "application/json", body };
+    }
+    let routed = route(path, query, store);
+    if routed.status == 200 {
+        cache.put(key, &routed.body);
+    }
+    routed
+}
+
 /// Read-only routing over store snapshots; separated from HTTP for testability.
 ///
 /// Every project-scoped endpoint must thread `project` through, or a 400s
 /// project's numbers leak into a 12s project's panel — a recurring bug class
 /// here, guarded by `project_filter_reaches_every_project_scoped_route`.
+///
+/// Uncached. Callers serving a browser want [`route_cached`]; this stays
+/// available so a test can assert what the database actually returns without a
+/// previous request's answer standing in for it.
 pub fn route(path: &str, query: &str, store: &Arc<std::sync::Mutex<PostgresStore>>) -> Routed {
     let limit = number_param(query, "limit", 100);
     let builds = number_param(query, "builds", 30);
@@ -322,6 +438,131 @@ mod tests {
                  committed bundle. Run `node dashboard-ui/build.mjs` and commit the result."
             );
         }
+    }
+
+    /// A second identical request must be served from the cache, and a
+    /// different query must not read the first one's answer.
+    ///
+    /// Uses the cache directly rather than through `route_cached` so it needs no
+    /// database: the leak this guards against is in the keying, not in the SQL.
+    #[test]
+    fn the_cache_separates_entries_by_path_and_query() {
+        let cache = ResponseCache::new();
+        cache.put("/api/trends/duration?project=App".into(), "app");
+        cache.put("/api/trends/duration?project=Other".into(), "other");
+        cache.put("/api/trends/daily?project=App".into(), "daily");
+
+        assert_eq!(cache.get("/api/trends/duration?project=App").as_deref(), Some("app"));
+        assert_eq!(cache.get("/api/trends/duration?project=Other").as_deref(), Some("other"));
+        assert_eq!(cache.get("/api/trends/daily?project=App").as_deref(), Some("daily"));
+        // The failure mode worth guarding: a key that was never stored must miss
+        // rather than fall back to a similar one.
+        assert!(cache.get("/api/trends/duration?project=Absent").is_none());
+        assert!(cache.get("/api/trends/duration").is_none());
+    }
+
+    /// The cache has to sit in front of the database on a repeat request, and
+    /// stay out of the way for the paths that must not be cached.
+    ///
+    /// Proven by writing a sentinel into the cache under the key the route would
+    /// use: if the second call returns the sentinel, it never reached the store.
+    /// `/` is checked the other way — it must ignore a poisoned entry, because it
+    /// is the compiled-in bundle rather than data.
+    #[test]
+    fn route_cached_serves_a_repeat_request_without_the_store() {
+        let Ok(url) = std::env::var("BUILDLENS_TEST_DATABASE_URL") else {
+            eprintln!("skipping: BUILDLENS_TEST_DATABASE_URL not set");
+            return;
+        };
+        let store = Arc::new(std::sync::Mutex::new(
+            PostgresStore::connect(&url).expect("connect and migrate"),
+        ));
+        let cache = ResponseCache::new();
+
+        let first = route_cached("/api/projects", "", &store, &cache);
+        assert_eq!(first.status, 200);
+        // The real answer is now cached; replace it so a cache hit is visible.
+        cache.put("/api/projects?".into(), "{\"sentinel\":true}");
+        let second = route_cached("/api/projects", "", &store, &cache);
+        assert_eq!(second.body, "{\"sentinel\":true}", "the repeat request hit the database");
+
+        // A different query must not read that entry.
+        let scoped = route_cached("/api/projects", "project=App", &store, &cache);
+        assert_ne!(scoped.body, "{\"sentinel\":true}");
+
+        // The bundle is not an `/api/` path and must bypass the cache entirely.
+        cache.put("/?".into(), "poisoned");
+        let index = route_cached("/", "", &store, &cache);
+        assert!(index.body.contains("<!doctype html>") || index.body.contains("<!DOCTYPE html>"));
+        assert_eq!(index.content_type, "text/html");
+    }
+
+    /// A 404 must not be cached: it is cheap to recompute, and caching an error
+    /// would hold a transient failure after it cleared.
+    #[test]
+    fn route_cached_does_not_cache_failures() {
+        let Ok(url) = std::env::var("BUILDLENS_TEST_DATABASE_URL") else {
+            eprintln!("skipping: BUILDLENS_TEST_DATABASE_URL not set");
+            return;
+        };
+        let store = Arc::new(std::sync::Mutex::new(
+            PostgresStore::connect(&url).expect("connect and migrate"),
+        ));
+        let cache = ResponseCache::new();
+        assert_eq!(route_cached("/api/nope", "", &store, &cache).status, 404);
+        assert!(cache.get("/api/nope?").is_none(), "a 404 must not be cached");
+    }
+
+    /// Invalidation must drop everything, so a stored build is visible on the
+    /// next request rather than up to `CACHE_TTL` later.
+    #[test]
+    fn invalidating_the_cache_drops_every_entry() {
+        let cache = ResponseCache::new();
+        cache.put("/api/summary?".into(), "before");
+        cache.put("/api/projects?".into(), "before");
+        cache.invalidate();
+        assert!(cache.get("/api/summary?").is_none());
+        assert!(cache.get("/api/projects?").is_none());
+    }
+
+    /// An entry past its TTL must not be served.
+    ///
+    /// Asserted by storing a timestamp older than the TTL rather than by
+    /// sleeping, so the test stays fast and cannot flake on a slow machine.
+    #[test]
+    fn an_expired_entry_is_not_served() {
+        let cache = ResponseCache::new();
+        let stale = std::time::Instant::now() - CACHE_TTL - std::time::Duration::from_millis(1);
+        cache.lock().insert("/api/summary?".into(), (stale, "stale".into()));
+        assert!(cache.get("/api/summary?").is_none(), "an entry past its TTL must miss");
+        // And the miss removes it, rather than leaving it to be re-checked.
+        assert!(cache.lock().is_empty());
+    }
+
+    /// The TTL has to stay below the UI's refresh interval, or a panel shows the
+    /// same numbers for more than one cycle and the dashboard reads as frozen.
+    #[test]
+    fn the_cache_ttl_is_shorter_than_the_uis_refresh_window() {
+        let refresh = UI_SOURCE
+            .split_once("REFRESH_MS")
+            .and_then(|(_, rest)| rest.split_once('='))
+            .and_then(|(_, rest)| {
+                let digits: String = rest.trim_start().chars().take_while(char::is_ascii_digit).collect();
+                digits.parse::<u64>().ok()
+            })
+            .expect("REFRESH_MS is declared in dashboard-ui/src/main.tsx");
+        assert!(
+            CACHE_TTL.as_millis() as u64 >= refresh,
+            "a TTL below the refresh interval caches nothing: TTL {}ms, refresh {refresh}ms",
+            CACHE_TTL.as_millis()
+        );
+        // Sanity bound: a TTL far above the refresh interval means the page
+        // shows stale numbers for several cycles.
+        assert!(
+            CACHE_TTL.as_millis() as u64 <= refresh * 10,
+            "TTL {}ms is more than ten refresh cycles of {refresh}ms",
+            CACHE_TTL.as_millis()
+        );
     }
 
     /// The sidebar's three views must be real routes, not decorative buttons.

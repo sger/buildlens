@@ -43,6 +43,47 @@ const MIGRATIONS_SQL: &str = include_str!("../../buildlens-server/migrations.sql
 /// Arbitrary constant, shared by every BuildLens process on this database.
 const MIGRATION_LOCK: i64 = 0x6275_696c;
 
+/// Advisory-lock class for per-day partition DDL, distinct from
+/// [`MIGRATION_LOCK`] so a long migration on one database does not block an
+/// ingest that only needs today's partition. The second key is the day, so two
+/// processes creating partitions for *different* days never wait on each other.
+const PARTITION_LOCK: i32 = 0x6275_6970_u32 as i32;
+
+/// How far either side of today [`migrate`] pre-creates partitions.
+///
+/// One day each way, not a week. Every `connect` runs this under
+/// `MIGRATION_LOCK`, and each day costs eight `CREATE`/`ATTACH` pairs, so a wide
+/// window turns every CLI invocation and every test into hundreds of DDL
+/// statements serialised against each other — measured at 3.5x slower on a
+/// 35-test suite for partitions nothing was going to write to.
+///
+/// The window only has to cover the days a *running* process will be asked for
+/// without reconnecting: today, tomorrow for a clock a little fast or a process
+/// alive over midnight, and yesterday for a build that finished just before it.
+/// Anything further out — a `collect --all` backfill dated last month — is
+/// handled on the write path by [`PostgresStore::ensure_partitions_for`], which
+/// pays one short DDL for the first build of that day and nothing after.
+const PARTITION_WINDOW_DAYS: i64 = 1;
+
+/// Every table partitioned by `day`.
+///
+/// The sibling of [`BUILD_SCOPED_TABLES`], and deliberately a separate list:
+/// that one names the tables `prune` must delete child rows from, which excludes
+/// `builds` itself, while this one includes it because `builds` is partitioned
+/// too. `every_day_partitioned_table_is_declared_partitioned_in_the_schema`
+/// checks this list against the schema, so a ninth partitioned table cannot be
+/// added without appearing here.
+pub const DAY_PARTITIONED_TABLES: &[&str] = &[
+    "builds",
+    "build_targets",
+    "build_phases",
+    "build_files",
+    "build_swift_timings",
+    "build_diagnostics",
+    "build_tests",
+    "build_metadata",
+];
+
 /// Applies the baseline schema and every unapplied migration, under an
 /// advisory lock so concurrent starts serialise rather than deadlock.
 ///
@@ -62,7 +103,14 @@ pub fn migrate(client: &mut Client) -> Result<(), StoreError> {
 
 fn migrate_locked(client: &mut Client) -> Result<(), StoreError> {
     client.batch_execute(SCHEMA_SQL)?;
-    apply_migrations(client)
+    apply_migrations(client)?;
+    // After the migrations, never before. Migration 0002 rewrites
+    // `build_tests`' primary key on the parent, and a child created ahead of
+    // that would be born with the old key. Creating partitions last means every
+    // child inherits the current one — which is also why they are created from
+    // here rather than from `schema.sql`, which runs first.
+    ensure_partition_window(client, PARTITION_WINDOW_DAYS, PARTITION_WINDOW_DAYS)?;
+    Ok(())
 }
 
 /// One migration parsed out of `migrations.sql`.
@@ -136,6 +184,186 @@ fn apply_migrations(client: &mut Client) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// `builds` + `2023-11-14` -> `builds_p20231114`.
+///
+/// Not `builds_2023_11_14`: a child whose name reads like a parent is a trap for
+/// anything that derives table lists from names, and
+/// `prune_covers_every_build_scoped_table` does exactly that. The `_p` prefix on
+/// the digits keeps children out of every such filter.
+fn partition_name(table: &str, day: &str) -> String {
+    let mut name = String::with_capacity(table.len() + 10);
+    name.push_str(table);
+    name.push_str("_p");
+    name.extend(day.chars().filter(char::is_ascii_digit));
+    name
+}
+
+/// True when every one of `day`'s partitions already exists in the current
+/// `search_path`.
+///
+/// `to_regclass` on the unqualified names rather than a `pg_inherits` join: it
+/// resolves exactly as the following DDL would, which is what makes this correct
+/// under the per-test schema isolation the integration tests use.
+///
+/// Checks all eight rather than `builds` alone. They are created together, but
+/// they do not always disappear together: `prune` drops a day per table, and a
+/// day left half-partitioned by an interrupted prune — or by a hand-run
+/// `DROP TABLE` — would otherwise report as present and quietly send the missing
+/// tables' rows to their defaults.
+fn day_partition_exists(client: &mut Client, day: &str) -> Result<bool, StoreError> {
+    let names: Vec<String> =
+        DAY_PARTITIONED_TABLES.iter().map(|table| partition_name(table, day)).collect();
+    let row = client
+        .query_one(
+            "SELECT count(*) = cardinality($1::TEXT[])
+             FROM unnest($1::TEXT[]) AS name
+             WHERE to_regclass(name) IS NOT NULL",
+            &[&names],
+        )
+        .map_err(|source| StoreError::Query { operation: "checking for a partition", source })?;
+    Ok(row.get(0))
+}
+
+/// Creates `day`'s partition on every table in [`DAY_PARTITIONED_TABLES`],
+/// moving any rows already sitting in the default partition into it.
+///
+/// Always takes the create-move-attach path rather than `CREATE TABLE ...
+/// PARTITION OF`, because Postgres scans the default partition on that form and
+/// refuses when it holds rows in the new range — which is every row written
+/// before per-day partitions existed. Using one path unconditionally means the
+/// populated case is exercised by every test rather than by a branch that only
+/// fires during an upgrade.
+///
+/// Idempotent and race-safe in two independent ways, because they fail
+/// differently: an advisory lock keyed on the day serialises two BuildLens
+/// processes that both find the partition missing, and a `duplicate_table` from
+/// someone who ran the DDL by hand outside that lock is treated as success.
+///
+/// `day` is `YYYY-MM-DD`, the spelling [`day_of`] produces, so no caller
+/// converts between two date representations.
+pub fn ensure_day_partitions(client: &mut Client, day: &str) -> Result<(), StoreError> {
+    let upper = next_day(day)?;
+    // Identifiers cannot be parameterised, and neither can partition bounds.
+    // Every value interpolated below is either a compile-time constant from
+    // `DAY_PARTITIONED_TABLES` or a `YYYY-MM-DD` string that `next_day` has
+    // already validated as digits, so there is nothing a caller could inject.
+    //
+    // All eight tables in one `batch_execute`, and so one round trip: this runs
+    // under `MIGRATION_LOCK` on every connect, where eight separate round trips
+    // per day is latency every other starting process waits on.
+    let mut statements = String::new();
+    // Transaction-scoped, unlike `MIGRATION_LOCK`: it releases on commit or
+    // rollback, so it cannot leak the way a session lock does on an error path.
+    statements.push_str(&format!(
+        "SELECT pg_advisory_xact_lock({PARTITION_LOCK}, {});",
+        day_lock_key(day)
+    ));
+    for table in DAY_PARTITIONED_TABLES {
+        let child = partition_name(table, day);
+        let default = format!("{table}_default");
+        // Per table rather than per day, because a day can be half-partitioned:
+        // `prune` drops each table's partition separately, so an interrupted one
+        // leaves some present and some not. Creating only what is missing makes
+        // this a repair as well as a create.
+        //
+        // `to_regclass` is checked inside the same statement batch, and so under
+        // the advisory lock, rather than by the caller's earlier existence check:
+        // between that check and this batch another process may have created it.
+        //
+        // The CHECK matching the bounds exactly lets ATTACH skip its validation
+        // scan of the new child, turning an O(rows) read into a catalog check.
+        statements.push_str(&format!(
+            "DO $do$ BEGIN
+                 IF to_regclass('{child}') IS NULL THEN
+                     CREATE TABLE {child} (LIKE {table} INCLUDING DEFAULTS INCLUDING CONSTRAINTS);
+                     ALTER TABLE {child} ADD CONSTRAINT {child}_day
+                         CHECK (day >= DATE '{day}' AND day < DATE '{upper}');
+                     INSERT INTO {child} SELECT * FROM {default} WHERE day = DATE '{day}';
+                     DELETE FROM {default} WHERE day = DATE '{day}';
+                     ALTER TABLE {table} ATTACH PARTITION {child}
+                         FOR VALUES FROM ('{day}') TO ('{upper}');
+                 END IF;
+             END $do$;"
+        ));
+    }
+    // `batch_execute` is implicitly one transaction, so a failure part-way
+    // leaves no half-partitioned day behind.
+    if let Err(error) = client.batch_execute(&statements) {
+        // 42P07 is duplicate_table. The advisory lock serialises BuildLens
+        // processes and the `to_regclass` guard skips what already exists, so
+        // reaching this means someone outside both created the partition — a
+        // hand-run `CREATE TABLE`, or another tool holding no lock of ours.
+        // The partition exists either way, which is all the caller wanted.
+        if error.code().map(|code| code.code()) == Some("42P07") {
+            return Ok(());
+        }
+        return Err(StoreError::Query { operation: "creating a day partition", source: error });
+    }
+    Ok(())
+}
+
+/// Pre-creates partitions for a window around today, so steady-state ingest
+/// does no DDL at all.
+///
+/// Returns how many days it created. Zero on the second start of the day is the
+/// signal that the window is warm, which is the number worth logging.
+pub fn ensure_partition_window(
+    client: &mut Client,
+    back: i64,
+    ahead: i64,
+) -> Result<usize, StoreError> {
+    let days = window_days(&day_of(None), back, ahead);
+    // One round trip to find the days that need work, rather than one existence
+    // check per day per table. On a warm database this is the only statement this
+    // function runs, which is the whole point of the window.
+    //
+    // Screens on `builds` alone, unlike `day_partition_exists`: this only decides
+    // which days to hand to `ensure_day_partitions`, which re-checks every table
+    // under the lock and creates whatever is missing. A day that is half
+    // partitioned is repaired there, on the write path, rather than by widening
+    // this into eight lookups per day on every single connect.
+    let missing: Vec<String> = client
+        .query(
+            "SELECT day FROM unnest($1::TEXT[]) AS day
+             WHERE to_regclass('builds_p' || replace(day, '-', '')) IS NULL",
+            &[&days],
+        )
+        .map_err(|source| StoreError::Query { operation: "listing missing partitions", source })?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    for day in &missing {
+        ensure_day_partitions(client, day)?;
+    }
+    Ok(missing.len())
+}
+
+/// The days a window covers, oldest first, inclusive of both ends.
+fn window_days(anchor: &str, back: i64, ahead: i64) -> Vec<String> {
+    let Ok(center) = days_from_civil(anchor) else {
+        return Vec::new();
+    };
+    ((center - back)..=(center + ahead)).map(civil_from_days).collect()
+}
+
+/// A stable per-day key for the advisory lock's second argument.
+///
+/// The epoch day itself, so two processes on the same day collide and two on
+/// different days do not. Falls back to 0 for an unparseable day, which only
+/// costs a little serialisation.
+fn day_lock_key(day: &str) -> i32 {
+    days_from_civil(day).unwrap_or(0) as i32
+}
+
+/// The day after `day`, as the exclusive upper bound of its partition.
+///
+/// Computed here rather than as `$1::date + 1` in SQL because partition bounds
+/// cannot be parameterised — the DDL is formatted as text either way, so asking
+/// Postgres for the date would cost a round trip and buy nothing.
+fn next_day(day: &str) -> Result<String, StoreError> {
+    Ok(civil_from_days(days_from_civil(day)? + 1))
+}
+
 /// Caps on how much per-build detail is stored. An activity log can name tens
 /// of thousands of files; the dashboard only ever ranks the slowest, so storing
 /// every row would grow the database without changing a single answer.
@@ -163,11 +391,25 @@ pub struct BaselineComparison {
     pub regressions: Vec<MetricRegression>,
 }
 
-pub struct PostgresStore { client: Client }
+/// Deliberately derives nothing: `url` is a connection string that may carry a
+/// password, and a `Debug` impl would put it in every error report that formats
+/// a struct containing one.
+pub struct PostgresStore {
+    client: Client,
+    /// The URL this store connected with, kept so [`PostgresStore::ensure_partitions_for`]
+    /// can open a second, short-lived connection for its DDL.
+    ///
+    /// Creating a partition takes ACCESS EXCLUSIVE on the parent and holds it
+    /// until commit. Run on `client`, that lock would be held for the whole
+    /// ingest transaction, and every concurrent reader and writer would queue
+    /// behind one build's insert. A throwaway connection commits the DDL in
+    /// milliseconds and disconnects before the ingest transaction opens.
+    url: String,
+}
 
 impl PostgresStore {
     pub fn connect(url: &str) -> Result<Self, StoreError> {
-        let mut store = Self { client: Client::connect(url, NoTls)? };
+        let mut store = Self { client: Client::connect(url, NoTls)?, url: url.to_owned() };
         store.migrate()?;
         Ok(store)
     }
@@ -182,8 +424,46 @@ impl PostgresStore {
         migrate(&mut self.client)
     }
 
+    /// Makes sure `day`'s partitions exist before a write that targets them,
+    /// using a throwaway connection so the DDL's ACCESS EXCLUSIVE lock on eight
+    /// parents is not held for the length of the ingest transaction.
+    ///
+    /// The existence check runs on `self.client` because it is on the hot path
+    /// and costs one catalog lookup; a connection is only opened on the rare
+    /// miss, which after `migrate`'s pre-created window means the first build of
+    /// a day outside it.
+    ///
+    /// A connection failure here is logged and swallowed rather than propagated.
+    /// The insert that follows still succeeds — it lands in the default
+    /// partition, which exists for exactly this reason — and refusing a build
+    /// because its storage could not be optimised would be the wrong trade. A
+    /// failure of the DDL itself does propagate: that is a real schema problem,
+    /// not a degraded path.
+    fn ensure_partitions_for(&mut self, day: &str) -> Result<(), StoreError> {
+        if day_partition_exists(&mut self.client, day)? {
+            return Ok(());
+        }
+        match Client::connect(&self.url, NoTls) {
+            Ok(mut ddl) => ensure_day_partitions(&mut ddl, day),
+            Err(error) => {
+                // Once per process: a broken DDL path would otherwise log on
+                // every insert, and the symptom worth seeing is that it happened
+                // at all, not how many times.
+                static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                WARNED.get_or_init(|| {
+                    eprintln!(
+                        "buildlens: could not open a connection to create day partitions \
+                         ({error}); builds will be stored in the default partition"
+                    );
+                });
+                Ok(())
+            }
+        }
+    }
+
     pub fn insert(&mut self, build: &WireBuild) -> Result<bool, StoreError> {
         let day = day_of(build.started_at);
+        self.ensure_partitions_for(&day)?;
         let mut tx = self.client.transaction()?;
         let inserted = insert_wire(&mut tx, build, &day)?;
         tx.commit()?;
@@ -241,6 +521,7 @@ impl PostgresStore {
         }
         let day = day_of(build.started_at);
         let key = build.build_key.clone();
+        self.ensure_partitions_for(&day)?;
         let mut tx = self.client.transaction()?;
         if !insert_wire(&mut tx, &build, &day)? {
             tx.commit()?;
@@ -360,6 +641,11 @@ impl PostgresStore {
             return Ok(0);
         };
         let day: String = row.get(0);
+        // Nearly always a no-op — the build's own insert created this day's
+        // partitions — but a prune that dropped the day between the build log
+        // and the `.xcresult` arriving 70-90 seconds later is real, and without
+        // this the results would land in the default partition.
+        self.ensure_partitions_for(&day)?;
         let mut inserted = 0;
         let mut tx = self.client.transaction()?;
         for (test, attempt) in tests {
@@ -679,16 +965,43 @@ impl PostgresStore {
     /// Builds older than `keep_days`, excluding the newest build of each
     /// project. Retention orders by `recorded_at`, not `id`: `collect --all`
     /// backfills old logs under new ids, so a higher id can hold an older build.
-    fn prunable_builds(&mut self, keep_days: u32) -> Result<Vec<String>, StoreError> {
+    ///
+    /// Returns each build's day alongside its key, because every table is
+    /// partitioned by day and a DELETE that names one prunes to a single
+    /// partition instead of scanning every one.
+    fn prunable_builds(&mut self, keep_days: u32) -> Result<Vec<(String, String)>, StoreError> {
         let rows = self.client.query(
             "WITH newest AS (
                  SELECT DISTINCT ON (project) build_key FROM builds
                  ORDER BY project, received_at DESC
              )
-             SELECT build_key FROM builds
+             SELECT day::TEXT, build_key FROM builds
              WHERE received_at < now() - ($1::INTEGER * INTERVAL '1 day')
                AND build_key NOT IN (SELECT build_key FROM newest)
              ORDER BY received_at",
+            &[&(keep_days as i32)],
+        )?;
+        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
+
+    /// Days whose every build is prunable, so the day can be dropped whole.
+    ///
+    /// A day holding a build that must be preserved — one inside the retention
+    /// window, or the newest of its project — is excluded. Dropping a partition
+    /// is all-or-nothing, and losing a project's newest build would silently
+    /// break every regression comparison for it, which is the one thing
+    /// `prune`'s row-wise path goes out of its way to protect.
+    fn droppable_days(&mut self, keep_days: u32) -> Result<Vec<String>, StoreError> {
+        let rows = self.client.query(
+            "WITH newest AS (
+                 SELECT DISTINCT ON (project) day, build_key FROM builds
+                 ORDER BY project, received_at DESC
+             )
+             SELECT day::TEXT FROM builds
+             GROUP BY day
+             HAVING bool_and(received_at < now() - ($1::INTEGER * INTERVAL '1 day'))
+                AND NOT bool_or((day, build_key) IN (SELECT day, build_key FROM newest))
+             ORDER BY day",
             &[&(keep_days as i32)],
         )?;
         Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
@@ -814,29 +1127,84 @@ impl PostgresStore {
     }
 
     /// Reports what `prune` would delete without deleting anything.
+    ///
+    /// Exact, including the days `prune` will drop whole: every build in a
+    /// droppable day is prunable by construction — that is what makes the day
+    /// droppable — so this can never under-report what `prune` removes.
     pub fn prune_preview(&mut self, keep_days: u32) -> Result<Vec<String>, StoreError> {
-        self.prunable_builds(keep_days)
+        Ok(self.prunable_builds(keep_days)?.into_iter().map(|(_, key)| key).collect())
     }
 
     /// Deletes builds older than `keep_days`, keeping the newest build of each
     /// project so regression baselines never lose their chain.
+    ///
+    /// Two paths, because the tables are partitioned by day. A day whose every
+    /// build is prunable is dropped as eight `DROP TABLE`s, which is a catalog
+    /// update rather than a scan; whatever remains is deleted row-wise, one
+    /// statement per day so the constant `day` prunes to a single partition.
+    /// Before partitions existed this was eight DELETEs that each scanned their
+    /// whole table.
+    ///
+    /// Not atomic across the two paths, deliberately: one transaction would hold
+    /// ACCESS EXCLUSIVE on every dropped partition for the length of the
+    /// row-wise deletes. A crash in between leaves fewer builds deleted than the
+    /// return value claims, and re-running finishes the job.
     pub fn prune(&mut self, keep_days: u32) -> Result<usize, StoreError> {
-        let keys = self.prunable_builds(keep_days)?;
-        if keys.is_empty() {
+        let doomed = self.prunable_builds(keep_days)?;
+        if doomed.is_empty() {
             return Ok(0);
         }
-        let mut tx = self.client.transaction()?;
-        for table in BUILD_SCOPED_TABLES {
-            tx.execute(
-                format!("DELETE FROM {table} WHERE build_key = ANY($1)").as_str(),
-                &[&keys],
-            )
-            .map_err(|source| StoreError::Query { operation: "pruning child rows", source })?;
+        // Counted before anything is dropped, so the number reported matches
+        // what `prune_preview` showed. An inconsistent count on a destructive
+        // command is how a user stops trusting the preview.
+        let total = doomed.len();
+
+        let droppable: std::collections::HashSet<String> =
+            self.droppable_days(keep_days)?.into_iter().collect();
+        for day in &droppable {
+            // Own transaction per day: the locks are released as each day
+            // finishes rather than being held until the last one does.
+            let mut tx = self.client.transaction()?;
+            for table in DAY_PARTITIONED_TABLES {
+                let child = partition_name(table, day);
+                // IF EXISTS because a day can predate the per-day partitions and
+                // still have its rows in the default, where the row-wise path
+                // below catches them.
+                tx.execute(format!("DROP TABLE IF EXISTS {child}").as_str(), &[]).map_err(
+                    |source| StoreError::Query { operation: "dropping a day partition", source },
+                )?;
+            }
+            tx.commit()?;
         }
-        tx.execute("DELETE FROM builds WHERE build_key = ANY($1)", &[&keys])
+
+        // Whatever the drops did not cover: builds in days that hold something
+        // worth keeping, and rows still in a default partition.
+        let mut by_day: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+        for (day, key) in &doomed {
+            by_day.entry(day.as_str()).or_default().push(key.as_str());
+        }
+        let mut tx = self.client.transaction()?;
+        for (day, keys) in by_day {
+            let keys: Vec<String> = keys.iter().map(|key| (*key).to_owned()).collect();
+            for table in BUILD_SCOPED_TABLES {
+                tx.execute(
+                    format!(
+                        "DELETE FROM {table}
+                         WHERE day = to_date($1,'YYYY-MM-DD') AND build_key = ANY($2)"
+                    )
+                    .as_str(),
+                    &[&day, &keys],
+                )
+                .map_err(|source| StoreError::Query { operation: "pruning child rows", source })?;
+            }
+            tx.execute(
+                "DELETE FROM builds WHERE day = to_date($1,'YYYY-MM-DD') AND build_key = ANY($2)",
+                &[&day, &keys],
+            )
             .map_err(|source| StoreError::Query { operation: "pruning builds", source })?;
+        }
         tx.commit()?;
-        Ok(keys.len())
+        Ok(total)
     }
 
     pub fn git_context(&mut self, builds:i64, project:Option<&str>) -> Result<Value,StoreError> {
@@ -1089,6 +1457,44 @@ fn civil_from_days(days: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// `YYYY-MM-DD` to days since the Unix epoch — the inverse of
+/// [`civil_from_days`], and Hinnant's `days_from_civil` for the same reason:
+/// this crate needs two date conversions and no date crate.
+///
+/// Fallible where its inverse is not, because the input is not always ours.
+/// `day_of` produces a well-formed day, but `attach_tests` reads one back out of
+/// a database column, and partition DDL formats it straight into a statement —
+/// so a malformed day must be rejected rather than interpolated.
+fn days_from_civil(day: &str) -> Result<i64, StoreError> {
+    let malformed = || StoreError::Migration(format!("malformed day: {day}"));
+    let mut parts = day.split('-');
+    let (Some(y), Some(m), Some(d), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(malformed());
+    };
+    // Length-checked as well as parsed: `to_date` would accept "2023-1-4", and
+    // a partition named from those digits would not match the day it holds.
+    if (y.len(), m.len(), d.len()) != (4, 2, 2) {
+        return Err(malformed());
+    }
+    let (year, month, day_of_month) = (
+        y.parse::<i64>().map_err(|_| malformed())?,
+        m.parse::<i64>().map_err(|_| malformed())?,
+        d.parse::<i64>().map_err(|_| malformed())?,
+    );
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day_of_month) {
+        return Err(malformed());
+    }
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day_of_month - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Ok(era * 146_097 + doe - 719_468)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1163,6 +1569,94 @@ mod tests {
         assert_eq!(civil_from_days(19_782), "2024-02-29");
         // Before the epoch, which `div_euclid` must handle without wrapping.
         assert_eq!(civil_from_days(-1), "1969-12-31");
+    }
+
+    #[test]
+    fn partition_names_encode_the_day_without_separators() {
+        assert_eq!(partition_name("builds", "2023-11-14"), "builds_p20231114");
+        assert_eq!(partition_name("build_tests", "2024-02-29"), "build_tests_p20240229");
+        // A child must never be mistakable for a parent or for a default: both
+        // `prune_covers_every_build_scoped_table` and the partition inventory
+        // filter on those shapes.
+        for table in DAY_PARTITIONED_TABLES {
+            let child = partition_name(table, "2023-11-14");
+            assert!(!child.ends_with("_default"), "{child} must not read as a default partition");
+            assert!(
+                !DAY_PARTITIONED_TABLES.contains(&child.as_str()),
+                "{child} must not collide with a parent name"
+            );
+        }
+    }
+
+    #[test]
+    fn next_day_crosses_month_and_year_and_leap_boundaries() {
+        assert_eq!(next_day("2023-11-14").unwrap(), "2023-11-15");
+        assert_eq!(next_day("2023-11-30").unwrap(), "2023-12-01");
+        assert_eq!(next_day("2023-12-31").unwrap(), "2024-01-01");
+        // 2024 is a leap year and 2023 is not, so February ends differently.
+        assert_eq!(next_day("2024-02-28").unwrap(), "2024-02-29");
+        assert_eq!(next_day("2023-02-28").unwrap(), "2023-03-01");
+    }
+
+    /// The DDL formats a day straight into a statement, so a malformed one must
+    /// be rejected rather than interpolated. `attach_tests` reads its day from a
+    /// database column, which is why this is not merely defensive.
+    #[test]
+    fn next_day_rejects_a_malformed_day() {
+        for bad in ["", "2023-11", "2023-11-14-1", "not-a-date", "2023-1-4", "2023-13-01", "2023-11-00"] {
+            assert!(next_day(bad).is_err(), "{bad:?} must not parse as a day");
+        }
+    }
+
+    #[test]
+    fn days_from_civil_inverts_civil_from_days() {
+        for days in [-719_162_i64, -1, 0, 1, 19_000, 19_782, 100_000] {
+            let civil = civil_from_days(days);
+            assert_eq!(days_from_civil(&civil).unwrap(), days, "{civil} round-trips");
+        }
+    }
+
+    #[test]
+    fn the_partition_window_names_every_day_inclusive() {
+        let days = window_days("2023-11-14", 2, 2);
+        assert_eq!(
+            days,
+            vec!["2023-11-12", "2023-11-13", "2023-11-14", "2023-11-15", "2023-11-16"],
+            "both ends are included and the anchor is in the middle"
+        );
+        assert_eq!(window_days("2023-11-14", 7, 7).len(), 15);
+        assert_eq!(window_days("2023-11-14", 0, 0), vec!["2023-11-14"]);
+    }
+
+    /// The schema and [`DAY_PARTITIONED_TABLES`] must agree exactly. A ninth
+    /// partitioned table added to the schema but not to the constant would never
+    /// get per-day partitions — every one of its rows would land in the default,
+    /// silently, which is the state this whole change exists to fix.
+    #[test]
+    fn every_day_partitioned_table_is_declared_partitioned_in_the_schema() {
+        let declared: Vec<&str> = SCHEMA_SQL
+            .lines()
+            .filter(|line| line.contains("PARTITION BY RANGE (day)"))
+            .filter_map(|line| line.split_once("CREATE TABLE IF NOT EXISTS ")?.1.split_whitespace().next())
+            .collect();
+        assert_eq!(
+            declared.len(),
+            DAY_PARTITIONED_TABLES.len(),
+            "the schema declares {declared:?} as partitioned by day, but the constant lists \
+             {DAY_PARTITIONED_TABLES:?}"
+        );
+        for table in &declared {
+            assert!(
+                DAY_PARTITIONED_TABLES.contains(table),
+                "{table} is partitioned by day but is missing from DAY_PARTITIONED_TABLES, \
+                 so no per-day partition is ever created for it"
+            );
+            assert!(
+                SCHEMA_SQL.contains(&format!("{table}_default PARTITION OF {table} DEFAULT")),
+                "{table} has no default partition, so a build dated outside the pre-created \
+                 window would fail to insert"
+            );
+        }
     }
 
     /// A build that started just before midnight and one just after must land

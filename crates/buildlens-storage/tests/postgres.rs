@@ -57,6 +57,79 @@ fn connect(name: &str) -> Option<PostgresStore> {
     Some(PostgresStore::connect(&isolated_url(&base, name)).expect("connect and migrate"))
 }
 
+/// A store plus a second connection on the same isolated schema, for the tests
+/// that have to inspect the catalog or age a row that no public method exposes.
+///
+/// Both share the `search_path` the URL carries, so the raw client sees exactly
+/// the tables the store created and `to_regclass` resolves the same way the
+/// partition DDL does.
+fn connect_with_client(name: &str) -> Option<(PostgresStore, Client)> {
+    let Some(base) = database_url() else {
+        eprintln!("skipping {name}: BUILDLENS_TEST_DATABASE_URL not set");
+        return None;
+    };
+    let url = isolated_url(&base, name);
+    let store = PostgresStore::connect(&url).expect("connect and migrate");
+    let client = Client::connect(&url, NoTls).expect("second connection");
+    Some((store, client))
+}
+
+/// Whether a relation exists in the schema this connection points at.
+fn exists(client: &mut Client, relation: &str) -> bool {
+    client
+        .query_one("SELECT to_regclass($1) IS NOT NULL", &[&relation])
+        .expect("check for a relation")
+        .get(0)
+}
+
+fn count(client: &mut Client, relation: &str) -> i64 {
+    client
+        .query_one(format!("SELECT count(*)::bigint FROM {relation}").as_str(), &[])
+        .expect("count rows")
+        .get(0)
+}
+
+/// Backdates a build's `received_at`, which is what prune's cutoff reads.
+///
+/// `received_at` defaults to `now()` and nothing public sets it, so a test
+/// cannot otherwise produce a build old enough to prune. `started_at` — and so
+/// the partition a row lives in — is deliberately left alone: the two are
+/// independent, and prune has to handle a day whose builds were received long
+/// after they ran.
+fn age_build(client: &mut Client, key: &str, days: i32) {
+    let updated = client
+        .execute(
+            "UPDATE builds SET received_at = now() - ($2::INTEGER * INTERVAL '1 day')
+             WHERE build_key = $1",
+            &[&key, &days],
+        )
+        .expect("backdate a build");
+    assert_eq!(updated, 1, "{key} was not stored, so ageing it did nothing");
+}
+
+fn build_keys(client: &mut Client) -> std::collections::HashSet<String> {
+    client
+        .query("SELECT build_key FROM builds", &[])
+        .expect("list builds")
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+/// The partition name a build with this start time should land in, e.g.
+/// `builds_p20231114`.
+///
+/// Asks Postgres to do the epoch-to-date conversion rather than repeating the
+/// crate's own civil-date maths: a test that reimplements what it is checking
+/// agrees with the implementation even when both are wrong.
+fn partition_for(client: &mut Client, table: &str, started_at: f64) -> String {
+    let day: String = client
+        .query_one("SELECT to_char(to_timestamp($1) AT TIME ZONE 'UTC', 'YYYYMMDD')", &[&started_at])
+        .expect("derive the day")
+        .get(0);
+    format!("{table}_p{day}")
+}
+
 fn metrics(id: &str, seconds: f64, started_at: f64) -> BuildMetrics {
     BuildMetrics {
         metrics_schema_version: 2,
@@ -889,6 +962,19 @@ fn prune_covers_every_build_scoped_table() {
     tables.sort_unstable();
     tables.dedup();
 
+    // Per-day partitions are created from Rust and never appear in `schema.sql`,
+    // which is what keeps this filter honest. If one is ever added to the schema
+    // it would be picked up as a build-scoped table and prune would be asked to
+    // delete from a child directly.
+    for table in &tables {
+        let suffix = table.rsplit('_').next().unwrap_or_default();
+        assert!(
+            !(suffix.starts_with('p') && suffix[1..].chars().all(char::is_numeric) && suffix.len() > 1),
+            "{table} reads as a per-day partition; those are created by \
+             ensure_day_partitions, not declared in schema.sql"
+        );
+    }
+
     let covered = buildlens_storage::BUILD_SCOPED_TABLES;
     for table in tables {
         assert!(
@@ -897,6 +983,323 @@ fn prune_covers_every_build_scoped_table() {
              so pruning a build would orphan its rows"
         );
     }
+}
+
+/// Storing a build must create its day's partition on every partitioned table,
+/// not just on `builds`: the detail tables are written in the same transaction
+/// and would otherwise fall into their defaults.
+#[test]
+fn an_insert_creates_the_partition_for_its_day() {
+    let Some((mut store, mut client)) = connect_with_client("part_create") else { return };
+    let started = 1_700_000_000.0;
+    store.save_analysis(&analysis("p1", 100.0, started), "App", None, false).unwrap();
+
+    for table in buildlens_storage::DAY_PARTITIONED_TABLES {
+        let child = partition_for(&mut client, table, started);
+        assert!(exists(&mut client, &child), "{child} was never created");
+    }
+}
+
+/// The point of the whole exercise: rows must land in the dated child, and the
+/// default must stay empty. A passing `DISTINCT day` check proves nothing here —
+/// that was already true when every row was in the default.
+#[test]
+fn rows_land_in_the_per_day_partition_not_the_default() {
+    let Some((mut store, mut client)) = connect_with_client("part_routing") else { return };
+    let started = 1_700_000_000.0;
+    store.save_analysis(&analysis("r1", 100.0, started), "App", None, false).unwrap();
+
+    // `builds` comes over the wire; `build_metadata` is written only by
+    // `save_inner`, so it exercises the other insert site.
+    for table in ["builds", "build_targets", "build_tests", "build_metadata"] {
+        let child = partition_for(&mut client, table, started);
+        assert!(count(&mut client, &child) > 0, "{child} holds no rows");
+        assert_eq!(
+            count(&mut client, &format!("{table}_default")),
+            0,
+            "{table}_default must be empty in steady state"
+        );
+    }
+}
+
+/// The upgrade path. Every row written before this feature sits in the default
+/// partition, and Postgres refuses `CREATE TABLE ... PARTITION OF` for a range
+/// the default already holds rows in — so creation has to move them. Detaching
+/// the child and re-inserting reproduces exactly that starting state.
+#[test]
+fn a_populated_default_is_drained_when_its_partition_is_created() {
+    let Some((mut store, mut client)) = connect_with_client("part_drain") else { return };
+    let started = 1_700_000_000.0;
+    store.save_analysis(&analysis("d1", 100.0, started), "App", None, false).unwrap();
+
+    // Put the row back where an un-partitioned database would have kept it.
+    let child = partition_for(&mut client, "builds", started);
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE builds DETACH PARTITION {child};
+             INSERT INTO builds_default SELECT * FROM {child};
+             DROP TABLE {child};"
+        ))
+        .expect("move the row into the default");
+    assert_eq!(count(&mut client, "builds_default"), 1, "the row starts in the default");
+
+    buildlens_storage::ensure_day_partitions(&mut client, "2023-11-14").expect("create the day");
+
+    assert_eq!(count(&mut client, "builds_default"), 0, "the default was drained");
+    assert_eq!(count(&mut client, &child), 1, "the row moved into its day");
+    assert_eq!(count(&mut client, "builds"), 1, "and was neither lost nor duplicated");
+}
+
+/// Two processes storing the first build of a new day race on the same DDL. One
+/// creates the partitions; the other must find them rather than error.
+#[test]
+fn two_concurrent_inserts_for_a_new_day_both_succeed() {
+    let Some(base) = database_url() else {
+        eprintln!("skipping part_race: BUILDLENS_TEST_DATABASE_URL not set");
+        return;
+    };
+    let url = isolated_url(&base, "part_race");
+    // A day well outside the pre-created window, so neither thread finds the
+    // partitions already there and both attempt the DDL.
+    let started = 1_600_000_000.0;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let handles: Vec<_> = ["c1", "c2"]
+        .into_iter()
+        .map(|key| {
+            let url = url.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let mut store = PostgresStore::connect(&url).expect("connect and migrate");
+                barrier.wait();
+                store.save_analysis(&analysis(key, 100.0, started), "App", None, false)
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let stored = handle.join().expect("thread did not panic");
+        assert!(stored.expect("racing inserts must not error"), "both builds stored");
+    }
+
+    let mut client = Client::connect(&url, NoTls).expect("verify");
+    assert_eq!(count(&mut client, "builds"), 2);
+    assert_eq!(count(&mut client, "builds_default"), 0, "both rows routed to the day");
+}
+
+/// `migrate` pre-creates a narrow window, so a backfilled log from last year and
+/// a build from a machine with a fast clock both fall outside it. Each must
+/// create its own partition on the write path rather than fail or land in the
+/// default.
+#[test]
+fn a_build_dated_outside_the_pre_created_window_still_stores() {
+    let Some((mut store, mut client)) = connect_with_client("part_window") else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as f64;
+    let year = 365.0 * 86_400.0;
+
+    for (key, started) in [("old", now - year), ("future", now + year)] {
+        store.save_analysis(&analysis(key, 100.0, started), "App", None, false).unwrap();
+        let child = partition_for(&mut client, "builds", started);
+        assert!(exists(&mut client, &child), "{child} was not created for {key}");
+        assert_eq!(count(&mut client, &child), 1, "{key} did not land in {child}");
+    }
+    assert_eq!(count(&mut client, "builds_default"), 0);
+    // The safety net must survive: without it, a build dated outside every
+    // partition would fail to insert rather than degrade.
+    assert!(exists(&mut client, "builds_default"), "the default partition was removed");
+}
+
+/// A ⌘U writes its `.xcresult` 70-90 seconds after the build log. If a prune
+/// dropped the day in between, the results would land in the default.
+#[test]
+fn attach_tests_creates_the_partition_when_the_day_was_dropped() {
+    let Some((mut store, mut client)) = connect_with_client("part_attach") else { return };
+    let started = 1_700_000_000.0;
+    let mut build = analysis("a1", 100.0, started);
+    build.tests.tests.clear();
+    store.save_analysis(&build, "App", None, false).unwrap();
+
+    let child = partition_for(&mut client, "build_tests", started);
+    client
+        .batch_execute(&format!("DROP TABLE {child}"))
+        .expect("drop the day's test partition");
+
+    let results = [(
+        TestResult {
+            suite: "AppTests".into(),
+            test: "testLate".into(),
+            status: TestStatus::Passed,
+            duration_seconds: Some(0.5),
+            message: None,
+            fingerprint: None,
+        },
+        1,
+    )];
+    assert_eq!(store.attach_tests("a1", &results).unwrap(), 1);
+
+    assert!(exists(&mut client, &child), "{child} was not recreated");
+    assert_eq!(count(&mut client, &child), 1, "the result did not land in its day");
+    assert_eq!(count(&mut client, "build_tests_default"), 0);
+}
+
+/// Prune's row-wise path must still clear every build-scoped table when the day
+/// cannot be dropped whole.
+#[test]
+fn prune_deletes_from_every_partition_scoped_table_by_day() {
+    let Some((mut store, mut client)) = connect_with_client("prune_rows") else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as f64;
+    // Same day, so the day holds the project's newest build and cannot be
+    // dropped — forcing the row-wise path for the older one.
+    store.save_analysis(&analysis("old", 100.0, now - 100.0), "App", None, false).unwrap();
+    store.save_analysis(&analysis("new", 100.0, now - 50.0), "App", None, false).unwrap();
+    age_build(&mut client, "old", 60);
+
+    assert_eq!(store.prune(30).unwrap(), 1);
+
+    assert_eq!(count(&mut client, "builds"), 1, "the newest build survives");
+    for table in buildlens_storage::BUILD_SCOPED_TABLES {
+        let orphans: i64 = client
+            .query_one(
+                format!("SELECT count(*)::bigint FROM {table} WHERE build_key = 'old'").as_str(),
+                &[],
+            )
+            .expect("count orphans")
+            .get(0);
+        assert_eq!(orphans, 0, "{table} still holds rows for the pruned build");
+    }
+}
+
+/// The fast path: a day holding nothing worth keeping is dropped as eight
+/// `DROP TABLE`s rather than scanned.
+#[test]
+fn prune_drops_a_whole_day_when_nothing_in_it_must_be_kept() {
+    let Some((mut store, mut client)) = connect_with_client("prune_drop") else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as f64;
+    let old_day = now - 60.0 * 86_400.0;
+    store.save_analysis(&analysis("stale", 100.0, old_day), "App", None, false).unwrap();
+    // The project's newest build, on a different day, so the stale day holds
+    // nothing that must be preserved.
+    store.save_analysis(&analysis("fresh", 100.0, now), "App", None, false).unwrap();
+    age_build(&mut client, "stale", 60);
+
+    let stale_child = partition_for(&mut client, "builds", old_day);
+    let fresh_child = partition_for(&mut client, "builds", now);
+    assert!(exists(&mut client, &stale_child), "the stale day starts partitioned");
+
+    assert_eq!(store.prune(30).unwrap(), 1);
+
+    for table in buildlens_storage::DAY_PARTITIONED_TABLES {
+        let child = partition_for(&mut client, table, old_day);
+        assert!(!exists(&mut client, &child), "{child} should have been dropped whole");
+    }
+    assert!(exists(&mut client, &fresh_child), "the current day must survive");
+    assert_eq!(count(&mut client, "builds"), 1);
+}
+
+/// Dropping a partition is all-or-nothing, so a day holding a project's newest
+/// build must not be dropped however old it is — losing it would silently break
+/// every regression comparison for that project.
+#[test]
+fn prune_keeps_a_day_that_holds_a_projects_newest_build() {
+    let Some((mut store, mut client)) = connect_with_client("prune_keep") else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as f64;
+    let old_day = now - 60.0 * 86_400.0;
+    // Two builds on one old day, and it is the only day this project has: its
+    // newest build lives here, so the day survives even though both builds are
+    // past the cutoff.
+    store.save_analysis(&analysis("quiet1", 100.0, old_day), "Quiet", None, false).unwrap();
+    store.save_analysis(&analysis("quiet2", 100.0, old_day + 60.0), "Quiet", None, false).unwrap();
+    age_build(&mut client, "quiet1", 60);
+    age_build(&mut client, "quiet2", 59);
+
+    assert_eq!(store.prune(30).unwrap(), 1, "only the older of the two is prunable");
+
+    let child = partition_for(&mut client, "builds", old_day);
+    assert!(exists(&mut client, &child), "{child} holds a baseline and must not be dropped");
+    let survivors: Vec<String> = client
+        .query("SELECT build_key FROM builds", &[])
+        .expect("list survivors")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(survivors, vec!["quiet2".to_string()], "the baseline survived");
+}
+
+/// The invariant that keeps the preview trustworthy: every build in a dropped
+/// day is prunable by construction, so the preview can never under-report what
+/// prune removes. A mismatch here means `--confirm` deletes more than it showed.
+#[test]
+fn prune_preview_never_under_reports_what_prune_deletes() {
+    let Some((mut store, mut client)) = connect_with_client("prune_preview") else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as f64;
+    let old_day = now - 60.0 * 86_400.0;
+    // A mix of both paths: a droppable day, plus an old build sharing a day with
+    // a build that must be kept.
+    store.save_analysis(&analysis("gone1", 100.0, old_day), "App", None, false).unwrap();
+    store.save_analysis(&analysis("gone2", 100.0, old_day + 60.0), "App", None, false).unwrap();
+    store.save_analysis(&analysis("mixed", 100.0, now - 100.0), "App", None, false).unwrap();
+    store.save_analysis(&analysis("keep", 100.0, now - 50.0), "App", None, false).unwrap();
+    for (key, days) in [("gone1", 60), ("gone2", 59), ("mixed", 40)] {
+        age_build(&mut client, key, days);
+    }
+
+    let before: std::collections::HashSet<String> = build_keys(&mut client);
+    let mut previewed = store.prune_preview(30).unwrap();
+    previewed.sort();
+
+    let deleted = store.prune(30).unwrap();
+    let after = build_keys(&mut client);
+    let mut actually_gone: Vec<String> = before.difference(&after).cloned().collect();
+    actually_gone.sort();
+
+    assert_eq!(previewed, actually_gone, "the preview must name exactly what prune removed");
+    assert_eq!(deleted, actually_gone.len(), "and the count must match too");
+}
+
+/// The inventory view is how an operator answers "is partitioning working
+/// here", so it must list every parent rather than whichever ones happen to be
+/// in `search_path` order.
+#[test]
+fn the_partition_inventory_view_lists_every_parent() {
+    let Some((mut store, mut client)) = connect_with_client("part_view") else { return };
+    store.save_analysis(&analysis("v1", 100.0, 1_700_000_000.0), "App", None, false).unwrap();
+
+    let parents: Vec<String> = client
+        .query("SELECT DISTINCT parent FROM buildlens_partitions ORDER BY parent", &[])
+        .expect("read the inventory")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+
+    let mut expected: Vec<String> =
+        buildlens_storage::DAY_PARTITIONED_TABLES.iter().map(|t| (*t).to_string()).collect();
+    expected.sort();
+    assert_eq!(parents, expected);
+
+    // Every parent keeps its default alongside the dated children.
+    let defaults: i64 = client
+        .query_one(
+            "SELECT count(*)::bigint FROM buildlens_partitions WHERE partition LIKE '%\\_default'",
+            &[],
+        )
+        .expect("count defaults")
+        .get(0);
+    assert_eq!(defaults, buildlens_storage::DAY_PARTITIONED_TABLES.len() as i64);
 }
 
 /// `compare_to_baseline` had no test at all, which is how it shipped setting

@@ -56,11 +56,10 @@ pub fn pool(url: &str, size: u32) -> Result<Pool, ServerError> {
 /// advisory lock still guards against *other* BuildLens processes starting
 /// against the same database concurrently.
 ///
-/// `builds` is partitioned by day so that dropping old data becomes a
-/// partition drop and day-scoped queries can skip whole ranges. Note that
-/// only a DEFAULT partition is created here: until per-day partitions are
-/// added, every row lands in the default and neither benefit applies. The
-/// declaration is in place so adding them later needs no table rewrite.
+/// Also creates the per-day partitions for a window around today, so that
+/// dropping old data is a partition drop and day-scoped queries skip whole
+/// ranges. A build dated outside that window creates its own partition on the
+/// write path; the DEFAULT partitions remain as the safety net beneath both.
 pub fn migrate(client: &mut Client) -> Result<(), ServerError> {
     // Delegated to `buildlens-storage`, which owns the schema and the
     // migration ledger. This function used to carry its own copy of the

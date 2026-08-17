@@ -248,6 +248,27 @@ fn partitions_by_the_build_start_day() {
         .map(|row| row.get(0))
         .collect();
     assert_eq!(days, vec!["2023-11-14", "2023-11-15"]);
+
+    // The `day` column alone proves nothing about partitioning — it read
+    // correctly for a year while every row sat in `builds_default` and the
+    // per-day partitions this asserts on did not exist. Check placement.
+    for child in ["builds_p20231114", "builds_p20231115"] {
+        let present: bool = client
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[&child])
+            .unwrap()
+            .get(0);
+        assert!(present, "{child} was never created");
+        let rows: i64 = client
+            .query_one(format!("SELECT count(*)::bigint FROM {child}").as_str(), &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(rows, 1, "{child} did not receive its build");
+    }
+    let stragglers: i64 = client
+        .query_one("SELECT count(*)::bigint FROM builds_default", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(stragglers, 0, "no row should be left in the default partition");
 }
 
 #[test]
@@ -432,6 +453,74 @@ fn the_day_window_is_inclusive_of_its_boundary() {
     assert_eq!(slowest["items"].as_array().unwrap().len(), 1);
 }
 
+/// The read-side half of the payoff, and the only test that proves it rather
+/// than assuming it: a `day >= CURRENT_DATE - $1` filter must skip the
+/// partitions outside its window.
+///
+/// `CURRENT_DATE` is STABLE, not IMMUTABLE, so this is *runtime* pruning — the
+/// executor discards partitions during init-plan rather than the planner
+/// discarding them outright. Either way the children are never scanned, which is
+/// what the plan is inspected for.
+///
+/// Asserts on how many partitions the plan touches rather than on plan text,
+/// because node names and plan shapes move between major Postgres versions.
+#[test]
+fn the_day_window_query_prunes_to_its_partitions() {
+    let Some(url) = database_url() else {
+        eprintln!("skipping: BUILDLENS_TEST_DATABASE_URL not set");
+        return;
+    };
+    let url = isolated_url(&url, "t_prune_plan");
+    let mut store = buildlens_server_store(&url);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as f64;
+    // A spread of days, most of them far outside a 2-day window.
+    for days_back in [0.0, 1.0, 10.0, 20.0, 30.0, 40.0] {
+        store.insert(&build(
+            &format!("b{days_back}"),
+            100.0,
+            Some(now - days_back * 86_400.0),
+            Some("m1"),
+        ));
+    }
+
+    let mut client = Client::connect(&url, NoTls).unwrap();
+    let total: i64 = client
+        .query_one("SELECT count(*)::bigint FROM buildlens_partitions WHERE parent = 'builds'", &[])
+        .unwrap()
+        .get(0);
+    assert!(total > 4, "expected a partition per day plus the default, got {total}");
+
+    // ANALYZE so the plan reports what was actually executed; FORMAT TEXT and a
+    // substring count keeps this robust across versions.
+    let plan: String = client
+        .query(
+            "EXPLAIN (ANALYZE, FORMAT TEXT)
+             SELECT count(*) FROM builds WHERE day >= (CURRENT_DATE - $1::INTEGER)",
+            &[&2_i32],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // `never executed` is how a pruned-at-runtime child appears; a child that
+    // was actually read reports rows and loops instead.
+    let scanned = plan
+        .lines()
+        .filter(|line| line.contains("on builds_p"))
+        .filter(|line| !line.contains("never executed"))
+        .count();
+    assert!(
+        scanned < (total as usize - 1),
+        "a 2-day window scanned {scanned} of {total} partitions, so it is not pruning:\n{plan}"
+    );
+}
+
 /// The ranked panels scope to one project; without that, a shared server
 /// mixes every team's targets into one list.
 #[test]
@@ -543,11 +632,29 @@ fn migrating_an_existing_schema_is_idempotent() {
     let mut first = buildlens_server_store(&url);
     first
         .insert(&build("before", 10.0, Some(1_700_000_000.0), Some("m1")));
+
+    let mut client = Client::connect(&url, NoTls).unwrap();
+    let partitions = |client: &mut Client| -> i64 {
+        client
+            .query_one("SELECT count(*)::bigint FROM buildlens_partitions", &[])
+            .unwrap()
+            .get(0)
+    };
+    let before = partitions(&mut client);
+
     // Reconnecting re-runs migrate() against a populated schema.
     let mut second = buildlens_server_store(&url);
     assert_eq!(
         second.store().builds(10).unwrap()["items"].as_array().unwrap().len(),
         1,
         "re-migrating must not disturb existing rows"
+    );
+    // Migration now creates partitions too, so idempotence has to cover them:
+    // a second connect must find the window warm rather than add another day's
+    // worth of tables.
+    assert_eq!(
+        partitions(&mut client),
+        before,
+        "re-migrating must not create more partitions"
     );
 }
