@@ -89,6 +89,24 @@ pub struct BuildStepMetric {
     pub started_at: Option<f64>,
     pub ended_at: Option<f64>,
     pub fetched_from_cache: bool,
+    /// Whether this step ran during the build being measured, rather than
+    /// being replayed from an earlier one.
+    ///
+    /// Xcode re-emits the whole build graph in an incremental build's log,
+    /// including steps it did not run, carrying their **original durations and
+    /// timestamps**. Measured on a real project: a 21.9-second rebuild logged
+    /// 3,888 steps of which 3,850 had started before that build began, and
+    /// claimed 2,007 Swift compilations totalling 1,723 seconds.
+    ///
+    /// Nothing else distinguishes them — `fetched_from_cache` is false on a
+    /// replayed step, because Xcode did not fetch it from anywhere. Treating
+    /// "not fetched from cache" as "compiled" is what made every incremental
+    /// build report as `clean` with its full clean-build file count. XCMetrics
+    /// classifies builds the same way and has the same blind spot.
+    ///
+    /// `true` for a step with no usable timestamps: a step that cannot be
+    /// placed is counted as real, so an unreadable log under-reports nothing.
+    pub executed: bool,
     pub warning_count: usize,
     pub error_count: usize,
 }
@@ -173,6 +191,8 @@ pub struct MetricDiagnostic {
     pub target: Option<String>,
 }
 
+fn is_zero(value: &usize) -> bool { *value == 0 }
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BuildMetrics {
     pub metrics_schema_version: u32,
@@ -213,6 +233,16 @@ pub struct BuildMetrics {
     /// look broken. Recorded rather than silent so a reader of "50 files"
     /// knows the build compiled nine thousand.
     pub truncations: Vec<String>,
+    /// How many steps this log restated from an earlier build without re-running
+    /// them. See [`BuildStepMetric::executed`].
+    ///
+    /// Its own field rather than a `truncations` entry: nothing was capped, and
+    /// rather than `warnings`, because the log decoded perfectly — this is what
+    /// Xcode wrote. It is a fact about the build worth surfacing, since a
+    /// rebuild that replayed 3,850 of 3,888 steps did almost nothing, and that
+    /// is the interesting part.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub replayed_steps: usize,
     /// Diagnostics summed over every step. Reported alongside `status` rather
     /// than used to derive it: a build can fail with zero step-level errors
     /// (a cancelled build, a failure in a script phase), so counting errors
@@ -293,6 +323,7 @@ impl BuildMetrics {
             },
             warnings,
             truncations: Vec::new(),
+            replayed_steps: 0,
             error_count: 0,
             warning_count: 0,
             diagnostics: Vec::new(),
@@ -371,6 +402,12 @@ impl BuildMetrics {
             "Prepare packages",
             "Compute target dependency graph",
             "Cleaning",
+            // Xcode 26's spelling for the same thing. A ⇧⌘K writes a log whose
+            // only substantial phase is this one — 7.6 seconds of deleting, no
+            // targets, no files — and without it here that log passed
+            // `is_usable` on its phases alone and appeared beside real builds
+            // as an `unknown` row that compiled nothing.
+            "Prepare clean",
         ];
         self.targets.is_empty()
             && self.files.is_empty()
@@ -493,6 +530,29 @@ mod usability_tests {
         metrics
     }
 
+    /// Xcode's Clean Build Folder writes a log like any build's, and Xcode 26
+    /// names its work "Prepare clean" where earlier versions said "Cleaning".
+    /// With only the older spelling recognised, a ⇧⌘K appeared in the
+    /// dashboard as a 7.6-second `unknown` build that compiled nothing.
+    #[test]
+    fn an_xcode_26_clean_action_is_not_a_build() {
+        let mut metrics = BuildMetrics::empty(MetricsSourceKind::Xcactivitylog, Vec::new());
+        metrics.total_seconds = Some(7.63);
+        // The exact phases observed, in order.
+        metrics.phases = ["Prepare clean", "Create build operation",
+                          "Send project description to build service", "Create build request"]
+            .iter()
+            .map(|name| PhaseMetric {
+                name: (*name).into(),
+                seconds: 0.1,
+                started_at: None,
+                ended_at: None,
+            })
+            .collect();
+        assert!(metrics.timed_no_work(), "a clean action compiles nothing");
+        assert!(!metrics.is_usable(), "and so is not stored as a build");
+    }
+
     /// The bug this guards: an `IDELogDocumentLocation` 478 bytes into a real
     /// 52KB log left exactly this shape. It has a duration and a phase, so
     /// every other check passed, and it reached the dashboard as a near-empty
@@ -551,6 +611,7 @@ mod usability_tests {
                     started_at: None,
                     ended_at: None,
                     fetched_from_cache: false,
+                    executed: true,
                     warning_count: 0,
                     error_count: 0,
                 })

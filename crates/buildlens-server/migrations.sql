@@ -47,3 +47,14 @@ ALTER TABLE build_tests ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAUL
 -- ALTER ... ALTER CONSTRAINT for this.
 ALTER TABLE build_tests DROP CONSTRAINT IF EXISTS build_tests_pkey;
 ALTER TABLE build_tests ADD PRIMARY KEY (day, build_key, suite, name, attempt);
+
+--@migration 0003 replayed_steps
+-- How many steps a build's log restated from an earlier build without
+-- re-running them.
+--
+-- Xcode re-emits the whole build graph in an incremental log, keeping each
+-- replayed step's original duration, so a 9.7-second rebuild can list twelve
+-- thousand steps it never executed. Storing the count makes the difference
+-- between a build's logged size and its actual work visible on the build page,
+-- which is the number that varies on a machine with no build cache.
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS replayed_steps INTEGER NOT NULL DEFAULT 0;

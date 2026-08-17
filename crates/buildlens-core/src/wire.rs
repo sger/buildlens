@@ -508,6 +508,7 @@ mod tests {
             },
             warnings: vec![],
             truncations: vec![],
+            replayed_steps: 0,
             error_count: 0,
             warning_count: 0,
             diagnostics: vec![],

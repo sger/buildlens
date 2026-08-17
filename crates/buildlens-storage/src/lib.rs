@@ -258,6 +258,18 @@ impl PostgresStore {
             .map_err(|source| StoreError::Query { operation: "recording the scheme", source })?;
         }
 
+        // Also local-only, and for the same reason as the scheme: the wire
+        // carries totals, and how much of a build was replayed rather than run
+        // is a property of the log a client parsed, not of the build a server
+        // was told about.
+        if metrics.replayed_steps > 0 {
+            tx.execute(
+                "UPDATE builds SET replayed_steps = $3 WHERE day = to_date($1,'YYYY-MM-DD') AND build_key = $2",
+                &[&day, &key, &(metrics.replayed_steps as i32)],
+            )
+            .map_err(|source| StoreError::Query { operation: "recording replayed steps", source })?;
+        }
+
         // Slowest files first, so the cap keeps the rows that matter.
         let mut files: Vec<_> = metrics.files.iter().collect();
         files.sort_by(|a, b| b.seconds.total_cmp(&a.seconds));
@@ -426,7 +438,7 @@ impl PostgresStore {
     /// a normal answer to a stale dashboard link, and a caller should not have
     /// to read error text to tell it apart from a real database failure.
     pub fn build_snapshot(&mut self, key:&str) -> Result<Option<Value>,StoreError> {
-        let Some(r)=self.client.query_opt("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate,compiled_count,machine_id,xcode_version,platform,architecture,status,error_count,warning_count,scheme FROM builds WHERE build_key=$1",&[&key])? else {
+        let Some(r)=self.client.query_opt("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate,compiled_count,machine_id,xcode_version,platform,architecture,status,error_count,warning_count,scheme,replayed_steps FROM builds WHERE build_key=$1",&[&key])? else {
             return Ok(None);
         };
         let targets=self.client.query("SELECT name,seconds,category,fetched_from_cache,compiled_count FROM build_targets WHERE build_key=$1 ORDER BY seconds DESC LIMIT 100",&[&key])?;
@@ -466,7 +478,7 @@ impl PostgresStore {
                     (SELECT COALESCE(SUM(seconds),0.0) FROM build_tests WHERE build_key=$1)",&[&key])?;
         Ok(Some(serde_json::json!({
             "id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"project":r.get::<_,String>(2),"category":r.get::<_,String>(3),
-            "total_seconds":r.get::<_,f64>(4),"cache_hit_rate":r.get::<_,Option<f64>>(5),"compiled_count":r.get::<_,i32>(6),
+            "total_seconds":r.get::<_,f64>(4),"cache_hit_rate":r.get::<_,Option<f64>>(5),"compiled_count":r.get::<_,i32>(6),"replayed_steps":r.get::<_,i32>(15),
             "machine_id":r.get::<_,Option<String>>(7),"xcode_version":r.get::<_,Option<String>>(8),"platform":r.get::<_,Option<String>>(9),
             "architecture":r.get::<_,Option<String>>(10),"status":r.get::<_,Option<String>>(11),"errors":r.get::<_,i32>(12),"raw_warnings":r.get::<_,i32>(13),"scheme":r.get::<_,Option<String>>(14),
             "targets":targets.iter().map(|t|serde_json::json!({"name":t.get::<_,String>(0),"seconds":t.get::<_,f64>(1),"category":t.get::<_,String>(2),"fetched_from_cache":t.get::<_,bool>(3),"compiled_count":t.get::<_,i32>(4)})).collect::<Vec<_>>(),

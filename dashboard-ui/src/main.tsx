@@ -16,7 +16,7 @@ type BuildSwiftRow = { file:string; line:number; symbol?:string|null; kind:strin
 type BuildDiagRow = { fingerprint:string; severity:string; category:string; message:string; file?:string|null; line?:number|null; target?:string|null; occurrences:number };
 type BuildTestRow = { suite:string; test:string; status:string; seconds?:number|null; message?:string|null; attempts?:number };
 type TestTotals = { total:number; failed:number; seconds:number };
-type Detail = Build & { compiled_count?:number; machine_id?:string|null; xcode_version?:string|null; platform?:string|null; architecture?:string|null; targets?:TargetRow[]; phases?:PhaseRow[]; metadata?:Record<string,string>; files?:BuildFileRow[]; swift?:BuildSwiftRow[]; diagnostics?:BuildDiagRow[]; tests?:BuildTestRow[]; test_totals?:TestTotals; };
+type Detail = Build & { compiled_count?:number; replayed_steps?:number; machine_id?:string|null; xcode_version?:string|null; platform?:string|null; architecture?:string|null; targets?:TargetRow[]; phases?:PhaseRow[]; metadata?:Record<string,string>; files?:BuildFileRow[]; swift?:BuildSwiftRow[]; diagnostics?:BuildDiagRow[]; tests?:BuildTestRow[]; test_totals?:TestTotals; };
 type Percentiles = { builds:number; enough_history:boolean; p50?:number|null; p95?:number|null; min_seconds?:number|null; max_seconds?:number|null; avg_seconds?:number|null };
 type Ranked = { name:string; observations:number; avg_seconds?:number|null; max_seconds?:number|null; cached_builds?:number };
 type FileRow = { file:string; target?:string|null; observations:number; avg_seconds?:number|null; max_seconds?:number|null; compilations?:number|null };
@@ -174,7 +174,22 @@ function BuildPage({id}:{id:string}) {
       <section className="kpis">
         <Kpi icon={ICONS.clock} label="Duration" value={seconds(build.total_seconds)} foot={build.category||"unknown"}/>
         <Kpi icon={ICONS.file} tone="blue" label="Files compiled" value={(build.compiled_count||0).toLocaleString()} foot="This build"/>
-        <Kpi icon={ICONS.cache} tone="ok" label="Cache hit rate" value={percent(build.cache_hit_rate)} foot="Across targets"/>
+        {/* Cache hit rate only when there is a cache to hit. Xcode never sets
+            the per-step flag for its own incremental reuse — work it skips is
+            absent from the log rather than marked cached — so the bit is true
+            only behind a remote build cache. On a stock Xcode setup the tile
+            read a permanent "0%", which looks like a diagnosis of a missing
+            cache rather than the absence of one.
+
+            What varies on those setups is how much of the logged build was
+            actually re-run: Xcode restates the whole graph each time, so a
+            9.7-second rebuild can list twelve thousand steps it did not
+            execute. That number explains the duration; the cache one cannot. */}
+        {build.cache_hit_rate
+          ? <Kpi icon={ICONS.cache} tone="ok" label="Cache hit rate" value={percent(build.cache_hit_rate)} foot="Across targets"/>
+          : <Kpi icon={ICONS.layers} tone="violet" label="Steps re-run"
+                 value={(build.compiled_count||0).toLocaleString()}
+                 foot={build.replayed_steps ? `${build.replayed_steps.toLocaleString()} reused from an earlier build` : "Everything in this build ran"}/>}
         <Kpi icon={ICONS.calendar} tone="violet" label="Recorded" value={date(build.recorded_at)} foot={build.project||"Unknown project"}/>
       </section>
       <section className="insights">

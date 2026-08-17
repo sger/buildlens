@@ -300,6 +300,9 @@ fn collect_step(
             started_at: sub.time_started.map(cf_to_unix),
             ended_at: sub.time_stopped.map(cf_to_unix),
             fetched_from_cache: sub.was_fetched_from_cache,
+            // Filled in by `mark_replayed_steps` once the build's own window is
+            // known; every step is provisionally real until then.
+            executed: true,
             warning_count: sub
                 .messages
                 .iter()
@@ -479,6 +482,9 @@ fn collect_swift_timings(section: &IdeSection, target: Option<&str>, metrics: &m
 }
 
 fn finish(metrics: &mut BuildMetrics, options: &MapOptions) {
+    // Before anything counts steps: categorisation, the compiled count and the
+    // cache rate all read the `executed` flag this sets.
+    mark_replayed_steps(metrics);
     // Roll step diagnostics up to the build. Xcode records errors on the steps
     // that produced them and never states an overall verdict, so this sum is
     // what makes a failed build recognisable downstream.
@@ -499,11 +505,16 @@ fn finish(metrics: &mut BuildMetrics, options: &MapOptions) {
     let mut clean_targets = 0usize;
     let mut noop_targets = 0usize;
     for target in &mut metrics.targets {
-        // Only compilation-relevant steps decide the category.
+        // Only compilation-relevant steps that this build actually ran decide
+        // the category. Without the `executed` filter every incremental build
+        // reads as clean: Xcode replays the whole graph, and a replayed step
+        // is not flagged as cached, so it counts as compiled.
         let relevant: Vec<&BuildStepMetric> = target
             .steps
             .iter()
-            .filter(|step| !NON_COMPILATION_STEP_TYPES.contains(&step.step_type.as_str()))
+            .filter(|step| {
+                step.executed && !NON_COMPILATION_STEP_TYPES.contains(&step.step_type.as_str())
+            })
             .collect();
         let compiled = relevant
             .iter()
@@ -517,11 +528,16 @@ fn finish(metrics: &mut BuildMetrics, options: &MapOptions) {
         } else {
             BuildCategory::Incremental
         };
+        // Over executed steps only, for the same reason: a target whose work
+        // was all replayed did not fetch anything from a cache, and counting
+        // replayed steps in the denominator makes every incremental build look
+        // like a cache miss.
+        let executed: Vec<&BuildStepMetric> =
+            target.steps.iter().filter(|step| step.executed).collect();
         target.fetched_from_cache =
-            !target.steps.is_empty() && target.steps.iter().all(|step| step.fetched_from_cache);
-        total_steps += target.steps.len();
-        cached_steps += target
-            .steps
+            !executed.is_empty() && executed.iter().all(|step| step.fetched_from_cache);
+        total_steps += executed.len();
+        cached_steps += executed
             .iter()
             .filter(|step| step.fetched_from_cache)
             .count();
@@ -646,6 +662,50 @@ fn finish(metrics: &mut BuildMetrics, options: &MapOptions) {
 }
 
 /// Records that a ranked list was capped, naming what was dropped.
+/// Tolerance when deciding whether a step began within its build.
+///
+/// A step recorded fractionally before the main section's own start is a
+/// rounding artefact of two clocks written at slightly different moments, not
+/// a replay: the replayed steps observed were older by whole seconds to
+/// minutes, never by milliseconds. Wide enough to absorb that skew, far
+/// narrower than the gap between consecutive builds.
+const CLOCK_SKEW_TOLERANCE_SECONDS: f64 = 1.0;
+
+/// Flags steps that Xcode replayed from an earlier build rather than ran.
+///
+/// An incremental build's log restates the entire build graph, and a step it
+/// did not re-run keeps the timestamps and duration it had when it last ran.
+/// Comparing each step's start against the build's own start separates them:
+/// on a measured 21.9-second rebuild, 3,850 of 3,888 steps had started before
+/// that build began, and the 38 that had not summed to 0.59 seconds of real
+/// work.
+///
+/// Deliberately marks rather than removes. The full graph is still what the
+/// dependency view reads, and a step dropped here could not be recovered;
+/// timing and categorisation filter on the flag instead.
+///
+/// No-ops when the log states no start time for the build, since then there is
+/// no window to compare against and every step stays counted as real.
+fn mark_replayed_steps(metrics: &mut BuildMetrics) {
+    let Some(build_started) = metrics.started_at else {
+        return;
+    };
+    let cutoff = build_started - CLOCK_SKEW_TOLERANCE_SECONDS;
+    let mut replayed = 0usize;
+    for target in &mut metrics.targets {
+        for step in &mut target.steps {
+            // A step with no timestamp cannot be placed, so it counts as real:
+            // under-reporting work is the safer error, since the alternative
+            // is silently discarding a build's actual measurements.
+            step.executed = step.started_at.is_none_or(|started| started >= cutoff);
+            if !step.executed {
+                replayed += 1;
+            }
+        }
+    }
+    metrics.replayed_steps = replayed;
+}
+
 fn note_truncation(metrics: &mut BuildMetrics, what: &str, actual: usize, cap: usize) {
     if actual > cap {
         metrics.truncations.push(format!(
@@ -1136,6 +1196,99 @@ mod tests {
                 .iter()
                 .all(|s| s.architecture.is_none())
         );
+    }
+
+    /// Xcode restates the whole build graph in an incremental log, keeping the
+    /// timestamps and durations replayed steps had when they last ran. Without
+    /// separating them every incremental build reports as clean with its full
+    /// clean-build file count: a replayed step is not flagged cached, because
+    /// Xcode did not fetch it from anywhere, so it counts as compiled.
+    ///
+    /// Measured on a real project: a 21.9-second rebuild logged 3,888 steps of
+    /// which 3,850 had started before that build began.
+    #[test]
+    fn steps_replayed_from_an_earlier_build_are_not_counted_as_compiled() {
+        let mut old = step("CompileSwift stale.swift", false);
+        // Ran in a build that finished long before this one started.
+        old.time_started = Some(-500.0);
+        old.time_stopped = Some(-400.0);
+        let fresh = step("CompileSwift fresh.swift", false);
+        let log = build(vec![target("App", vec![old, fresh])]);
+        let metrics = map(&log, vec![], &MapOptions { full_detail: true });
+
+        assert_eq!(metrics.compiled_count, 1, "only the step that ran counts");
+        // Clean, not incremental: of the work this build actually did, all of
+        // it was compiled. The category describes the executed steps, and the
+        // replayed one is not one of them — the fix here is the count, which
+        // was 2 before, not a reclassification of a one-step build.
+        assert_eq!(metrics.category, BuildCategory::Clean);
+        assert_eq!(metrics.replayed_steps, 1, "the exclusion is recorded, not silent");
+        let steps = &metrics.targets[0].steps;
+        assert_eq!(steps.len(), 2, "both are kept; the dependency view reads them");
+        assert_eq!(steps.iter().filter(|s| s.executed).count(), 1);
+    }
+
+    /// A rebuild that re-ran nothing is a noop, not a clean build. This is the
+    /// case that read as `clean` with 96 compiled files on a 0.5-second build.
+    #[test]
+    fn a_build_that_replayed_everything_is_a_noop() {
+        let replayed = |name: &str| {
+            let mut section = step(name, false);
+            section.time_started = Some(-500.0);
+            section.time_stopped = Some(-400.0);
+            section
+        };
+        let log = build(vec![target(
+            "App",
+            vec![replayed("CompileSwift a.swift"), replayed("CompileSwift b.swift")],
+        )]);
+        let metrics = map(&log, vec![], &MapOptions { full_detail: true });
+        assert_eq!(metrics.category, BuildCategory::Noop);
+        assert_eq!(metrics.compiled_count, 0);
+    }
+
+    /// A step fractionally older than the build's own start is clock skew
+    /// between two recorded moments, not a replay — replayed steps were older
+    /// by whole seconds to minutes.
+    #[test]
+    fn a_step_starting_a_moment_early_is_not_treated_as_replayed() {
+        let mut early = step("CompileSwift a.swift", false);
+        early.time_started = Some(-0.2);
+        let log = build(vec![target("App", vec![early])]);
+        let metrics = map(&log, vec![], &MapOptions { full_detail: true });
+        assert!(metrics.targets[0].steps[0].executed);
+        assert_eq!(metrics.compiled_count, 1);
+    }
+
+    /// A step that cannot be placed counts as real: under-reporting work is
+    /// safer than silently discarding a build's actual measurements.
+    #[test]
+    fn a_step_without_timestamps_counts_as_executed() {
+        let mut untimed = step("CompileSwift a.swift", false);
+        untimed.time_started = None;
+        untimed.time_stopped = None;
+        let log = build(vec![target("App", vec![untimed])]);
+        let metrics = map(&log, vec![], &MapOptions { full_detail: true });
+        assert!(metrics.targets[0].steps[0].executed);
+    }
+
+    /// The cache rate's denominator is executed steps. Counting replayed ones
+    /// makes every incremental build look like a total cache miss.
+    #[test]
+    fn the_cache_rate_ignores_replayed_steps() {
+        let mut replayed = step("CompileSwift stale.swift", false);
+        replayed.time_started = Some(-500.0);
+        let log = build(vec![target(
+            "App",
+            vec![replayed, step("CompileSwift fresh.swift", true)],
+        )]);
+        let metrics = map(&log, vec![], &MapOptions { full_detail: true });
+        assert_eq!(
+            metrics.cache.hit_rate,
+            Some(1.0),
+            "the one step that ran was a cache hit"
+        );
+        assert_eq!(metrics.cache.status, "warm");
     }
 
     #[test]

@@ -114,6 +114,7 @@ fn metrics(id: &str, seconds: f64, started_at: f64) -> BuildMetrics {
         cache: CacheMetrics { status: "cold".into(), hit_rate: Some(0.25) },
         warnings: vec![],
         truncations: vec![],
+        replayed_steps: 0,
         error_count: 0,
         warning_count: 0,
         diagnostics: vec![],
@@ -166,6 +167,7 @@ fn test_bundle_step() -> BuildStepMetric {
         started_at: None,
         ended_at: None,
         fetched_from_cache: false,
+        executed: true,
         warning_count: 0,
         error_count: 0,
     }
