@@ -584,6 +584,12 @@ mod tests {
                 architecture: None,
                 targets: vec![],
                 phases: vec![],
+                // This probe is about decoding a build key, not the detail
+                // collections, so they stay empty.
+                files: vec![],
+                swift_timings: vec![],
+                diagnostics: vec![],
+                tests: vec![],
             })
             .ok();  // Already present from an earlier run is fine.
         let store = Arc::new(std::sync::Mutex::new(connected));

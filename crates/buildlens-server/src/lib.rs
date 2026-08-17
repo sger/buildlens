@@ -440,7 +440,7 @@ fn route(
                 return Err(Failure::TooManyRequests);
             }
             let payload = read_body(request)?;
-            ingest(&payload, pool).map(Reply::ok)
+            ingest(&payload, dashboard).map(Reply::ok)
         }
         (Method::Get, "/v1/builds") => {
             let limit = param(query, "limit").unwrap_or(100).clamp(1, 1000);
@@ -597,10 +597,19 @@ fn parse_payload(payload: &str) -> Result<WireBuild, Failure> {
     Ok(build)
 }
 
-fn ingest(payload: &str, pool: &Pool) -> Result<String, Failure> {
+fn ingest(payload: &str, dashboard: &DashboardPool) -> Result<String, Failure> {
     let build = parse_payload(payload)?;
-    let mut connection = connection(pool)?;
-    let stored = PostgresStore::new(&mut connection).insert(&build)?;
+    // Stored through `buildlens_storage`, the same code a local `collect --db`
+    // writes with. This crate's own store had a second, narrower INSERT that
+    // knew nothing about file timings, diagnostics or tests, so a pushed build
+    // silently lost the detail it carried while a locally collected one kept
+    // it. One writer means the two paths cannot diverge again.
+    let stored = dashboard
+        .next()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(&build)
+        .map_err(|error| Failure::Internal(error.into()))?;
     Ok(serde_json::json!({
         "stored": stored,
         "build_key": build.build_key,

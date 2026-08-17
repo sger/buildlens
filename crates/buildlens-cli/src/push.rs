@@ -10,6 +10,15 @@ use buildlens_core::wire::{Attribution, WireBuild};
 /// several hundred.
 const MAX_TARGETS: usize = 40;
 
+/// A serde-renamed enum as its storage string, matching what the local store
+/// writes so the same value arrives whichever path a build took.
+fn serde_plain<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 /// Stable, non-reversible id for this machine. Derived from the hardware UUID
 /// so it survives reboots and reinstalls, hashed so it cannot be traced back.
 pub fn machine_id(probe: &dyn buildlens_plugins::SystemProbe) -> Option<String> {
@@ -28,6 +37,13 @@ pub struct PushOptions<'a> {
     pub attribution: Attribution,
     pub machine_id: Option<String>,
     pub dry_run: bool,
+    /// The analysis the metrics came from, when the caller has one.
+    ///
+    /// Supplies diagnostics and test results, which `BuildMetrics` does not
+    /// carry — they come from the paired text log. Without it the payload is
+    /// still valid and the server simply records no diagnostics or tests for
+    /// this build, exactly as a wire-version-1 client did.
+    pub analysis: Option<&'a buildlens_core::BuildAnalysis>,
 }
 
 /// Returns the payload that was sent (or would be sent, for a dry run).
@@ -40,6 +56,17 @@ pub fn push(metrics: &BuildMetrics, options: &PushOptions<'_>) -> Result<serde_j
         MAX_TARGETS,
     )
     .context("metrics did not decode into a usable build, so nothing was sent")?;
+    // `serde_plain` renders the two diagnostic enums the way the local store
+    // does, so a pushed row and a locally stored one hold the same words.
+    let build = match options.analysis {
+        Some(analysis) => build.with_analysis(
+            &analysis.diagnostics.diagnostics,
+            &analysis.tests.tests,
+            serde_plain,
+            serde_plain,
+        ),
+        None => build,
+    };
     let payload = serde_json::to_value(&build)?;
     if options.dry_run {
         return Ok(payload);

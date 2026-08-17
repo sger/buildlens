@@ -12,7 +12,14 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped when the payload shape changes; the server rejects versions it does
 /// not understand rather than guessing.
-pub const WIRE_VERSION: u32 = 1;
+///
+/// Version 2 added the detail collections below. Before it, a build pushed to
+/// a team server carried only totals, targets and phases, so a team dashboard
+/// left its Files, Swift, Diagnostics and Tests panels permanently empty while
+/// the same UI showed them filled for a locally collected build. Closing that
+/// gap means source paths, diagnostic text and test names now leave the
+/// machine — a deliberate widening of this payload, not an oversight.
+pub const WIRE_VERSION: u32 = 2;
 
 /// The `BuildMetrics::metrics_schema_version` this module was written against.
 ///
@@ -109,9 +116,80 @@ pub struct WirePhase {
     pub seconds: f64,
 }
 
-/// One build's measurements. Per-file timings and step titles are deliberately
-/// excluded: they expose source layout and add little at fleet scale, where the
-/// useful signal is target- and phase-level.
+/// Caps on the detail collections, matching what a local collect stores.
+///
+/// The same numbers as `buildlens-storage`'s: transmitting more than the
+/// server would keep is wasted payload, and transmitting less would make a
+/// pushed build show thinner panels than a locally collected one — the exact
+/// asymmetry version 2 exists to remove. Ranked by cost before truncating, so
+/// the cap keeps the rows worth looking at.
+pub const MAX_FILES: usize = 500;
+pub const MAX_SWIFT_TIMINGS: usize = 500;
+pub const MAX_DIAGNOSTICS: usize = 500;
+
+/// One file's compile time. `file` is a source path as the log recorded it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireFile {
+    pub file: String,
+    pub seconds: f64,
+    pub target: Option<String>,
+    pub step_type: String,
+    pub architecture: Option<String>,
+    /// How many compilations produced this row; a file built once per
+    /// architecture reports more than one.
+    pub occurrences: usize,
+}
+
+/// A slow Swift function body or type-check site.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireSwiftTiming {
+    /// `function_body` or `type_check`, matching the local spelling so the
+    /// column the server writes holds the same values either way.
+    pub kind: String,
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+    pub symbol: Option<String>,
+    pub milliseconds: f64,
+    pub target: Option<String>,
+}
+
+/// One diagnostic, aggregated by fingerprint, with a representative example.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireDiagnostic {
+    /// Stable identity for "the same problem", so occurrences aggregate across
+    /// builds rather than appearing as unrelated one-offs.
+    pub fingerprint: String,
+    pub severity: String,
+    pub category: String,
+    pub occurrences: usize,
+    pub message: String,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub target: Option<String>,
+}
+
+/// One test's outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireTest {
+    pub suite: String,
+    pub name: String,
+    /// `passed`, `failed`, or `started` — the last meaning the test never
+    /// reported an outcome, which is how a crash appears. Transmitted as-is so
+    /// that stays visible rather than being read as a pass.
+    pub status: String,
+    pub seconds: Option<f64>,
+    pub message: Option<String>,
+}
+
+/// One build's measurements, as transmitted to a team server.
+///
+/// Carries source paths, diagnostic text and test names — see the detail
+/// collections at the end. That is a deliberate choice made when the team
+/// dashboard shipped: the alternative was a UI whose Files, Swift, Diagnostics
+/// and Tests panels were permanently empty for every build that arrived over
+/// the wire. Deployments that would rather not transmit it should not pass
+/// `--server` at all; a local `collect --db` keeps everything on the machine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireBuild {
     pub wire_version: u32,
@@ -140,6 +218,19 @@ pub struct WireBuild {
     pub architecture: Option<String>,
     pub targets: Vec<WireTarget>,
     pub phases: Vec<WirePhase>,
+    /// The detail a local collect stores, added in wire version 2.
+    ///
+    /// `#[serde(default)]` so a client still sending version 1 deserializes
+    /// with these empty rather than failing: the server checks the version and
+    /// would otherwise reject on a missing field before it could say why.
+    #[serde(default)]
+    pub files: Vec<WireFile>,
+    #[serde(default)]
+    pub swift_timings: Vec<WireSwiftTiming>,
+    #[serde(default)]
+    pub diagnostics: Vec<WireDiagnostic>,
+    #[serde(default)]
+    pub tests: Vec<WireTest>,
 }
 
 impl WireBuild {
@@ -190,6 +281,37 @@ impl WireBuild {
             .collect();
         phases.sort_by(|a, b| b.seconds.total_cmp(&a.seconds));
         phases.truncate(MAX_PHASES);
+        // Slowest first, so the cap keeps the rows worth looking at rather
+        // than whichever the log happened to list first.
+        let mut files: Vec<WireFile> = metrics
+            .files
+            .iter()
+            .map(|file| WireFile {
+                file: file.file.clone(),
+                seconds: file.seconds,
+                target: file.target.clone(),
+                step_type: file.step_type.clone(),
+                architecture: file.architecture.clone(),
+                occurrences: file.occurrences as usize,
+            })
+            .collect();
+        files.sort_by(|a, b| b.seconds.total_cmp(&a.seconds));
+        files.truncate(MAX_FILES);
+        let mut swift_timings: Vec<WireSwiftTiming> = metrics
+            .swift_timings
+            .iter()
+            .map(|timing| WireSwiftTiming {
+                kind: timing.kind.as_str().to_owned(),
+                file: timing.file.clone(),
+                line: timing.line,
+                column: timing.column,
+                symbol: timing.symbol.clone(),
+                milliseconds: timing.milliseconds,
+                target: timing.target.clone(),
+            })
+            .collect();
+        swift_timings.sort_by(|a, b| b.milliseconds.total_cmp(&a.milliseconds));
+        swift_timings.truncate(MAX_SWIFT_TIMINGS);
         Some(Self {
             wire_version: WIRE_VERSION,
             build_key: metrics.build_id.clone()?,
@@ -212,9 +334,70 @@ impl WireBuild {
             architecture: metrics.environment.architecture.clone(),
             targets,
             phases,
+            files,
+            swift_timings,
+            // Diagnostics and tests are not in `BuildMetrics` — they come from
+            // the analysis of the paired text log. `with_analysis` fills them,
+            // so a caller that has one transmits them and a caller that does
+            // not still produces a valid document.
+            diagnostics: Vec::new(),
+            tests: Vec::new(),
         })
     }
+
+    /// Adds the detail only a full analysis carries: diagnostics and tests.
+    ///
+    /// Separate from [`WireBuild::from_metrics`] because the two have
+    /// different inputs — metrics come from the activity log, these from the
+    /// analysis built alongside it — and because keeping the split explicit
+    /// means a caller has to opt into transmitting message text and test
+    /// names rather than getting it as a side effect.
+    /// `severity_of` and `category_of` render those two enums the way serde
+    /// does locally, so the server's TEXT columns hold one vocabulary however
+    /// the row arrived. Passed in rather than derived here because this crate
+    /// carries no JSON dependency, and a hand-written match would keep
+    /// compiling while silently transmitting the wrong word for a newly added
+    /// variant.
+    pub fn with_analysis(
+        mut self,
+        diagnostics: &[crate::DiagnosticAggregate],
+        tests: &[crate::TestResult],
+        severity_of: impl Fn(&crate::DiagnosticSeverity) -> String,
+        category_of: impl Fn(&crate::DiagnosticCategory) -> String,
+    ) -> Self {
+        self.diagnostics = diagnostics
+            .iter()
+            .take(MAX_DIAGNOSTICS)
+            .map(|diagnostic| WireDiagnostic {
+                fingerprint: diagnostic.fingerprint.clone(),
+                severity: severity_of(&diagnostic.severity),
+                category: category_of(&diagnostic.category),
+                occurrences: diagnostic.occurrences,
+                message: diagnostic.example.message.clone(),
+                file: diagnostic.example.file.clone(),
+                line: diagnostic.example.line,
+                target: diagnostic.example.target.clone(),
+            })
+            .collect();
+        self.tests = tests
+            .iter()
+            .map(|test| WireTest {
+                suite: test.suite.clone(),
+                name: test.test.clone(),
+                status: match test.status {
+                    crate::TestStatus::Passed => "passed",
+                    crate::TestStatus::Failed => "failed",
+                    crate::TestStatus::Started => "started",
+                }
+                .to_owned(),
+                seconds: test.duration_seconds,
+                message: test.message.clone(),
+            })
+            .collect();
+        self
+    }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -304,14 +487,18 @@ mod tests {
                 "cache_hit_rate",
                 "category",
                 "compiled_count",
+                "diagnostics",
                 "error_count",
+                "files",
                 "machine_id",
                 "phases",
                 "platform",
                 "project",
                 "started_at",
                 "status",
+                "swift_timings",
                 "targets",
+                "tests",
                 "total_seconds",
                 "warning_count",
                 "wire_version",
@@ -357,11 +544,16 @@ mod tests {
         assert!(!text.contains(".xcactivitylog"));
     }
 
-    /// Per-file and per-function timings expose source layout, so they are
-    /// excluded from the payload by construction. Pinning it: a fixture rich
-    /// in both must still transmit neither.
+    /// Per-file and per-function timings *are* transmitted, as of wire
+    /// version 2, and this pins that they arrive intact.
+    ///
+    /// This test previously asserted the exact opposite — that neither ever
+    /// left the machine. That was the deliberate boundary until a team
+    /// dashboard shipped and left its Files and Swift panels permanently empty
+    /// for every build received over the wire. Widening the payload was the
+    /// decision taken then; source paths and symbol names now travel with it.
     #[test]
-    fn per_file_and_swift_timings_are_never_transmitted() {
+    fn per_file_and_swift_timings_are_transmitted() {
         let mut detailed = metrics();
         detailed.files = vec![FileMetric {
             file: "/Users/someone/App/Secret/Internal.swift".into(),
@@ -383,9 +575,17 @@ mod tests {
         let build =
             WireBuild::from_metrics(&detailed, "App", None, Attribution::Anonymous, 50).unwrap();
         let text = serde_json::to_string(&build).unwrap();
-        assert!(!text.contains("Internal.swift"));
-        assert!(!text.contains("expensiveGeneric"));
-        assert!(!text.contains("/Users/"));
+        assert!(text.contains("Internal.swift"), "the file timing was dropped");
+        assert!(
+            text.contains("expensiveGeneric"),
+            "the Swift timing's symbol was dropped"
+        );
+        // The path travels as the log recorded it, home directory and all.
+        // Stated here rather than left implicit: this is what a team server
+        // receives, and anyone tightening it should fail this test first.
+        assert!(text.contains("/Users/"), "the source path was rewritten");
+        assert_eq!(build.files.len(), 1);
+        assert_eq!(build.swift_timings.len(), 1);
     }
 
     #[test]

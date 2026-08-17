@@ -19,7 +19,10 @@
 // tests in the binary itself.
 #![allow(dead_code)]
 
-use buildlens_core::wire::{Attribution, BuildStatus, WIRE_VERSION, WireBuild, WirePhase, WireTarget};
+use buildlens_core::wire::{
+    Attribution, BuildStatus, WIRE_VERSION, WireBuild, WireDiagnostic, WireFile, WirePhase,
+    WireSwiftTiming, WireTarget, WireTest,
+};
 use buildlens_core::BuildCategory;
 use postgres::{Client, NoTls};
 
@@ -73,6 +76,43 @@ fn build(key: &str, seconds: f64, started_at: Option<f64>, machine: Option<&str>
             compiled_count: 50,
         }],
         phases: vec![WirePhase { name: "Prepare build".into(), seconds: 1.0 }],
+        // Wire version 2's detail. Populated rather than left empty so the
+        // stored-and-read-back tests cover the tables a pushed build now
+        // writes — the whole point of the version bump.
+        files: vec![WireFile {
+            file: "/src/Core/Model.swift".into(),
+            seconds: 3.5,
+            target: Some("Core".into()),
+            step_type: "swift".into(),
+            architecture: Some("arm64".into()),
+            occurrences: 1,
+        }],
+        swift_timings: vec![WireSwiftTiming {
+            kind: "type_check".into(),
+            file: "/src/Core/Model.swift".into(),
+            line: 42,
+            column: 9,
+            symbol: Some("body".into()),
+            milliseconds: 250.0,
+            target: Some("Core".into()),
+        }],
+        diagnostics: vec![WireDiagnostic {
+            fingerprint: format!("{key}-warn"),
+            severity: "warning".into(),
+            category: "swift_concurrency".into(),
+            occurrences: 2,
+            message: "capture of non-sendable type".into(),
+            file: Some("/src/Core/Model.swift".into()),
+            line: Some(42),
+            target: Some("Core".into()),
+        }],
+        tests: vec![WireTest {
+            suite: "CoreTests".into(),
+            name: "testModel".into(),
+            status: "passed".into(),
+            seconds: Some(0.25),
+            message: None,
+        }],
     }
 }
 
@@ -88,12 +128,12 @@ fn stores_queries_and_deduplicates_builds() {
     let mut store = buildlens_server_store(&url);
 
     // A fresh build is stored...
-    assert!(store.store().insert(&build("a", 100.0, Some(1_700_000_000.0), Some("m1"))).unwrap());
+    assert!(store.insert(&build("a", 100.0, Some(1_700_000_000.0), Some("m1"))));
     // ...and re-sending it is a no-op, so a client retry cannot double-count.
-    assert!(!store.store().insert(&build("a", 100.0, Some(1_700_000_000.0), Some("m1"))).unwrap());
+    assert!(!store.insert(&build("a", 100.0, Some(1_700_000_000.0), Some("m1"))));
 
-    store.store().insert(&build("b", 200.0, Some(1_700_000_000.0), Some("m2"))).unwrap();
-    store.store().insert(&build("c", 300.0, Some(1_700_000_000.0), Some("m2"))).unwrap();
+    store.insert(&build("b", 200.0, Some(1_700_000_000.0), Some("m2")));
+    store.insert(&build("c", 300.0, Some(1_700_000_000.0), Some("m2")));
 
     let builds = store.store().builds(10).unwrap();
     assert_eq!(builds["items"].as_array().unwrap().len(), 3);
@@ -107,6 +147,85 @@ fn stores_queries_and_deduplicates_builds() {
     assert_eq!(targets, 3);
 }
 
+/// A pushed build must land the same detail a locally collected one does.
+///
+/// This is what wire version 2 bought: before it, a build arriving over
+/// `/v1/metrics` wrote only builds, targets and phases, so a team dashboard
+/// showed empty Files, Swift, Diagnostics and Tests panels for every build it
+/// received while the identical UI showed them filled locally. Asserted per
+/// table because a single count would pass with three of four written.
+#[test]
+fn a_pushed_build_stores_the_same_detail_a_local_collect_does() {
+    let Some(url) = database_url() else {
+        eprintln!("skipping: BUILDLENS_TEST_DATABASE_URL not set");
+        return;
+    };
+    let url = isolated_url(&url, "t_detail");
+    let mut store = buildlens_server_store(&url);
+    assert!(
+        store
+            .insert(&build("detail", 100.0, Some(1_700_000_000.0), Some("m1")))
+    );
+
+    let mut client = Client::connect(&url, NoTls).unwrap();
+    for table in [
+        "build_files",
+        "build_swift_timings",
+        "build_diagnostics",
+        "build_tests",
+    ] {
+        let rows: i64 = client
+            .query_one(
+                &format!("SELECT COUNT(*)::BIGINT FROM {table} WHERE build_key = 'detail'"),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(rows, 1, "{table} kept nothing from the pushed build");
+    }
+
+    // The values arrive intact, not merely as a row of the right shape.
+    let (file, seconds): (String, f64) = {
+        let row = client
+            .query_one(
+                "SELECT file, seconds FROM build_files WHERE build_key = 'detail'",
+                &[],
+            )
+            .unwrap();
+        (row.get(0), row.get(1))
+    };
+    assert_eq!(file, "/src/Core/Model.swift");
+    assert!((seconds - 3.5).abs() < f64::EPSILON, "{seconds}");
+
+    let message: String = client
+        .query_one(
+            "SELECT message FROM build_diagnostics WHERE build_key = 'detail'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(message, "capture of non-sendable type");
+}
+
+/// A client still speaking wire version 1 sends no detail collections at all.
+/// Serde's defaults must read those as empty rather than failing to
+/// deserialize, so an older client keeps working against a newer server.
+#[test]
+fn a_payload_without_the_detail_collections_still_decodes() {
+    let mut payload = serde_json::to_value(build("v1", 10.0, Some(1_700_000_000.0), None))
+        .expect("a build serializes");
+    let object = payload.as_object_mut().expect("a JSON object");
+    for field in ["files", "swift_timings", "diagnostics", "tests"] {
+        object.remove(field);
+    }
+    let decoded: WireBuild =
+        serde_json::from_value(payload).expect("a payload without the detail must still decode");
+    assert!(decoded.files.is_empty());
+    assert!(decoded.swift_timings.is_empty());
+    assert!(decoded.diagnostics.is_empty());
+    assert!(decoded.tests.is_empty());
+}
+
 #[test]
 fn partitions_by_the_build_start_day() {
     let Some(url) = database_url() else {
@@ -118,8 +237,8 @@ fn partitions_by_the_build_start_day() {
     let url = isolated_url(&url, "t_partition");
     let mut store = buildlens_server_store(&url);
     // 2023-11-14 and 2023-11-15 in Unix seconds.
-    store.store().insert(&build("day1", 100.0, Some(1_700_000_000.0), Some("m1"))).unwrap();
-    store.store().insert(&build("day2", 100.0, Some(1_700_090_000.0), Some("m1"))).unwrap();
+    store.insert(&build("day1", 100.0, Some(1_700_000_000.0), Some("m1")));
+    store.insert(&build("day2", 100.0, Some(1_700_090_000.0), Some("m1")));
 
     let mut client = Client::connect(&url, NoTls).unwrap();
     let days: Vec<String> = client
@@ -148,8 +267,7 @@ fn stats_report_percentiles_and_machine_counts() {
     for (index, seconds) in [100.0, 200.0, 300.0, 400.0, 500.0].iter().enumerate() {
         let machine = if index % 2 == 0 { "m1" } else { "m2" };
         store
-            .store().insert(&build(&format!("s{index}"), *seconds, Some(today), Some(machine)))
-            .unwrap();
+            .insert(&build(&format!("s{index}"), *seconds, Some(today), Some(machine)));
     }
     let stats = store.store().stats(30).unwrap();
     let item = &stats["items"].as_array().unwrap()[0];
@@ -174,17 +292,28 @@ fn stats_report_percentiles_and_machine_counts() {
 /// held, matching the request-scoped lifetime the server gives it.
 struct TestStore {
     client: postgres::Client,
+    /// The writer the server actually ingests through. Reads go via this
+    /// crate's own `store::PostgresStore`, which is read-only; writing lives
+    /// in `buildlens_storage` so a pushed build and a locally collected one
+    /// land through one code path. A test that wrote through anything else
+    /// would be exercising a path production does not use.
+    writer: buildlens_storage::PostgresStore,
 }
 
 impl TestStore {
     fn store(&mut self) -> store::PostgresStore<'_> {
         store::PostgresStore::new(&mut self.client)
     }
+
+    fn insert(&mut self, build: &WireBuild) -> bool {
+        self.writer.insert(build).expect("storing a build")
+    }
 }
 
 fn buildlens_server_store(url: &str) -> TestStore {
     TestStore {
         client: store::connect_and_migrate(url).expect("connect and migrate"),
+        writer: buildlens_storage::PostgresStore::connect(url).expect("connect the writer"),
     }
 }
 
@@ -212,7 +341,7 @@ fn build_status_round_trips_through_the_text_column() {
     for (key, status, _) in cases {
         let mut wire = build(key, 10.0, Some(1_700_000_000.0), Some("m1"));
         wire.status = status;
-        store.store().insert(&wire).unwrap();
+        store.insert(&wire);
     }
 
     let items = store.store().builds(10).unwrap();
@@ -252,7 +381,7 @@ fn build_detail_reports_both_diagnostic_counts() {
     let mut wire = build("counts", 10.0, Some(1_700_000_000.0), Some("m1"));
     wire.error_count = 7;
     wire.warning_count = 3;
-    store.store().insert(&wire).unwrap();
+    store.insert(&wire);
 
     let detail = store.store().build_detail("counts").unwrap().expect("build exists");
     assert_eq!(detail["error_count"], 7, "the error count was being dropped");
@@ -291,8 +420,7 @@ fn the_day_window_is_inclusive_of_its_boundary() {
     // Exactly 7 days back, which the old strict comparison dropped.
     let seven_days_ago = now - 7.0 * 86_400.0;
     store
-        .store().insert(&build("edge", 100.0, Some(seven_days_ago), Some("m1")))
-        .unwrap();
+        .insert(&build("edge", 100.0, Some(seven_days_ago), Some("m1")));
 
     let stats = store.store().stats(7).unwrap();
     assert_eq!(
@@ -317,12 +445,12 @@ fn ranked_queries_scope_to_a_project() {
 
     let mut ours = build("ours", 100.0, Some(1_700_000_000.0), Some("m1"));
     ours.project = "Ours".into();
-    store.store().insert(&ours).unwrap();
+    store.insert(&ours);
 
     let mut theirs = build("theirs", 100.0, Some(1_700_000_000.0), Some("m2"));
     theirs.project = "Theirs".into();
     theirs.targets[0].name = "TheirTarget".into();
-    store.store().insert(&theirs).unwrap();
+    store.insert(&theirs);
 
     let scoped = store.store().ranked_targets(100, 10, Some("Ours")).unwrap();
     let names: Vec<&str> = scoped["items"]
@@ -354,13 +482,12 @@ fn percentiles_report_whether_there_is_enough_history() {
 
     for index in 0..3 {
         store
-            .store().insert(&build(
+            .insert(&build(
                 &format!("p{index}"),
                 100.0,
                 Some(1_700_000_000.0),
                 Some("m1"),
-            ))
-            .unwrap();
+            ));
     }
     let thin = store.store().percentiles(100, None).unwrap();
     assert_eq!(thin["builds"], 3);
@@ -368,13 +495,12 @@ fn percentiles_report_whether_there_is_enough_history() {
 
     for index in 3..8 {
         store
-            .store().insert(&build(
+            .insert(&build(
                 &format!("p{index}"),
                 100.0,
                 Some(1_700_000_000.0),
                 Some("m1"),
-            ))
-            .unwrap();
+            ));
     }
     let full = store.store().percentiles(100, None).unwrap();
     assert_eq!(full["builds"], 8);
@@ -416,8 +542,7 @@ fn migrating_an_existing_schema_is_idempotent() {
     let url = isolated_url(&url, "t_migrate");
     let mut first = buildlens_server_store(&url);
     first
-        .store().insert(&build("before", 10.0, Some(1_700_000_000.0), Some("m1")))
-        .unwrap();
+        .insert(&build("before", 10.0, Some(1_700_000_000.0), Some("m1")));
     // Reconnecting re-runs migrate() against a populated schema.
     let mut second = buildlens_server_store(&url);
     assert_eq!(

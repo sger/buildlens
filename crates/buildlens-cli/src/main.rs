@@ -1123,6 +1123,10 @@ fn push_metrics(
         attribution,
         machine_id: machine,
         dry_run,
+        // The caller already holds the analysis these metrics came from, so a
+        // pushed build carries the same diagnostics and tests a locally
+        // collected one records.
+        analysis: Some(analysis),
     };
     let result = push::push(metrics, &options)?;
     if dry_run {

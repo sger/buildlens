@@ -1,4 +1,3 @@
-use buildlens_core::wire::WireBuild;
 use postgres::{Client, NoTls};
 use r2d2_postgres::PostgresConnectionManager;
 use thiserror::Error;
@@ -76,63 +75,14 @@ pub fn connect_and_migrate(url: &str) -> Result<Client, ServerError> {
 }
 
 fn migrate_locked(client: &mut Client) -> Result<(), ServerError> {
-    client.batch_execute(
-            "CREATE TABLE IF NOT EXISTS builds (
-                build_key TEXT NOT NULL,
-                day DATE NOT NULL,
-                project TEXT NOT NULL,
-                category TEXT NOT NULL,
-                total_seconds DOUBLE PRECISION NOT NULL,
-                compiled_count INTEGER NOT NULL,
-                cache_hit_rate DOUBLE PRECISION,
-                started_at DOUBLE PRECISION,
-                machine_id TEXT,
-                xcode_version TEXT,
-                platform TEXT,
-                architecture TEXT,
-                received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (day, build_key)
-            ) PARTITION BY RANGE (day);
-
-            CREATE TABLE IF NOT EXISTS builds_default PARTITION OF builds DEFAULT;
-
-            CREATE TABLE IF NOT EXISTS build_targets (
-                day DATE NOT NULL,
-                build_key TEXT NOT NULL,
-                name TEXT NOT NULL,
-                seconds DOUBLE PRECISION NOT NULL,
-                category TEXT NOT NULL,
-                fetched_from_cache BOOLEAN NOT NULL,
-                compiled_count INTEGER NOT NULL,
-                PRIMARY KEY (day, build_key, name)
-            ) PARTITION BY RANGE (day);
-
-            CREATE TABLE IF NOT EXISTS build_targets_default PARTITION OF build_targets DEFAULT;
-
-            CREATE TABLE IF NOT EXISTS build_phases (
-                day DATE NOT NULL,
-                build_key TEXT NOT NULL,
-                name TEXT NOT NULL,
-                seconds DOUBLE PRECISION NOT NULL,
-                PRIMARY KEY (day, build_key, name)
-            ) PARTITION BY RANGE (day);
-
-            CREATE TABLE IF NOT EXISTS build_phases_default PARTITION OF build_phases DEFAULT;
-
-            CREATE INDEX IF NOT EXISTS idx_builds_project_day ON builds (project, day);
-            CREATE INDEX IF NOT EXISTS idx_targets_name ON build_targets (name);
-
-            -- Added after the first release. These must be ALTERs, not columns
-            -- in the CREATE above: an existing database already has the table,
-            -- and CREATE TABLE IF NOT EXISTS silently skips a changed column
-            -- list, leaving the new columns missing at INSERT time.
-            ALTER TABLE builds ADD COLUMN IF NOT EXISTS error_count INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE builds ADD COLUMN IF NOT EXISTS warning_count INTEGER NOT NULL DEFAULT 0;
-            -- Nullable: a text log states no verdict, and NULL must read as
-            -- unknown rather than as success.
-            ALTER TABLE builds ADD COLUMN IF NOT EXISTS status TEXT;
-            ALTER TABLE builds ADD COLUMN IF NOT EXISTS scheme TEXT;",
-    )?;
+    // The canonical schema, shared with `buildlens-storage` rather than
+    // restated here. This function used to carry its own copy covering only
+    // builds, targets and phases, so a server that migrated a fresh database
+    // had no build_files, build_swift_timings, build_diagnostics or
+    // build_tests — and a pushed build carrying that detail hit "relation does
+    // not exist". One definition means the two cannot disagree about what a
+    // BuildLens database contains.
+    client.batch_execute(include_str!("../schema.sql"))?;
     Ok(())
 }
 
@@ -153,75 +103,14 @@ impl<'a> PostgresStore<'a> {
         Self { client }
     }
 
-    /// Stores a build. Re-sending the same build is a no-op, so a client that
-    /// retries after a network failure never double-counts.
-    pub fn insert(&mut self, build: &WireBuild) -> Result<bool, ServerError> {
-        let day = day_of(build.started_at);
-        let category = build.category.as_str().to_owned();
-        // The column is TEXT; `as_str` is the same spelling serde writes, so
-        // the stored value matches what a client sent. `None` stays NULL,
-        // which reads as unknown rather than as success.
-        let status = build.status.map(|status| status.as_str());
-        let mut transaction = self.client.transaction()?;
-        let inserted = transaction.execute(
-            "INSERT INTO builds (build_key, day, project, category, total_seconds,
-                                 compiled_count, cache_hit_rate, started_at, machine_id,
-                                 xcode_version, platform, architecture,
-                                 error_count, warning_count, status)
-             VALUES ($1, to_date($2, 'YYYY-MM-DD'), $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                     $13, $14, $15)
-             ON CONFLICT (day, build_key) DO NOTHING",
-            &[
-                &build.build_key,
-                &day,
-                &build.project,
-                    &category,
-                &build.total_seconds,
-                &(build.compiled_count as i32),
-                &build.cache_hit_rate,
-                &build.started_at,
-                &build.machine_id,
-                &build.xcode_version,
-                &build.platform,
-                &build.architecture,
-                &(build.error_count as i32),
-                &(build.warning_count as i32),
-                &status,
-            ],
-        )?;
-        if inserted == 0 {
-            transaction.commit()?;
-            return Ok(false);
-        }
-        for target in &build.targets {
-            let target_category = target.category.as_str().to_owned();
-            transaction.execute(
-                "INSERT INTO build_targets (day, build_key, name, seconds, category,
-                                            fetched_from_cache, compiled_count)
-                 VALUES (to_date($1, 'YYYY-MM-DD'), $2, $3, $4, $5, $6, $7)
-                 ON CONFLICT DO NOTHING",
-                &[
-                    &day,
-                    &build.build_key,
-                    &target.name,
-                    &target.seconds,
-                    &target_category,
-                    &target.fetched_from_cache,
-                    &(target.compiled_count as i32),
-                ],
-            )?;
-        }
-        for phase in &build.phases {
-            transaction.execute(
-                "INSERT INTO build_phases (day, build_key, name, seconds)
-                 VALUES (to_date($1, 'YYYY-MM-DD'), $2, $3, $4)
-                 ON CONFLICT DO NOTHING",
-                &[&day, &build.build_key, &phase.name, &phase.seconds],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(true)
-    }
+    // Writing is deliberately absent here.
+    //
+    // Ingest goes through `buildlens_storage::PostgresStore::insert`, the same
+    // writer a local `collect --db` uses. This struct once had its own
+    // narrower INSERT that knew nothing about file timings, Swift timings,
+    // diagnostics or tests, so a build pushed to a team server silently lost
+    // the detail it carried while a locally collected one kept it. Two writers
+    // for one schema is what made that possible; there is now one.
 
     /// Recent builds, newest first.
     pub fn builds(&mut self, limit: i64) -> Result<serde_json::Value, ServerError> {
@@ -488,34 +377,7 @@ fn ranked(rows: Vec<postgres::Row>) -> serde_json::Value {
     serde_json::json!({ "items": items })
 }
 
-/// Partition day for a build, from its start time; falls back to today when
-/// the log carried no timestamp.
-fn day_of(started_at: Option<f64>) -> String {
-    let seconds = match started_at {
-        Some(seconds) if seconds.is_finite() && seconds >= 0.0 => seconds as i64,
-        _ => std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
-    };
-    let days = seconds.div_euclid(86_400);
-    civil_from_days(days)
-}
 
-/// Days since the Unix epoch to `YYYY-MM-DD` (Howard Hinnant's civil_from_days).
-fn civil_from_days(days: i64) -> String {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    format!("{year:04}-{month:02}-{day:02}")
-}
 
 /// A real `ServerError::Database`, for tests that assert how store failures
 /// are reported. Connecting to a closed port is the cheapest way to obtain a
@@ -546,27 +408,4 @@ pub fn pool_error_for_tests() -> ServerError {
         .err()
         .expect("connecting to a closed port fails")
         .into()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn converts_epoch_days_to_civil_dates() {
-        assert_eq!(civil_from_days(0), "1970-01-01");
-        assert_eq!(civil_from_days(19_000), "2022-01-08");
-        // 2024 was a leap year: day 60 of that year is Feb 29.
-        assert_eq!(civil_from_days(19_782), "2024-02-29");
-    }
-
-    #[test]
-    fn day_of_uses_the_build_start_time() {
-        assert_eq!(day_of(Some(0.0)), "1970-01-01");
-        assert_eq!(day_of(Some(1_700_000_000.0)), "2023-11-14");
-        // A missing or nonsensical timestamp still yields a valid partition day.
-        assert_eq!(day_of(None).len(), 10);
-        assert_eq!(day_of(Some(f64::NAN)).len(), 10);
-        assert_eq!(day_of(Some(-1.0)).len(), 10);
-    }
 }

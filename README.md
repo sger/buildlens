@@ -123,10 +123,11 @@ environment and refuses to start without one.
 
 So the local dashboard also exposes `/v1/metrics`, and pointing another machine
 at it with `collect --server <url>` works. What a client transmits is the
-explicit `buildlens_core::wire::WireBuild` document: build timings, target and
-phase names, and optional hardware facts — never source paths, per-file
-timings, or log contents. Locally collected builds keep that detail, because
-`collect --db` writes to Postgres directly rather than over the wire.
+explicit `buildlens_core::wire::WireBuild` document — reviewable in one file,
+so nothing starts travelling by accident. Since wire version 2 that document
+carries the full build detail, **source paths, diagnostic text and test names
+included**, so a team dashboard shows what a local one does. The raw log itself
+never leaves the machine. Nothing is sent at all without `--server`.
 </details>
 
 ## Running the team server in a container
@@ -177,10 +178,17 @@ than protected. Every `/api/*` call the page then makes is authenticated. If
 nobody should reach the page at all, that is a network control: a VPN, or a
 proxy in front.
 
-**What the server dashboard shows.** Builds, durations, percentiles, targets
-and phases — everything a pushed `WireBuild` carries. The Files, Swift,
-Diagnostics and Tests panels render empty, because that detail is written only
-by a local `collect --db` and is deliberately not transmitted to a team server.
+**What the server dashboard shows.** The same panels a local one does. As of
+wire version 2 a pushed build carries the full detail — per-file timings, Swift
+type-check timings, diagnostics and test results — so Files, Swift, Diagnostics
+and Tests fill in for builds that arrived over the network, not only for
+locally collected ones.
+
+That detail includes **source file paths, diagnostic message text and test
+names, transmitted as recorded**. It is a deliberate widening of what leaves a
+machine, taken so a team dashboard is not half-empty; earlier versions sent
+totals only. Nothing is transmitted unless `--server` is passed, and a local
+`collect --db` still keeps everything on the machine.
 
 **No TLS.** The token crosses the network in cleartext, so keep this on a
 trusted network or a VPN, or terminate TLS in a reverse proxy in front of it.

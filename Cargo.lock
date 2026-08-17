@@ -149,6 +149,7 @@ dependencies = [
  "buildlens-tests",
  "clap",
  "flate2",
+ "serde",
  "serde_json",
  "tracing-subscriber",
  "ureq",

@@ -664,6 +664,87 @@ fn insert_wire(tx: &mut Transaction<'_>, build: &WireBuild, day: &str) -> Result
         )
         .map_err(|source| StoreError::Query { operation: "inserting phase", source })?;
     }
+    // The wire-version-2 detail. Empty for a build sent by an older client,
+    // and for one whose sender had no analysis to draw on, so these loops are
+    // simply skipped rather than needing a version check: the payload already
+    // says what it carries.
+    //
+    // `save_analysis` writes the same tables from the local model. Both land
+    // here for a pushed build, so a team dashboard and a local one show the
+    // same panels for the same build.
+    for file in &build.files {
+        tx.execute(
+            "INSERT INTO build_files (day,build_key,file,architecture,seconds,target,step_type,
+                                      occurrences)
+             VALUES (to_date($1,'YYYY-MM-DD'),$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING",
+            &[
+                &day,
+                &build.build_key,
+                &file.file,
+                &file.architecture.clone().unwrap_or_default(),
+                &file.seconds,
+                &file.target,
+                &file.step_type,
+                &(file.occurrences as i32),
+            ],
+        )
+        .map_err(|source| StoreError::Query { operation: "inserting file timing", source })?;
+    }
+    for timing in &build.swift_timings {
+        tx.execute(
+            "INSERT INTO build_swift_timings (day,build_key,kind,file,line,column_number,symbol,
+                                              milliseconds,target)
+             VALUES (to_date($1,'YYYY-MM-DD'),$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING",
+            &[
+                &day,
+                &build.build_key,
+                &timing.kind,
+                &timing.file,
+                &(timing.line as i32),
+                &(timing.column as i32),
+                &timing.symbol,
+                &timing.milliseconds,
+                &timing.target,
+            ],
+        )
+        .map_err(|source| StoreError::Query { operation: "inserting swift timing", source })?;
+    }
+    for diagnostic in &build.diagnostics {
+        tx.execute(
+            "INSERT INTO build_diagnostics (day,build_key,fingerprint,severity,category,
+                                            occurrences,message,file,line,target)
+             VALUES (to_date($1,'YYYY-MM-DD'),$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING",
+            &[
+                &day,
+                &build.build_key,
+                &diagnostic.fingerprint,
+                &diagnostic.severity,
+                &diagnostic.category,
+                &(diagnostic.occurrences as i32),
+                &diagnostic.message,
+                &diagnostic.file,
+                &diagnostic.line.map(|line| line as i32),
+                &diagnostic.target,
+            ],
+        )
+        .map_err(|source| StoreError::Query { operation: "inserting diagnostic", source })?;
+    }
+    for test in &build.tests {
+        tx.execute(
+            "INSERT INTO build_tests (day,build_key,suite,name,status,seconds,message)
+             VALUES (to_date($1,'YYYY-MM-DD'),$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING",
+            &[
+                &day,
+                &build.build_key,
+                &test.suite,
+                &test.name,
+                &test.status,
+                &test.seconds,
+                &test.message,
+            ],
+        )
+        .map_err(|source| StoreError::Query { operation: "inserting test result", source })?;
+    }
     Ok(true)
 }
 
