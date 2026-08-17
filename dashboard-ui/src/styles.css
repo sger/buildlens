@@ -202,7 +202,19 @@ main > header { @apply flex justify-between gap-5 items-end mb-[22px]; }
 main header .icon-button { @apply text-[12.5px] font-semibold px-[13px] py-2.5 whitespace-nowrap; }
 h1 { @apply text-[26px] tracking-tight my-0.5 font-semibold; }
 p { @apply text-muted my-1; }
-select { @apply bg-white border border-line rounded-[9px] px-3 py-2 text-[#2b3844] text-[13px] min-w-[200px]; }
+/* The chevron is drawn here rather than left to the platform: a native select
+   arrow sits against the control's right edge with the OS's own padding, which
+   does not match this control's, so it read as misaligned. `appearance-none`
+   drops it, the background SVG replaces it, and the extra right padding keeps
+   a long project name from running underneath. */
+select {
+  @apply bg-white border border-line rounded-[9px] pl-3 pr-9 py-2 text-[#2b3844] text-[13px] min-w-[200px];
+  @apply appearance-none bg-no-repeat cursor-pointer;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none'%3E%3Cpath d='M1 1.5 6 6.5l5-5' stroke='%236b7785' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-position: right 12px center;
+  background-size: 12px 8px;
+}
+select:hover { @apply border-[#c7d0d8]; }
 footer { @apply flex justify-between text-faint text-xs px-0.5 py-[18px]; }
 footer span { @apply text-[#aab4bd]; }
 
