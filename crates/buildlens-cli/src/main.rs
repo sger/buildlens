@@ -883,7 +883,8 @@ fn run() -> Result<std::process::ExitCode> {
                 }
             }
             let project = project_name_for_storage(&analysis);
-            let inserted = store.save_analysis(&analysis, &project, None, anonymous)?;
+            let inserted =
+                store.save_analysis(&analysis, &project, local_machine_id(anonymous), anonymous)?;
             let summary = analysis
                 .metrics
                 .as_ref()
@@ -924,7 +925,8 @@ fn run() -> Result<std::process::ExitCode> {
                 reject_unusable_metrics(&analysis, &log_for_metadata)?;
                 let mut store = PostgresStore::connect(&db)?;
                 let project = project_name_for_storage(&analysis);
-                let inserted = store.save_analysis(&analysis, &project, None, false)?;
+                let inserted =
+                    store.save_analysis(&analysis, &project, local_machine_id(false), false)?;
                 println!("{} build in PostgreSQL", if inserted { "Saved" } else { "Skipped duplicate" });
             }
             HistoryCommand::Prune { keep_days, db, confirm } => {
@@ -1139,6 +1141,23 @@ fn push_metrics(
     Ok(())
 }
 
+/// The machine id recorded with a locally stored build.
+///
+/// The same pseudonymous id the `--server` push path sends, so a build stored
+/// locally and the same build pushed to a team server identify the machine
+/// identically. Without this every local build recorded an empty `machine_id`,
+/// leaving the dashboard's "Machine" field permanently blank and
+/// `/api/environment` unable to count distinct machines.
+///
+/// `anonymous` suppresses it, matching the push path: opting out of
+/// attribution must mean the same thing wherever a build is written.
+fn local_machine_id(anonymous: bool) -> Option<String> {
+    if anonymous {
+        return None;
+    }
+    push::machine_id(&buildlens_plugins::RealProbe)
+}
+
 /// The name a build is stored under. `--project` (already folded into
 /// `metrics.project` by `apply_project_name`) wins; otherwise the name is
 /// inferred from the log's DerivedData path, exactly as the `--server` push
@@ -1308,7 +1327,12 @@ fn import_one(
     {
         return Ok(false);
     }
-    store.save_analysis(&analysis, &project_name_for_storage(&analysis), None, false)?;
+    store.save_analysis(
+        &analysis,
+        &project_name_for_storage(&analysis),
+        local_machine_id(false),
+        false,
+    )?;
     Ok(true)
 }
 

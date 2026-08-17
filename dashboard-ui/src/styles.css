@@ -1,1 +1,226 @@
-:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#16212c;background:#f5f7f9;font-size:14px}*{box-sizing:border-box}body{margin:0}.shell{display:flex;min-height:100vh;max-width:100%}aside{width:232px;background:#101a24;color:#aab8c4;padding:26px 18px;display:flex;flex-direction:column}.brand{display:flex;align-items:center;color:#fff;font-size:19px;font-weight:750;letter-spacing:-.02em;padding:2px 10px 42px}nav{display:grid;gap:7px}nav button{border:0;background:transparent;color:inherit;text-align:left;border-radius:9px;padding:12px 13px;font:inherit;cursor:pointer;font-weight:600}nav button span{margin-left:10px}nav button.active{background:#1b2c3b;color:#fff;box-shadow:inset 3px 0 #38c991}.side-note{margin-top:auto;border-top:1px solid #283744;padding:20px 10px;line-height:1.7;color:#d5e0e7}.side-note small{color:#718492}.pulse{display:inline-block;width:7px;height:7px;border-radius:50%;background:#38c991;margin-right:7px}main{width:100%;max-width:1600px;padding:36px 42px 30px;margin:0 auto;min-width:0;overflow-x:hidden}header{display:flex;justify-content:space-between;gap:20px;align-items:flex-end;margin-bottom:28px}h1{font-size:34px;letter-spacing:-.04em;margin:3px 0}.eyebrow{font-size:11px;letter-spacing:.12em;color:#71808c;font-weight:800;margin:0}.lede,p{color:#71808c;margin:5px 0}.header-actions{display:flex;gap:9px}.header-actions select,.icon-button,.filters input{background:#fff;border:1px solid #d8e0e6;border-radius:8px;padding:10px 12px;color:#283743;font:inherit}.header-actions select{min-width:210px}.icon-button{font-size:20px;padding:6px 11px;cursor:pointer}.error{background:#fff0f0;color:#a32232;border:1px solid #f2c5cb;padding:12px;border-radius:9px;margin-bottom:18px}.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:16px}.kpi,.panel{background:#fff;border:1px solid #e1e7eb;border-radius:12px;box-shadow:0 5px 18px #20384d08}.kpi{padding:18px 20px}.kpi span,.kpi small,.detail-grid span{display:block;color:#7a8892;font-size:12px}.kpi strong{font-size:28px;letter-spacing:-.04em;display:block;margin:8px 0 4px}.kpi small{font-size:12px}.bad,.red{color:#d44855!important}.good,.green{color:#168b67!important}.workspace{display:grid;grid-template-columns:minmax(0,2fr) minmax(280px,1fr);gap:16px;margin-bottom:16px;min-width:0}.panel{padding:20px;min-width:0}.panel-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}.panel h2{font-size:16px;margin:0;color:#1c2b36}.panel-head p{font-size:12px}.metric{color:#7a8892;font-size:12px}.metric b{color:#1b2b37;font-size:18px;margin-left:8px}.chart{height:160px;margin-top:22px;color:#38a982;background:linear-gradient(180deg,#effaf6,transparent);border-radius:8px;padding:14px 0}.spark{width:100%;height:100%;overflow:visible}.chart-foot{display:flex;justify-content:space-between;color:#9aa6ae;font-size:11px}.legend i{display:inline-block;width:8px;height:8px;background:#38a982;border-radius:50%;margin-right:5px}.attention{background:#10202c;color:#fff;border:0}.attention h2{color:#fff}.attention p,.attention .panel-head p{color:#91a4b2}.attention-row{display:flex;align-items:center;gap:15px;padding:20px 0;border-bottom:1px solid #29404f}.attention-row:last-child{border:0}.attention-row strong{font-size:34px;min-width:52px}.attention-row span{color:#dbe5eb;font-weight:600}.attention-row small{color:#91a4b2;font-weight:400}.build-panel{padding:0;overflow:hidden}.table-head{padding:20px;border-bottom:1px solid #e6ebee;align-items:center}.filters{display:flex;gap:12px;align-items:center;color:#73818b;font-size:12px}.filters input[type=text],.filters>input{min-width:180px}.filters label input{accent-color:#35a980;margin-right:5px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:850px}th{text-align:left;color:#87939b;font-size:11px;letter-spacing:.05em;text-transform:uppercase;font-weight:750;padding:13px 20px;white-space:nowrap}td{padding:14px 20px;border-top:1px solid #edf0f2;white-space:nowrap;cursor:pointer}tbody tr:hover,tbody tr.selected{background:#f5fbf8}td small{display:block;color:#9aa6ae;margin-top:3px;white-space:normal;max-width:180px}.build-id{border:0;background:transparent;color:#247d63;font:600 13px ui-monospace,monospace;cursor:pointer}.mono{font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px}.muted{color:#81909a}.category{background:#eef2f3;padding:5px 8px;border-radius:7px;color:#65747d;font-size:12px}.status{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border-radius:99px;background:#eaf8f1;color:#14805e;font-size:12px;font-weight:700}.status i{width:6px;height:6px;background:currentColor;border-radius:50%}.status.bad{background:#fff0f0;color:#d44855!important}.status.warn{background:#fff7e5;color:#a87316!important}.icon-button.live{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;color:#7a8892}.icon-button.live i{width:7px;height:7px;border-radius:50%;background:#c3ccd2}.icon-button.live.on{color:#14805e}.icon-button.live.on i{background:#38c991;animation:pulse-live 2s ease-in-out infinite}@keyframes pulse-live{0%,100%{opacity:1}50%{opacity:.35}}@media(prefers-reduced-motion:reduce){.icon-button.live.on i{animation:none}}.status.muted-status{background:#eef2f4;color:#7a8892!important;font-weight:600}.diagnostics{color:#697984}.detail{margin-top:16px}.detail h2{display:flex;align-items:center;gap:10px}.close{border:0;background:#eef3f5;color:#5a6b76;border-radius:7px;padding:8px 12px;cursor:pointer}.detail-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:18px}.detail-grid div{background:#f6f8f9;border-radius:8px;padding:13px}.detail-grid strong{display:block;font-size:20px;margin-top:5px}.detail pre{background:#0f1b24;color:#c7d7df;border-radius:9px;padding:16px;max-height:280px;overflow:auto;font-size:11px;margin:16px 0 0}footer{display:flex;justify-content:space-between;color:#98a5ad;font-size:12px;padding:20px 2px}footer span{color:#b1bbc0}.insights{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;margin-bottom:16px}.insight{min-width:0;overflow:hidden}.insight h2{font-size:15px}.insight h3{font-size:13px;color:#5c6a74;margin:18px 0 8px;letter-spacing:.02em}.bars{list-style:none;margin:16px 0 0;padding:0;display:grid;gap:13px}.bars li{display:grid;gap:5px;min-width:0}.bar-head{display:flex;justify-content:space-between;gap:12px;align-items:baseline;min-width:0}.bar-label{font-weight:600;color:#22323d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;min-width:0;flex:1}.bar-value{color:#41525d;white-space:nowrap;flex:none}.bar-track{background:#eef2f4;border-radius:99px;height:7px;overflow:hidden}.bar-track i{display:block;height:100%;background:#38a982;border-radius:99px}.bars small,.rows small{color:#8b98a1;font-size:11px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.rows{list-style:none;margin:16px 0 0;padding:0;display:grid;gap:12px}.rows li{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:baseline;min-width:0}.rows li small{grid-column:1/-1}.warnpill{color:#a87316!important}.dirty{color:#a87316;font-style:normal;font-weight:500}.crumb{color:#71808c;text-decoration:none}.crumb:hover{color:#247d63}main header .icon-button{font-size:13px;font-weight:600;padding:10px 14px;white-space:nowrap}.empty,.empty-note{color:#8b98a1;font-size:12px;padding:14px 0;line-height:1.6}.table-wrap .empty{padding:22px 20px}.empty-note code{background:#eef2f4;border-radius:5px;padding:2px 5px;font-size:11px}.detail-cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:22px;margin-top:8px}.meta-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin-top:8px}.meta-grid div{background:#f6f8f9;border-radius:8px;padding:11px 13px;overflow:hidden}.meta-grid span{display:block;color:#7a8892;font-size:11px;margin-bottom:3px}.meta-grid b{font-size:13px;color:#22323d;word-break:break-all}.diag-list{list-style:none;margin:16px 0 0;padding:0;display:grid;gap:11px}.diag-list li{display:grid;grid-template-columns:auto minmax(0,1fr);gap:12px;align-items:start;padding-bottom:11px;border-bottom:1px solid #edf0f2}.diag-list li:last-child{border:0;padding-bottom:0}.diag-list b{display:block;font-size:13px;font-weight:600;color:#22323d;line-height:1.5;word-break:break-word}.diag-list small{display:block;color:#8b98a1;font-size:11px;margin-top:3px;line-height:1.5;word-break:break-word}.sev{background:#fff7e5;color:#a87316;border-radius:99px;padding:3px 9px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;white-space:nowrap;margin-top:1px}.sev.bad{background:#fff0f0;color:#d44855}.sev.ok{background:#eaf8f1;color:#14805e}@media(max-width:900px){aside{width:72px;padding:22px 10px}.brand{padding:0 9px 35px}nav button span,.side-note{display:none}.brand{font-size:0}.brand span{font-size:15px}main{padding:25px 18px}.kpis{grid-template-columns:repeat(2,1fr)}.workspace{grid-template-columns:1fr}header{align-items:flex-start;flex-direction:column}.header-actions{width:100%}.header-actions select{flex:1}}@media(max-width:520px){main{padding:20px 12px}.kpis{gap:8px}.kpi{padding:14px}.kpi strong{font-size:22px}.filters{flex-wrap:wrap}.detail-grid{grid-template-columns:repeat(2,1fr)}footer{display:block}footer span{display:block;margin-top:5px}}
+@import "tailwindcss";
+
+/* Class names live in main.tsx only, but Tailwind v4's automatic source
+   detection ignores files outside the CSS's own directory tree. Naming the
+   source explicitly keeps the scan deterministic — the drift check compares
+   the bundle byte-for-byte, so a scan that varies by cwd would fail in CI. */
+@source "./main.tsx";
+
+/* The CourtFlow-derived palette, as theme tokens rather than scattered hex
+   values: `--color-accent` here becomes `bg-accent`, `text-accent`, and so on.
+   Repainting the dashboard means editing this block and nothing else. */
+@theme {
+  --color-page: #f7f8fa;
+  --color-line: #e8ecf0;
+  --color-hair: #f1f4f6;
+  --color-ink: #15202b;
+  --color-muted: #6b7885;
+  --color-faint: #95a1ac;
+
+  --color-accent: #e08c33;
+  --color-accent-soft: #fdecd3;
+  --color-ok: #15855f;
+  --color-ok-soft: #dcf3e7;
+  --color-bad: #d0453f;
+  --color-bad-soft: #fbe4e3;
+  --color-warn: #a8731a;
+  --color-warn-soft: #fbeed3;
+  --color-violet: #6b4fd0;
+  --color-violet-soft: #e8e3fb;
+  --color-blue: #2f6fd0;
+  --color-blue-soft: #dde9fb;
+
+  /* The dark sidebar. */
+  --color-navy: #0f1a24;
+  --color-navy-soft: #16232d;
+  --color-navy-hover: #18262f;
+  --color-navy-active: #182731;
+  --color-navy-label: #5d6f7e;
+  --color-navy-text: #9fadba;
+  --color-live: #38c991;
+
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, monospace;
+}
+
+/* Element defaults. Tailwind's preflight resets these, so the few global
+   choices the dashboard relies on are restated here. */
+@layer base {
+  html { font-size: 14px; }
+  body {
+    @apply bg-page text-ink font-sans antialiased;
+  }
+}
+
+/* Component classes.
+ *
+ * The markup is dense single-line JSX; inlining fifteen utilities per element
+ * would make it unreadable. These compose Tailwind utilities under the names
+ * the components already use, so the styling stays in one file and the JSX
+ * stays legible. Utilities are still used inline for one-off adjustments. */
+@layer components {
+  .shell { @apply flex min-h-screen max-w-full; }
+
+  /* ---- Sidebar ---------------------------------------------------------- */
+  .brand { @apply flex items-center gap-2.5 text-white text-lg font-bold tracking-tight px-2.5 pt-1.5 pb-6; }
+  .brand svg { @apply shrink-0; }
+  .nav-group { @apply text-[10px] tracking-[.14em] font-bold text-navy-label px-3 pt-4 pb-2 uppercase; }
+  .nav-group:first-of-type { @apply pt-0; }
+  .side-note { @apply mt-auto flex items-center gap-2.5 bg-navy-soft rounded-[10px] px-3 py-2.5 leading-snug text-[#d5e0e7] text-[13px] font-semibold; }
+  .side-note small { @apply block text-[#7d8e9c] font-normal text-[11px]; }
+  .pulse { @apply inline-block size-2 rounded-full bg-live shrink-0 shadow-[0_0_0_3px_#38c9911f]; }
+
+  /* ---- Header ----------------------------------------------------------- */
+  .eyebrow { @apply text-[10px] tracking-[.13em] text-faint font-bold m-0; }
+  .lede { @apply text-muted my-1; }
+  .header-actions { @apply flex gap-2 items-center; }
+  .icon-button { @apply bg-white border border-line rounded-[9px] px-3 py-2 text-[#2b3844] text-[13px] cursor-pointer transition-colors hover:border-[#cfd8e0] hover:bg-[#fbfcfd]; }
+  .icon-button.live { @apply inline-flex items-center gap-[7px] text-xs font-semibold text-muted; }
+  .icon-button.live i { @apply size-[7px] rounded-full bg-[#c6ced5]; }
+  .icon-button.live.on { @apply text-ok bg-ok-soft border-[#c2e6d5]; }
+  .icon-button.live.on i { @apply bg-live motion-safe:animate-[pulse-live_2s_ease-in-out_infinite]; }
+  .token-input { @apply bg-white border border-line rounded-[9px] px-3 py-2 text-[#2b3844] text-[13px]; }
+  .error { @apply bg-bad-soft text-[#9d2b26] border border-[#f2c9c7] p-3 rounded-[10px] mb-4; }
+
+  /* ---- KPI tiles -------------------------------------------------------- */
+  .kpis { @apply grid grid-cols-1 min-[520px]:grid-cols-2 min-[1100px]:grid-cols-4 gap-3.5 mb-3.5; }
+  .kpi { @apply bg-white border border-line rounded-[14px] shadow-[0_1px_2px_#1c2b3a08] px-[18px] py-4 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 items-center; }
+  .kpi-icon { @apply row-span-2 size-[42px] rounded-[11px] flex items-center justify-center bg-accent-soft text-accent; }
+  .kpi.t-ok .kpi-icon { @apply bg-ok-soft text-ok; }
+  .kpi.t-violet .kpi-icon { @apply bg-violet-soft text-violet; }
+  .kpi.t-blue .kpi-icon { @apply bg-blue-soft text-blue; }
+  .kpi.t-bad .kpi-icon { @apply bg-bad-soft text-bad; }
+  .kpi > span { @apply text-muted text-[12.5px] font-medium; }
+  .kpi strong { @apply text-2xl tracking-tight block mt-px font-semibold col-start-2; }
+  .kpi small { @apply col-start-2 text-[11.5px] text-faint mt-[5px] block truncate; }
+
+  /* ---- Panels ----------------------------------------------------------- */
+  .panel { @apply bg-white border border-line rounded-[14px] shadow-[0_1px_2px_#1c2b3a08] px-5 py-[18px] min-w-0; }
+  .panel-head { @apply flex justify-between items-start gap-4; }
+  .panel h2 { @apply text-[15px] m-0 text-ink font-semibold tracking-tight; }
+  .panel-head p { @apply text-xs mt-[3px] mb-0 text-muted; }
+  .metric { @apply text-muted text-xs whitespace-nowrap; }
+  .metric b { @apply text-ink text-base ml-1.5; }
+  .panel-action { @apply inline-flex items-center gap-[7px] border border-line bg-white rounded-[9px] px-3 py-2 text-[12.5px] font-semibold text-[#3a4753] cursor-pointer whitespace-nowrap shrink-0 transition-colors hover:border-[#cfd8e0] hover:bg-[#fbfcfd]; }
+  .workspace { @apply grid grid-cols-1 min-[900px]:grid-cols-[minmax(0,1.65fr)_minmax(300px,1fr)] gap-3.5 mb-3.5 min-w-0; }
+
+  /* ---- Duration chart --------------------------------------------------- */
+  .chart { @apply h-[170px] mt-[18px] text-accent bg-linear-to-b from-[#fdf3e6] to-transparent rounded-[10px] py-3.5; }
+  .spark { @apply w-full h-full overflow-visible; }
+  .chart-foot { @apply flex justify-between text-faint text-[11px] mt-1.5; }
+  .legend i { @apply inline-block size-2 bg-accent rounded-full mr-[5px]; }
+
+  /* ---- Needs attention -------------------------------------------------- */
+  .attention-row { @apply flex items-center gap-3 py-3 border-b border-hair; }
+  .attention-row:first-of-type { @apply pt-4; }
+  .attention-row:last-child { @apply border-0 pb-0.5; }
+  .att-chip { @apply size-9 rounded-[10px] shrink-0 flex items-center justify-center bg-ok-soft text-ok font-bold text-sm; }
+  .attention-row.warn .att-chip { @apply bg-warn-soft text-warn; }
+  .attention-row.bad .att-chip { @apply bg-bad-soft text-bad; }
+  .att-text { @apply min-w-0 flex-1; }
+  .attention-row b { @apply block text-[13.5px] font-semibold text-ink; }
+  .attention-row small { @apply block text-faint text-[11.5px] mt-0.5 truncate; }
+
+  /* ---- Builds table ----------------------------------------------------- */
+  .build-panel { @apply p-0 overflow-hidden; }
+  .table-head { @apply px-5 py-[18px] border-b border-line items-center; }
+  .filters { @apply flex gap-3 items-center text-muted text-xs flex-wrap; }
+  .filters input { @apply bg-white border border-line rounded-[9px] px-3 py-2 text-[#2b3844] text-[13px] min-w-[190px]; }
+  .filters label input { @apply min-w-0 accent-accent mr-[5px]; }
+  .table-wrap { @apply overflow-auto; }
+  .table-wrap .empty { @apply px-5 py-[22px]; }
+  .build-id { @apply border-0 bg-transparent text-accent font-mono text-[12.5px] font-semibold cursor-pointer; }
+  .category { @apply bg-hair px-2.5 py-1 rounded-[7px] text-[#5d6a75] text-[11.5px] font-medium; }
+  .diagnostics { @apply text-[#63717d]; }
+
+  /* ---- Status pills ----------------------------------------------------- */
+  .status { @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-ok-soft text-ok text-[11.5px] font-semibold; }
+  .status i { @apply size-1.5 bg-current rounded-full; }
+  .status.bad { @apply bg-bad-soft text-bad; }
+  .status.warn { @apply bg-warn-soft text-warn; }
+  .status.muted-status { @apply bg-hair text-muted font-semibold; }
+
+  /* ---- Insight sections, bars and rows ---------------------------------- */
+  .insights { @apply grid grid-cols-[repeat(auto-fit,minmax(340px,1fr))] gap-3.5 mb-3.5; }
+  .insight { @apply min-w-0 overflow-hidden; }
+  .bars { @apply list-none mt-4 mb-0 p-0 grid gap-[13px]; }
+  .bars li { @apply grid gap-[5px] min-w-0; }
+  .bar-head { @apply flex justify-between gap-3 items-baseline min-w-0; }
+  .bar-label { @apply font-semibold text-[#22323d] truncate text-[13px] min-w-0 flex-1; }
+  .bar-value { @apply text-[#4a5763] whitespace-nowrap flex-none font-semibold; }
+  .bar-track { @apply bg-hair rounded-full h-[7px] overflow-hidden; }
+  .bar-track i { @apply block h-full bg-accent rounded-full; }
+  .bars small, .rows small { @apply text-faint text-[11px] block truncate min-w-0; }
+  .rows { @apply list-none mt-4 mb-0 p-0 grid gap-3; }
+  .rows li { @apply grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-1 items-baseline min-w-0; }
+  .rows li small { @apply col-span-full; }
+
+  /* ---- Diagnostics and build detail ------------------------------------- */
+  .diag-list { @apply list-none mt-3.5 mb-0 p-0 grid gap-[11px]; }
+  .diag-list li { @apply grid grid-cols-[auto_minmax(0,1fr)] gap-3 items-start pb-[11px] border-b border-hair; }
+  .diag-list li:last-child { @apply border-0 pb-0; }
+  .diag-list b { @apply block text-[13px] font-semibold text-[#22323d] leading-normal break-words; }
+  .diag-list small { @apply block text-faint text-[11px] mt-[3px] leading-normal break-words; }
+  .sev { @apply bg-warn-soft text-warn rounded-full px-2.5 py-[3px] text-[10.5px] font-bold uppercase tracking-[.03em] whitespace-nowrap mt-px; }
+  .sev.bad { @apply bg-bad-soft text-bad; }
+  .sev.ok { @apply bg-ok-soft text-ok; }
+  .meta-grid { @apply grid grid-cols-[repeat(auto-fit,minmax(210px,1fr))] gap-2.5 mt-3.5; }
+  .meta-grid div { @apply bg-[#fafbfc] border border-[#f0f3f5] rounded-[10px] px-[13px] py-[11px] overflow-hidden; }
+  .meta-grid span { @apply block text-faint text-[11px] mb-[3px]; }
+  .meta-grid b { @apply text-[13px] text-[#22323d] break-all; }
+
+  /* ---- Shared text helpers ---------------------------------------------- */
+  .mono { @apply font-mono text-xs; }
+  .muted { @apply text-faint; }
+  .warnpill { @apply text-warn; }
+  .dirty { @apply text-warn not-italic font-medium; }
+  .crumb { @apply text-muted no-underline hover:text-accent; }
+  .empty, .empty-note { @apply text-faint text-xs py-3.5 leading-relaxed; }
+  .empty-note code { @apply bg-hair rounded-[5px] px-[5px] py-0.5 text-[11px]; }
+}
+
+/* Layout the components can't express as classes: the app frame, and the
+   element-level table styling that would otherwise need a class per cell. */
+aside { @apply w-[244px] bg-navy text-navy-text px-3.5 pt-[22px] pb-[18px] flex flex-col flex-none; }
+nav { @apply grid gap-[3px]; }
+nav button { @apply flex items-center gap-[11px] border-0 bg-transparent text-inherit text-left rounded-[9px] px-3 py-2.5 font-medium cursor-pointer transition-colors hover:bg-navy-hover hover:text-[#dbe4ea]; }
+nav button svg { @apply shrink-0 opacity-85; }
+nav button.active { @apply bg-navy-active text-white font-semibold; }
+nav button.active svg { @apply opacity-100 text-live; }
+
+main { @apply w-full max-w-[1560px] px-[34px] pt-7 pb-6 mx-auto min-w-0 overflow-x-hidden; }
+main > header { @apply flex justify-between gap-5 items-end mb-[22px]; }
+main header .icon-button { @apply text-[12.5px] font-semibold px-[13px] py-2.5 whitespace-nowrap; }
+h1 { @apply text-[26px] tracking-tight my-0.5 font-semibold; }
+p { @apply text-muted my-1; }
+select { @apply bg-white border border-line rounded-[9px] px-3 py-2 text-[#2b3844] text-[13px] min-w-[200px]; }
+footer { @apply flex justify-between text-faint text-xs px-0.5 py-[18px]; }
+footer span { @apply text-[#aab4bd]; }
+
+table { @apply w-full border-collapse min-w-[850px]; }
+th { @apply text-left text-faint text-[11px] tracking-[.04em] uppercase font-bold px-5 py-3 whitespace-nowrap bg-[#fbfcfd] border-b border-line; }
+td { @apply px-5 py-[13px] border-t border-hair whitespace-nowrap cursor-pointer; }
+tbody tr:hover { @apply bg-[#fbfaf7]; }
+td small { @apply block text-faint mt-[3px] whitespace-normal max-w-[180px]; }
+
+@keyframes pulse-live { 0%, 100% { opacity: 1 } 50% { opacity: .35 } }
+
+/* Collapse the sidebar to icons before the content gets squeezed. */
+@media (max-width: 900px) {
+  aside { @apply w-[66px] px-2.5 py-5; }
+  .brand { @apply px-1.5 pb-6 justify-center; }
+  .brand span, .nav-group, .side-note { @apply hidden; }
+  nav button span { @apply hidden; }
+  nav button { @apply justify-center px-0 py-[11px]; }
+  main { @apply px-4 pt-[22px]; }
+  main > header { @apply items-start flex-col; }
+  .header-actions { @apply w-full flex-wrap; }
+  select { @apply flex-1; }
+}
+@media (max-width: 520px) {
+  main { @apply px-3 pt-[18px]; }
+  .kpis { @apply gap-2.5; }
+  .kpi strong { @apply text-[21px]; }
+  footer { @apply block; }
+  footer span { @apply block mt-[5px]; }
+}

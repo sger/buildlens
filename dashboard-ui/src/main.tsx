@@ -70,12 +70,34 @@ function Section({title,note,children}:{title:string;note?:string;children:React
   return <div className="panel insight"><div className="panel-head"><div><h2>{title}</h2>{note&&<p>{note}</p>}</div></div>{children}</div>;
 }
 
+/// Inline stroke icons.
+///
+/// Drawn here rather than pulled from an icon package: the dashboard ships as
+/// one self-contained HTML file, so a dependency that loads glyphs at runtime
+/// would not survive the bundle. `currentColor` lets each tile tint its own.
+const Icon = ({d,size=18}:{d:string;size?:number}) =>
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={d}/></svg>;
+const ICONS = {
+  builds:"M3 5h18M3 12h18M3 19h18",
+  trends:"M3 17l5-6 4 4 7-9M21 6v5h-5",
+  health:"M3 12h4l2-6 4 13 2-7h6",
+  clock:"M12 21a9 9 0 100-18 9 9 0 000 18zM12 7v5l3 2",
+  gauge:"M12 20a8 8 0 100-16 8 8 0 000 16zM12 12l4-3",
+  layers:"M12 3l9 5-9 5-9-5 9-5zM3 14l9 5 9-5",
+  alert:"M12 4l9 16H3l9-16zM12 10v4M12 17.5v.5",
+  file:"M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8l-5-5zM14 3v5h5",
+  cache:"M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zM4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7",
+  calendar:"M7 3v4M17 3v4M4 9h16M5 5h14a1 1 0 011 1v13a1 1 0 01-1 1H5a1 1 0 01-1-1V6a1 1 0 011-1z",
+  arrow:"M5 12h13M13 6l6 6-6 6",
+  logo:"M4 18l5-7 4 4 7-10",
+} as const;
+
 /// The three views. `builds` is the default, so `#/` and an empty hash both
-/// land there.
+/// land there. `group` places each in the sidebar's labelled sections.
 const TABS = [
-  {id:"builds", icon:"▦", label:"Builds", lede:"See what changed, what slowed down, and where to look next."},
-  {id:"trends", icon:"⌁", label:"Performance", lede:"Where build time goes, and what is getting slower."},
-  {id:"diagnostics", icon:"◌", label:"Health", lede:"Warnings, failing tests, and the commits behind them."},
+  {id:"builds", icon:ICONS.builds, group:"Main", label:"Builds", lede:"See what changed, what slowed down, and where to look next."},
+  {id:"trends", icon:ICONS.trends, group:"Analysis", label:"Performance", lede:"Where build time goes, and what is getting slower."},
+  {id:"diagnostics", icon:ICONS.health, group:"Analysis", label:"Health", lede:"Warnings, failing tests, and the commits behind them."},
 ] as const;
 type TabId = (typeof TABS)[number]["id"];
 
@@ -125,10 +147,10 @@ function BuildPage({id}:{id:string}) {
     {!build&&!error&&<div className="panel"><div className="empty">Loading build…</div></div>}
     {build&&<>
       <section className="kpis">
-        <Kpi label="Duration" value={seconds(build.total_seconds)} foot={build.category||"unknown"}/>
-        <Kpi label="Files compiled" value={(build.compiled_count||0).toLocaleString()} foot="This build"/>
-        <Kpi label="Cache hit rate" value={percent(build.cache_hit_rate)} foot="Across targets"/>
-        <Kpi label="Recorded" value={date(build.recorded_at)} foot={build.project||"Unknown project"}/>
+        <Kpi icon={ICONS.clock} label="Duration" value={seconds(build.total_seconds)} foot={build.category||"unknown"}/>
+        <Kpi icon={ICONS.file} tone="blue" label="Files compiled" value={(build.compiled_count||0).toLocaleString()} foot="This build"/>
+        <Kpi icon={ICONS.cache} tone="ok" label="Cache hit rate" value={percent(build.cache_hit_rate)} foot="Across targets"/>
+        <Kpi icon={ICONS.calendar} tone="violet" label="Recorded" value={date(build.recorded_at)} foot={build.project||"Unknown project"}/>
       </section>
       <section className="insights">
         <Section title="Targets" note="Slowest first">
@@ -175,12 +197,30 @@ function BuildPage({id}:{id:string}) {
               <small>{seconds(t.seconds)}{t.message?` · ${t.message}`:""}</small></div>
           </li>)}</ul>
       </section>}
+      {/* Git first: "which commit was this?" is the question asked of a build
+          far more often than which CPU built it, and in the flat metadata grid
+          it was three rows lost among fifteen. */}
+      {(() => {
+        const meta = build.metadata||{};
+        const git = {branch:meta["git.branch"], commit:meta["git.commit"], dirty:meta["git.dirty"]};
+        if(!git.branch&&!git.commit) return null;
+        return <section className="panel"><div className="panel-head"><div><h2>Git</h2><p>What was checked out when this build ran</p></div>
+          {git.dirty==="true"&&<span className="sev">uncommitted changes</span>}</div>
+          <div className="meta-grid">
+            <div><span>Branch</span><b>{git.branch||"—"}</b></div>
+            <div><span>Commit</span><b className="mono" title={git.commit}>{git.commit?git.commit.slice(0,12):"—"}</b></div>
+            <div><span>Working tree</span><b>{git.dirty==null?"—":git.dirty==="true"?"Modified":"Clean"}</b></div>
+          </div>
+        </section>;
+      })()}
       <section className="panel"><div className="panel-head"><div><h2>Environment &amp; metadata</h2><p>Git, hardware and CI context recorded with this build</p></div></div>
         <div className="meta-grid">
-          <div><span>Xcode</span><b>{build.xcode_version||"—"}</b></div>
-          <div><span>Platform</span><b>{build.platform||"—"}</b></div>
-          <div><span>Architecture</span><b>{build.architecture||"—"}</b></div>
-          <div><span>Machine</span><b className="mono">{build.machine_id||"—"}</b></div>
+          {/* Only what this build actually recorded: a permanent row of em-dashes
+              reads as "BuildLens lost this", not "nothing was collected". */}
+          {build.xcode_version&&<div><span>Xcode</span><b>{build.xcode_version}</b></div>}
+          {build.platform&&<div><span>Platform</span><b>{build.platform}</b></div>}
+          {build.architecture&&<div><span>Architecture</span><b>{build.architecture}</b></div>}
+          {build.machine_id&&<div><span>Machine</span><b className="mono">{build.machine_id}</b></div>}
           {Object.entries(build.metadata||{}).map(([k,v])=><div key={k}><span>{k}</span><b className="mono">{v}</b></div>)}
         </div>
         {!Object.keys(build.metadata||{}).length&&<p className="empty-note">No collected metadata for this build. Re-collect with <code>--collect-all</code> to record git, hardware and CI context.</p>}
@@ -191,12 +231,23 @@ function BuildPage({id}:{id:string}) {
 }
 
 function Sidebar({tab}:{tab:TabId}) {
-  return <aside><div className="brand"><span>BuildLens</span></div>
-    <nav>{TABS.map(t=>
-      <button key={t.id} className={t.id===tab?"active":""} aria-current={t.id===tab?"page":undefined}
-              onClick={()=>openTab(t.id)}>{t.icon} <span>{t.label}</span></button>)}
-    </nav>
-    <div className="side-note"><span className="pulse"/> Local collector<br/><small>Read-only workspace</small></div></aside>;
+  // Grouped rather than flat, so the nav reads as sections once more views are
+  // added. Each group header renders once, before the first tab that claims it.
+  const groups = TABS.reduce<{group:string;tabs:typeof TABS[number][]}[]>((acc,t)=>{
+    const last=acc.at(-1);
+    if(last?.group===t.group) last.tabs.push(t); else acc.push({group:t.group,tabs:[t]});
+    return acc;
+  },[]);
+  return <aside>
+    <div className="brand"><Icon d={ICONS.logo} size={22}/><span>BuildLens</span></div>
+    {groups.map(g=><div key={g.group}>
+      <p className="nav-group">{g.group}</p>
+      <nav>{g.tabs.map(t=>
+        <button key={t.id} className={t.id===tab?"active":""} aria-current={t.id===tab?"page":undefined}
+                onClick={()=>openTab(t.id)}><Icon d={t.icon}/><span>{t.label}</span></button>)}
+      </nav>
+    </div>)}
+    <div className="side-note"><span className="pulse"/><div>Local collector<small>Read-only workspace</small></div></div></aside>;
 }
 
 function App() {
@@ -351,13 +402,16 @@ function Overview({tab}:{tab:TabId}) {
   return <div className="shell"><Sidebar tab={tab}/><main>
     <header><div><p className="eyebrow">BUILD INTELLIGENCE / {view.label.toUpperCase()}</p><h1>{view.label}</h1><p className="lede">{view.lede}</p></div><div className="header-actions">{needsToken&&<input className="token-input" type="password" value={token} onChange={e=>{setToken(e.target.value);localStorage.setItem("buildlens-token",e.target.value)}} placeholder="Server token" aria-label="Server token" title="This backend refused a request; a buildlens-server needs its BUILDLENS_TOKEN here."/>}<select value={project} onChange={e=>{setProject(e.target.value);localStorage.setItem("buildlens-project",e.target.value)}}><option value="">All projects</option>{projects.map(p=><option key={p.project} value={p.project}>{p.project} · {p.builds}</option>)}</select><button className="icon-button" onClick={()=>load(true)} title="Refresh now">↻</button><button className={`icon-button live${autoRefresh?" on":""}`} onClick={()=>{const next=!autoRefresh;setAutoRefresh(next);localStorage.setItem("buildlens-autorefresh",next?"on":"off");}} title={autoRefresh?`Updating every ${REFRESH_MS/1000}s — click to pause`:"Auto-refresh paused — click to resume"}><i/>{autoRefresh?"Live":"Paused"}</button></div></header>
     {error&&<div className="error">{error}</div>}
-    {tab==="builds"&&<><section className="kpis"><Kpi label="Builds recorded" value={String(builds.length)} foot={project||"All projects"}/><Kpi label="Average duration" value={seconds(avg)} foot="Recent saved builds"/><Kpi label="Median / p95" value={percentiles?.enough_history?`${seconds(percentiles.p50)} / ${seconds(percentiles.p95)}`:"—"} foot={percentiles?.enough_history?`Over ${percentiles.builds} builds`:`Needs 5+ builds (${percentiles?.builds||0})`}/><Kpi label="Failed builds" value={canCountFailures?String(failures):"—"} foot={statusNote} tone={knowsStatus&&failures?"bad":undefined}/></section>
+    {tab==="builds"&&<><section className="kpis"><Kpi icon={ICONS.layers} tone="blue" label="Builds recorded" value={String(builds.length)} foot={project||"All projects"}/><Kpi icon={ICONS.clock} tone="" label="Average duration" value={seconds(avg)} foot="Recent saved builds"/><Kpi icon={ICONS.gauge} tone="violet" label="Median / p95" value={percentiles?.enough_history?`${seconds(percentiles.p50)} / ${seconds(percentiles.p95)}`:"—"} foot={percentiles?.enough_history?`Over ${percentiles.builds} builds`:`Needs 5+ builds (${percentiles?.builds||0})`}/><Kpi icon={ICONS.alert} tone={knowsStatus&&failures?"bad":"ok"} label="Failed builds" value={canCountFailures?String(failures):"—"} foot={statusNote} valueTone={knowsStatus&&failures?"bad":undefined}/></section>
 
-    <section className="workspace"><div className="panel trend-panel"><div className="panel-head"><div><h2>Duration trend</h2><p>Recent builds · select a row below for the full breakdown</p></div><span className="metric">Latest <b>{seconds(latest?.total_seconds)}</b></span></div><div className="chart"><Sparkline items={trend}/></div><div className="chart-foot"><span>Older</span><span className="legend"><i/> build duration</span><span>Latest</span></div></div>
-      <div className="panel attention"><div className="panel-head"><div><h2>Needs attention</h2><p>Signals from the current scope</p></div></div>
-        <div className="attention-row"><strong className={canCountFailures?(failures?"red":"green"):""}>{canCountFailures?failures:"—"}</strong><span>failed builds<br/><small>{canCountFailures?(failures?"Open the latest failure":"Everything is green"):"Not recorded by this backend"}</small></span></div>
-        <div className="attention-row"><strong className={regressions.length?"red":"green"}>{regressions.length}</strong><span>slower targets<br/><small>{regressions.length?`${regressions[0].name} +${seconds(regressions[0].delta_seconds)}`:"No target trending slower"}</small></span></div>
-        <div className="attention-row"><strong className={flaky.filter(f=>f.flaky).length?"red":"green"}>{flaky.filter(f=>f.flaky).length}</strong><span>flaky tests<br/><small>{flaky.filter(f=>f.flaky).length?"Passing and failing across builds":"No mixed test outcomes"}</small></span></div>
+    <section className="workspace"><div className="panel trend-panel"><div className="panel-head"><div><h2>Duration trend</h2><p>Recent builds · select a row below for the full breakdown</p></div><button className="panel-action" onClick={()=>openTab("trends")}>Open Performance <Icon d={ICONS.arrow} size={15}/></button></div><div className="chart"><Sparkline items={trend}/></div><div className="chart-foot"><span>Older</span><span className="legend"><i/> build duration · latest {seconds(latest?.total_seconds)}</span><span>Latest</span></div></div>
+      <div className="panel attention"><div className="panel-head"><div><h2>Needs attention</h2><p>Signals from the current scope</p></div><button className="panel-action" onClick={()=>openTab("diagnostics")}>View Health <Icon d={ICONS.arrow} size={15}/></button></div>
+        <Attention icon={ICONS.alert} count={canCountFailures?failures:"—"} label="failed builds" tone={canCountFailures?(failures?"bad":"ok"):"warn"}
+                   note={canCountFailures?(failures?"Open the latest failure":"Everything is green"):"Not recorded by this backend"}/>
+        <Attention icon={ICONS.trends} count={regressions.length} label="slower targets" tone={regressions.length?"warn":"ok"}
+                   note={regressions.length?`${regressions[0].name} +${seconds(regressions[0].delta_seconds)}`:"No target trending slower"}/>
+        <Attention icon={ICONS.health} count={flaky.filter(f=>f.flaky).length} label="flaky tests" tone={flaky.filter(f=>f.flaky).length?"bad":"ok"}
+                   note={flaky.filter(f=>f.flaky).length?"Passing and failing across builds":"No mixed test outcomes"}/>
       </div></section></>}
 
     {tab==="trends"&&<section className="insights">
@@ -410,5 +464,22 @@ function Overview({tab}:{tab:TabId}) {
     <footer>{status==="loading"?"Refreshing data…":updatedAt?`Updated ${new Date(updatedAt).toLocaleTimeString()}`:""}<span>BuildLens · local-first build observability</span></footer>
   </main></div>;
 }
-function Kpi({label,value,foot,tone=""}:{label:string;value:string;foot:string;tone?:string}){return <div className="kpi"><span>{label}</span><strong className={tone}>{value}</strong><small>{foot}</small></div>}
+/// A KPI tile: accent-tinted icon, value, and a context line beneath.
+///
+/// `tone` colours the icon tile so four tiles in a row read as four distinct
+/// metrics rather than one repeated card. `valueTone` is separate because a
+/// tile can be red about its number (failed builds) while keeping its own
+/// identity colour, and `undefined` must leave the value in the default ink.
+function Kpi({label,value,foot,icon,tone="",valueTone=""}:{label:string;value:string;foot:string;icon:string;tone?:string;valueTone?:string}){
+  return <div className={`kpi${tone?` t-${tone}`:""}`}><span className="kpi-icon"><Icon d={icon} size={19}/></span><span>{label}</span><strong className={valueTone}>{value}</strong><small title={foot}>{foot}</small></div>;
+}
+
+/// One row of the attention panel: a tinted icon chip, the count with what it
+/// counts, and a line saying what to do about it.
+///
+/// The chip carries an icon rather than the number — the number is already in
+/// the label, and repeating it made the row read as "2 · 2 failed builds".
+function Attention({icon,count,label,note,tone}:{icon:string;count:React.ReactNode;label:string;note:string;tone:string}){
+  return <div className={`attention-row ${tone}`}><span className="att-chip"><Icon d={icon} size={17}/></span><span className="att-text"><b>{count} {label}</b><small title={note}>{note}</small></span></div>;
+}
 createRoot(document.getElementById("root")!).render(<StrictMode><App/></StrictMode>);

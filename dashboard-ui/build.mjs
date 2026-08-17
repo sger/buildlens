@@ -6,9 +6,13 @@
 // `--check` exists because the output is committed: editing main.tsx without
 // rebuilding leaves a stale UI that still compiles and still passes every test.
 import { build } from "esbuild";
+import { execFile } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+
+const run = promisify(execFile);
 
 // Resolve against this file rather than the shell's cwd, so `node
 // dashboard-ui/build.mjs` works from the repo root as well as from here.
@@ -16,7 +20,19 @@ const here = dirname(fileURLToPath(import.meta.url));
 const src = (...parts) => join(here, "src", ...parts);
 
 const result = await build({ entryPoints: [src("main.tsx")], bundle: true, minify: true, format: "iife", write: false, jsx: "automatic" });
-const css = await readFile(src("styles.css"), "utf8");
+
+// Tailwind compiles src/styles.css — its `@theme` tokens, `@layer components`
+// classes and every utility main.tsx actually uses — into the stylesheet
+// inlined below. Only used classes are emitted, so the output stays small.
+//
+// `--cwd here` pins the scan root to this directory: Tailwind resolves
+// `@source` relative to it, and a cwd-dependent scan would emit different CSS
+// depending on where the command was run, which the byte-for-byte `--check`
+// would then report as spurious drift.
+const cssOut = join(here, "node_modules", ".cache", "buildlens-tailwind.css");
+const tailwind = join(here, "node_modules", ".bin", "tailwindcss");
+await run(tailwind, ["--input", src("styles.css"), "--output", cssOut, "--cwd", here, "--minify"]);
+const css = await readFile(cssOut, "utf8");
 const js = result.outputFiles[0].text;
 // A generated file that lives in the Rust tree needs to say so: without this
 // the first instinct on seeing a 224KB index.html is to edit it, and the next

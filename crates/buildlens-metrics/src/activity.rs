@@ -4,7 +4,7 @@ use buildlens_core::{
     MetricsSourceKind, PhaseMetric, SwiftTimingKind, SwiftTimingMetric, TargetMetric,
 };
 use regex::Regex;
-use std::sync::OnceLock;
+use std::{collections::HashMap, sync::OnceLock};
 
 /// Caps applied unless the caller asked for full detail.
 const MAX_STEPS_PER_TARGET: usize = 20;
@@ -43,8 +43,69 @@ pub fn map(log: &IdeActivityLog, warnings: Vec<String>, options: &MapOptions) ->
     metrics.environment.sdk = log.toolchain.sdk.clone();
     metrics.environment.architecture = log.toolchain.architecture.clone();
     collect(main, None, &mut metrics);
+    // Xcode 26 stopped wrapping steps in a section per target: the steps are
+    // flat siblings of the root, so the walk above finds no targets at all and
+    // every per-target and per-file number comes out empty. Rebuilding the
+    // targets from the steps themselves recovers them without assuming any
+    // particular nesting.
+    if metrics.targets.is_empty() {
+        collect_targets_from_steps(main, &mut metrics);
+    }
     finish(&mut metrics, options);
     metrics
+}
+
+/// Groups steps into targets by the target each step names.
+///
+/// The fallback for logs with no target wrapper sections. Targets keep the
+/// order in which their first step appears, so the output is deterministic
+/// rather than dependent on hash iteration order, and each target's span is
+/// derived from its steps: the earliest start to the latest end.
+fn collect_targets_from_steps(main: &IdeSection, metrics: &mut BuildMetrics) {
+    let mut steps: Vec<(String, &IdeSection)> = Vec::new();
+    tagged_steps(main, &mut steps);
+    let mut order: Vec<String> = Vec::new();
+    let mut grouped: HashMap<String, Vec<&IdeSection>> = HashMap::new();
+    for (target, section) in steps {
+        if !grouped.contains_key(&target) {
+            order.push(target.clone());
+        }
+        grouped.entry(target).or_default().push(section);
+    }
+    for name in order {
+        let sections = &grouped[&name];
+        let mut target = TargetMetric {
+            fingerprint: format!("target:{name}"),
+            name: name.clone(),
+            seconds: 0.0,
+            started_at: None,
+            ended_at: None,
+            // A target is only "from cache" if every one of its steps was, which
+            // matches how the nested path reads the target section's own flag.
+            fetched_from_cache: !sections.is_empty()
+                && sections.iter().all(|step| step.was_fetched_from_cache),
+            category: BuildCategory::Unknown,
+            compiled_count: 0,
+            steps: vec![],
+        };
+        // Without a wrapper section there is no recorded target duration, so it
+        // is spanned from the steps. Wall-clock start-to-end, not the sum: steps
+        // run concurrently, and summing them reports a target as taking several
+        // times longer than the build that contains it.
+        let starts = sections.iter().filter_map(|step| step.time_started);
+        let ends = sections.iter().filter_map(|step| step.time_stopped);
+        let start = starts.fold(f64::INFINITY, f64::min);
+        let end = ends.fold(f64::NEG_INFINITY, f64::max);
+        if start.is_finite() && end.is_finite() && end >= start {
+            target.seconds = end - start;
+            target.started_at = Some(cf_to_unix(start));
+            target.ended_at = Some(cf_to_unix(end));
+        }
+        for section in sections {
+            collect_step(section, &name, &mut target, metrics);
+        }
+        metrics.targets.push(target);
+    }
 }
 
 /// The scheme and destination Xcode recorded for this build.
@@ -105,6 +166,11 @@ fn duration(section: &IdeSection) -> Option<f64> {
     }
 }
 
+/// The target a *wrapper section* introduces, for logs that nest steps under
+/// one section per target.
+///
+/// Only Xcode's own section titles are matched here; the target a build *step*
+/// belongs to comes from [`step_target`] instead.
 fn target_name(section: &IdeSection) -> Option<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE
@@ -114,6 +180,46 @@ fn target_name(section: &IdeSection) -> Option<String> {
         .get(1)
         .or_else(|| captures.get(2))
         .map(|name| name.as_str().to_owned())
+}
+
+/// The target a build step declares in its signature.
+///
+/// Xcode tags task signatures with `(in target 'Name' from project 'Other')`,
+/// optionally followed by ` at path '...'`. This is what makes target
+/// attribution independent of how the log is *shaped*: Xcode 16 and earlier
+/// nest steps under a "Build target X" section, Xcode 26 emits them as flat
+/// siblings of the root with no wrapper at all, and both spell the target the
+/// same way here. Xcode 16 logs carry the tag on every step as well, so one
+/// rule covers both rather than one rule per Xcode release.
+///
+/// The name is quoted, so it is read up to the closing quote rather than to
+/// whitespace: target names may contain spaces.
+fn step_target(section: &IdeSection) -> Option<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\(in target '([^']+)'").expect("valid regex"));
+    // The signature is where Xcode puts the tag; the title is checked too
+    // because a few step kinds carry it there and nowhere else.
+    re.captures(&section.signature)
+        .or_else(|| re.captures(&section.title))
+        .map(|captures| captures[1].to_owned())
+}
+
+/// Every step under `section`, paired with the target it names.
+///
+/// Used for logs that have no target wrapper sections: the tree is walked in
+/// full and each step is attributed to the target its signature declares.
+/// Descent continues through untagged sections so a tagged step nested under
+/// one is still found.
+fn tagged_steps<'log>(section: &'log IdeSection, found: &mut Vec<(String, &'log IdeSection)>) {
+    for sub in &section.sub_sections {
+        match step_target(sub) {
+            // A tagged step owns its whole subtree: `collect_steps` recurses
+            // into children itself, so descending here as well would record
+            // every nested step twice.
+            Some(target) => found.push((target, sub)),
+            None => tagged_steps(sub, found),
+        }
+    }
 }
 
 fn collect(section: &IdeSection, current_target: Option<&str>, metrics: &mut BuildMetrics) {
@@ -158,6 +264,23 @@ fn collect_steps(
     metrics: &mut BuildMetrics,
 ) {
     for sub in &section.sub_sections {
+        collect_step(sub, target, target_metric, metrics);
+    }
+}
+
+/// Records one build step against `target`, then recurses into its children.
+///
+/// Split out of [`collect_steps`] so the flat-log path can record a step it
+/// located itself. Both paths must produce identical steps, files and
+/// diagnostics for the same section — sharing this function is what guarantees
+/// that, rather than two copies drifting apart.
+fn collect_step(
+    sub: &IdeSection,
+    target: &str,
+    target_metric: &mut TargetMetric,
+    metrics: &mut BuildMetrics,
+) {
+    {
         let step_type = classify_step(sub);
         let file = step_file(sub);
         let seconds = duration(sub).unwrap_or(0.0);
@@ -562,7 +685,10 @@ mod tests {
             subtitle: "Scheme OnlyScheme | Destination My Mac".into(),
             ..Default::default()
         });
-        assert_eq!(scheme_and_destination(&main).0.as_deref(), Some("OnlyScheme"));
+        assert_eq!(
+            scheme_and_destination(&main).0.as_deref(),
+            Some("OnlyScheme")
+        );
     }
 
     /// A log that never names a scheme reports none rather than an empty
@@ -571,7 +697,10 @@ mod tests {
     fn a_log_without_a_scheme_reports_none() {
         assert_eq!(scheme_and_destination(&IdeSection::default()), (None, None));
         let mut main = IdeSection::default();
-        main.sub_sections.push(IdeSection { subtitle: "Prepare build".into(), ..Default::default() });
+        main.sub_sections.push(IdeSection {
+            subtitle: "Prepare build".into(),
+            ..Default::default()
+        });
         assert_eq!(scheme_and_destination(&main), (None, None));
     }
 
@@ -691,6 +820,220 @@ mod tests {
 
     fn category_of(log: &IdeActivityLog) -> BuildCategory {
         map(log, vec![], &MapOptions { full_detail: false }).category
+    }
+
+    /// A step as Xcode 26 emits it: no target wrapper, the target named in the
+    /// signature's `(in target '...')` tag.
+    fn flat_step(title: &str, signature: &str, target: &str, start: f64, stop: f64) -> IdeSection {
+        IdeSection {
+            title: title.to_owned(),
+            signature: format!("{signature} (in target '{target}' from project 'P')"),
+            time_started: Some(start),
+            time_stopped: Some(stop),
+            ..Default::default()
+        }
+    }
+
+    /// Xcode 26 stopped wrapping build steps in a section per target: they are
+    /// flat siblings of the root. The whole per-target and per-file half of the
+    /// dashboard read as empty, and the build's category fell back to
+    /// "unknown", because the walk found no target sections to descend into.
+    #[test]
+    fn targets_are_recovered_from_flat_steps_without_wrapper_sections() {
+        let log = build(vec![
+            flat_step(
+                "Compile A.swift (arm64)",
+                "SwiftCompile normal arm64 /src/A.swift",
+                "Alpha",
+                0.0,
+                3.0,
+            ),
+            flat_step(
+                "Compile B.swift (arm64)",
+                "SwiftCompile normal arm64 /src/B.swift",
+                "Beta",
+                1.0,
+                2.0,
+            ),
+            flat_step(
+                "Compile C.swift (arm64)",
+                "SwiftCompile normal arm64 /src/C.swift",
+                "Alpha",
+                3.0,
+                7.0,
+            ),
+        ]);
+        let metrics = map(&log, vec![], &MapOptions { full_detail: true });
+        let names: Vec<&str> = metrics
+            .targets
+            .iter()
+            .map(|target| target.name.as_str())
+            .collect();
+        // Grouped by name, in the order each target's first step appeared.
+        assert_eq!(names, vec!["Alpha", "Beta"]);
+        assert_eq!(metrics.targets[0].steps.len(), 2);
+        assert_eq!(metrics.targets[1].steps.len(), 1);
+        // Files must be attributed to the target that compiled them. Sorted
+        // here because the file list is ranked by duration, not input order.
+        let mut alpha_files: Vec<&str> = metrics
+            .files
+            .iter()
+            .filter(|file| file.target.as_deref() == Some("Alpha"))
+            .map(|file| file.file.as_str())
+            .collect();
+        alpha_files.sort_unstable();
+        assert_eq!(alpha_files, vec!["/src/A.swift", "/src/C.swift"]);
+        assert_eq!(
+            metrics
+                .files
+                .iter()
+                .filter(|file| file.target.as_deref() == Some("Beta"))
+                .count(),
+            1
+        );
+        // And a build with real targets is no longer "unknown".
+        assert_eq!(metrics.category, BuildCategory::Clean);
+    }
+
+    /// A target's duration spans its steps rather than summing them: steps run
+    /// concurrently, and a sum reports a target as taking longer than the
+    /// build that contains it.
+    #[test]
+    fn a_flat_targets_duration_spans_its_steps_rather_than_summing_them() {
+        let log = build(vec![
+            flat_step(
+                "Compile A",
+                "SwiftCompile normal arm64 /src/A.swift",
+                "T",
+                2.0,
+                6.0,
+            ),
+            flat_step(
+                "Compile B",
+                "SwiftCompile normal arm64 /src/B.swift",
+                "T",
+                3.0,
+                5.0,
+            ),
+        ]);
+        let metrics = map(&log, vec![], &MapOptions { full_detail: true });
+        assert_eq!(metrics.targets.len(), 1);
+        // 2.0 -> 6.0 wall clock, not 4.0 + 2.0 summed.
+        assert!((metrics.targets[0].seconds - 4.0).abs() < f64::EPSILON);
+    }
+
+    /// Xcode 16 logs carry the `(in target '...')` tag on their steps *and*
+    /// nest them under "Build target X" sections. The wrapper must keep
+    /// winning, or every existing log would regroup and change shape.
+    #[test]
+    fn wrapper_sections_take_precedence_over_step_tags() {
+        let mut nested = step("Compile A.swift", false);
+        nested.signature =
+            "SwiftCompile normal arm64 /src/A.swift (in target 'Inner' from project 'P')".into();
+        let log = build(vec![target("Outer", vec![nested])]);
+        let metrics = map(&log, vec![], &MapOptions { full_detail: true });
+        assert_eq!(metrics.targets.len(), 1);
+        assert_eq!(metrics.targets[0].name, "Outer");
+    }
+
+    /// A tagged step owns its subtree. Descending into it as well as recording
+    /// it would count every nested step twice.
+    #[test]
+    fn steps_nested_under_a_tagged_step_are_not_counted_twice() {
+        let mut parent = flat_step(
+            "Compiling A.swift",
+            "SwiftCompile normal arm64 Compiling A.swift",
+            "T",
+            0.0,
+            4.0,
+        );
+        let mut child = flat_step(
+            "Compile A.swift (arm64)",
+            "SwiftCompile normal arm64 /src/A.swift",
+            "T",
+            0.0,
+            4.0,
+        );
+        child.sub_sections = vec![];
+        parent.sub_sections = vec![child];
+        let log = build(vec![parent]);
+        let metrics = map(&log, vec![], &MapOptions { full_detail: true });
+        assert_eq!(metrics.targets.len(), 1);
+        // Parent plus its one child, recorded once each.
+        assert_eq!(metrics.targets[0].steps.len(), 2);
+        assert_eq!(
+            metrics
+                .files
+                .iter()
+                .filter(|file| file.file == "/src/A.swift")
+                .count(),
+            1
+        );
+    }
+
+    /// Target names may contain spaces, so the quoted name is read to its
+    /// closing quote rather than to the next whitespace.
+    #[test]
+    fn a_target_name_containing_spaces_is_read_whole() {
+        let section = flat_step(
+            "Compile A.swift",
+            "SwiftCompile normal arm64 /src/A.swift",
+            "My App Extension",
+            0.0,
+            1.0,
+        );
+        assert_eq!(step_target(&section).as_deref(), Some("My App Extension"));
+    }
+
+    /// Steps that name no target must not invent one, and must not stop the
+    /// walk from reaching tagged steps nested beneath them.
+    #[test]
+    fn untagged_steps_are_skipped_but_still_descended_into() {
+        assert_eq!(step_target(&step("CreateBuildDirectory", false)), None);
+        let mut untagged = step("Create build description", false);
+        untagged.sub_sections = vec![flat_step(
+            "Compile A.swift",
+            "SwiftCompile normal arm64 /src/A.swift",
+            "Buried",
+            0.0,
+            1.0,
+        )];
+        let log = build(vec![untagged]);
+        let metrics = map(&log, vec![], &MapOptions { full_detail: true });
+        assert_eq!(metrics.targets.len(), 1);
+        assert_eq!(metrics.targets[0].name, "Buried");
+    }
+
+    /// A flat target is only "from cache" when every one of its steps was,
+    /// matching how the nested path reads the target section's own flag.
+    #[test]
+    fn a_flat_target_is_cached_only_when_all_of_its_steps_are() {
+        let cached = |target: &str, cached: bool| {
+            let mut section = flat_step(
+                "Compile X.swift",
+                "SwiftCompile normal arm64 /src/X.swift",
+                target,
+                0.0,
+                1.0,
+            );
+            section.was_fetched_from_cache = cached;
+            section
+        };
+        let log = build(vec![
+            cached("AllCached", true),
+            cached("Mixed", true),
+            cached("Mixed", false),
+        ]);
+        let metrics = map(&log, vec![], &MapOptions { full_detail: true });
+        let by_name = |name: &str| {
+            metrics
+                .targets
+                .iter()
+                .find(|target| target.name == name)
+                .expect("target")
+        };
+        assert!(by_name("AllCached").fetched_from_cache);
+        assert!(!by_name("Mixed").fetched_from_cache);
     }
 
     /// A file compiled for two architectures must stay two rows. Collapsing
