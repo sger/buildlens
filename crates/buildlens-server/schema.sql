@@ -8,8 +8,17 @@
 -- partitions are created here: until per-day partitions are added, every row
 -- lands in the default and neither benefit applies.
 --
--- This file documents the schema; it is not executed. `store.rs::migrate` is
--- what actually runs, and the two must be kept in step.
+-- This file IS executed, by both `buildlens_server::store::migrate` and
+-- `buildlens_storage::PostgresStore::migrate`, which `include_str!` it. One
+-- definition means the two cannot disagree about what a BuildLens database
+-- contains.
+--
+-- Everything here is the *baseline*: statements that are safe to re-run
+-- unconditionally, because each is `IF NOT EXISTS`. Changes that cannot be
+-- expressed that way — dropping a constraint, rewriting a primary key,
+-- backfilling a column — belong in `migrations.sql` instead, which runs after
+-- this file and records what it has already applied. Adding such a change
+-- here would either fail on the second startup or silently skip on the first.
 CREATE TABLE IF NOT EXISTS builds (build_key TEXT NOT NULL, day DATE NOT NULL, project TEXT NOT NULL, category TEXT NOT NULL, total_seconds DOUBLE PRECISION NOT NULL, compiled_count INTEGER NOT NULL, cache_hit_rate DOUBLE PRECISION, started_at DOUBLE PRECISION, machine_id TEXT, xcode_version TEXT, platform TEXT, architecture TEXT, received_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (day, build_key)) PARTITION BY RANGE (day);
 CREATE TABLE IF NOT EXISTS builds_default PARTITION OF builds DEFAULT;
 CREATE TABLE IF NOT EXISTS build_targets (day DATE NOT NULL, build_key TEXT NOT NULL, name TEXT NOT NULL, seconds DOUBLE PRECISION NOT NULL, category TEXT NOT NULL, fetched_from_cache BOOLEAN NOT NULL, compiled_count INTEGER NOT NULL, PRIMARY KEY (day, build_key, name)) PARTITION BY RANGE (day);
@@ -24,9 +33,12 @@ CREATE INDEX IF NOT EXISTS idx_targets_name ON build_targets (name);
 -- CREATE TABLE IF NOT EXISTS silently skips a changed column list.
 ALTER TABLE builds ADD COLUMN IF NOT EXISTS error_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE builds ADD COLUMN IF NOT EXISTS warning_count INTEGER NOT NULL DEFAULT 0;
--- Nullable: a text log states no verdict, and NULL must read as unknown
--- rather than as success.
+-- Xcode's own verdict. Nullable: a text log states no verdict, and NULL must
+-- read as unknown rather than as success.
 ALTER TABLE builds ADD COLUMN IF NOT EXISTS status TEXT;
+-- The scheme a build ran, from the activity log's preparation section. Absent
+-- for text logs, which never name one.
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS scheme TEXT;
 
 
 -- Local-only detail below. A team server never receives these rows: source
@@ -52,6 +64,11 @@ CREATE TABLE IF NOT EXISTS build_diagnostics (day DATE NOT NULL, build_key TEXT 
 CREATE TABLE IF NOT EXISTS build_diagnostics_default PARTITION OF build_diagnostics DEFAULT;
 
 -- Test results, so flaky and repeatedly-failing tests are visible over time.
+--
+-- The `attempt` column and its place in the primary key are added by migration
+-- 0002 rather than declared here, so that a database created before that
+-- migration and one created after it end up with the same key. A fresh
+-- database gets this CREATE and then immediately the migration.
 CREATE TABLE IF NOT EXISTS build_tests (day DATE NOT NULL, build_key TEXT NOT NULL, suite TEXT NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL, seconds DOUBLE PRECISION, message TEXT, PRIMARY KEY (day, build_key, suite, name)) PARTITION BY RANGE (day);
 CREATE TABLE IF NOT EXISTS build_tests_default PARTITION OF build_tests DEFAULT;
 
@@ -59,18 +76,6 @@ CREATE TABLE IF NOT EXISTS build_tests_default PARTITION OF build_tests DEFAULT;
 -- user tags) as key/value pairs, mirroring the local plugin namespaces.
 CREATE TABLE IF NOT EXISTS build_metadata (day DATE NOT NULL, build_key TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (day, build_key, key)) PARTITION BY RANGE (day);
 CREATE TABLE IF NOT EXISTS build_metadata_default PARTITION OF build_metadata DEFAULT;
-
--- Added after the first release, so this runs as an ALTER rather than living
--- in the CREATE above: existing databases already have the table, and
--- CREATE TABLE IF NOT EXISTS would silently skip a changed column list.
-ALTER TABLE builds ADD COLUMN IF NOT EXISTS error_count INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE builds ADD COLUMN IF NOT EXISTS warning_count INTEGER NOT NULL DEFAULT 0;
--- Xcode's own verdict. Nullable: a text log never states one, and NULL must
--- read as unknown rather than as success.
-ALTER TABLE builds ADD COLUMN IF NOT EXISTS status TEXT;
--- The scheme a build ran, from the activity log's preparation section. Absent
--- for text logs, which never name one.
-ALTER TABLE builds ADD COLUMN IF NOT EXISTS scheme TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_files_file ON build_files (file);
 CREATE INDEX IF NOT EXISTS idx_swift_file ON build_swift_timings (file);

@@ -104,6 +104,37 @@ pub fn list_activity_logs(root: &Path, project: Option<&str>) -> Result<Vec<Path
     Ok(logs)
 }
 
+/// The `<Project>-<hash>` directories under `root` that could hold test
+/// results.
+///
+/// Separate from [`collect_candidates`], which resolves down to `Logs/Build`
+/// directories: test results live beside those in `Logs/Test`, so the caller
+/// needs the project root rather than the build-log directory. Applies the
+/// same `--match-project` prefix filter, so a watcher scoped to one project
+/// does not attach another's results.
+///
+/// `root` may be DerivedData itself or a single project directory; both are
+/// accepted, matching how every other entry point here treats it.
+pub fn list_project_dirs(root: &Path, project: Option<&str>) -> Result<Vec<PathBuf>> {
+    // A directory that holds its own Logs is one project, not a DerivedData.
+    if root.join("Logs").is_dir() {
+        return Ok(vec![root.to_path_buf()]);
+    }
+    Ok(std::fs::read_dir(root)
+        .with_context(|| format!("cannot read {}", root.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && project.is_none_or(|prefix| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(prefix))
+                })
+        })
+        .collect())
+}
+
 /// Every build activity log under `root`, newest first; an empty result is an
 /// error, which is what the one-shot commands want.
 pub fn find_activity_logs(root: &Path, project: Option<&str>) -> Result<Vec<PathBuf>> {

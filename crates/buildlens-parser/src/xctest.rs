@@ -12,6 +12,18 @@ fn re() -> &'static Vec<Regex> {
             r"Test Case '(?:-\[)?([^\]\s]+)[\s\]]+([^'\]]+)\]?' started",
             r"Test Case '(?:-\[)?([^\]\s]+)[\s\]]+([^'\]]+)\]?' (passed|failed) \(([0-9.]+) seconds?\)",
             r"([0-9]+(?:\.[0-9]+)?)\s+elapsed",
+            // Xcode 16+ prints XCTest results in a second form:
+            // `Test case 'FlakyTests.testThing()' failed on 'Clone 1 of
+            // iPhone 17 Pro - App (12345)' (0.004 seconds)`. Lowercase "case",
+            // suite and test joined by a dot, and an optional destination
+            // clause before the duration.
+            //
+            // This must be matched as XCTest. It is close enough to Swift
+            // Testing's `Test 'name' passed (0.1 seconds)` that the Swift
+            // pattern claimed it, filing every XCTest in the run under a suite
+            // literally named "SwiftTesting" with the class folded into the
+            // test name.
+            r"Test case '([^'.]+)\.([^']+)' (passed|failed)(?: on '[^']*')?(?: \(([0-9.]+) seconds?\))?",
         ]
         .into_iter()
         .map(|p| Regex::new(p).unwrap())
@@ -23,19 +35,28 @@ pub fn started(l: &str) -> Option<String> {
     Some(format!("{}:{}", &c[1], c[2].trim()))
 }
 pub fn result(l: &str) -> Option<TestResult> {
-    let c = re()[1].captures(l)?;
-    let status = if &c[3] == "passed" {
+    // The bracketed form first, then Xcode 16+'s dotted one. Both are XCTest,
+    // and a line matches at most one, so the order is for predictability
+    // rather than correctness.
+    let (c, status_group, duration_group) = match re()[1].captures(l) {
+        Some(c) => (c, 3, 4),
+        None => (re()[3].captures(l)?, 3, 4),
+    };
+    let status = if &c[status_group] == "passed" {
         TestStatus::Passed
     } else {
         TestStatus::Failed
     };
+    let suite = c[1].trim();
+    let test = c[2].trim();
     let fp = matches!(status, TestStatus::Failed)
-        .then(|| format!("XCTEST:{}:{}", &c[1], c[2].trim().to_lowercase()));
+        .then(|| format!("XCTEST:{}:{}", suite, test.to_lowercase()));
     Some(TestResult {
-        suite: c[1].into(),
-        test: c[2].trim().into(),
+        suite: suite.into(),
+        test: test.into(),
         status,
-        duration_seconds: c[4].parse().ok(),
+        // Absent when Xcode names a destination but no duration.
+        duration_seconds: c.get(duration_group).and_then(|d| d.as_str().parse().ok()),
         message: None,
         fingerprint: fp,
     })
@@ -69,8 +90,13 @@ pub fn swift_testing_result(l: &str) -> Option<TestResult> {
 fn re_swift() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r"(?:Test|Test case) '([^']+)' (passed|failed)(?: \(([0-9.]+) seconds?\))?")
-            .unwrap()
+        // Only `Test 'name'`, never `Test case 'Suite.name'`. This used to
+        // accept both, which meant Xcode 16+'s XCTest lines were recorded as
+        // Swift Testing results under a suite named "SwiftTesting" — see the
+        // dotted pattern in `re()`, which now claims them. Swift Testing
+        // display names can contain dots and spaces, so the name itself stays
+        // unconstrained; it is the `case` keyword that distinguishes them.
+        Regex::new(r"Test '([^']+)' (passed|failed)(?: \(([0-9.]+) seconds?\))?").unwrap()
     })
 }
 pub fn crash(l: &str, test: Option<String>) -> Option<TestCrash> {
@@ -99,6 +125,49 @@ pub fn elapsed(l: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Xcode 16+ prints XCTest results as `Test case 'Suite.test()' failed on
+    /// 'Clone 1 of iPhone 17 Pro - App (12345)' (0.004 seconds)`. This was
+    /// matched by the Swift Testing pattern, which files everything under a
+    /// suite named "SwiftTesting" with the class folded into the test name.
+    #[test]
+    fn reads_the_dotted_form_xcode_16_prints() {
+        let line = "Test case 'FlakyTests.testFlakyNetworkCall()' failed on 'Clone 1 of iPhone 17 Pro - UnitTestsApp (78886)' (0.004 seconds)";
+        let result = result(line).expect("an XCTest result");
+        assert_eq!(result.suite, "FlakyTests", "the class, not \"SwiftTesting\"");
+        assert_eq!(result.test, "testFlakyNetworkCall()");
+        assert_eq!(result.status, TestStatus::Failed);
+        assert_eq!(result.duration_seconds, Some(0.004));
+    }
+
+    #[test]
+    fn the_dotted_form_parses_without_a_destination_clause() {
+        let result = result("Test case 'MySuite.testThing()' passed (0.5 seconds)").unwrap();
+        assert_eq!(result.suite, "MySuite");
+        assert_eq!(result.test, "testThing()");
+        assert_eq!(result.status, TestStatus::Passed);
+    }
+
+    /// Swift Testing prints `Test 'name' passed`, with no `case` keyword. It
+    /// must still parse, and must not be confused with the dotted XCTest form.
+    #[test]
+    fn swift_testing_lines_are_still_swift_testing() {
+        let swift = swift_testing_result("Test 'Feature loads' passed (0.42 seconds)").unwrap();
+        assert_eq!(swift.suite, "SwiftTesting");
+        assert_eq!(swift.test, "Feature loads");
+    }
+
+    /// The regression itself: an XCTest line must not be claimed by the Swift
+    /// Testing parser, whichever order a caller tries them in.
+    #[test]
+    fn the_swift_testing_pattern_no_longer_claims_xctest_lines() {
+        let line = "Test case 'FlakyTests.testAlwaysBroken()' failed on 'Clone 1 of iPhone 17 Pro' (0.004 seconds)";
+        assert!(
+            swift_testing_result(line).is_none(),
+            "Swift Testing must not match an XCTest line"
+        );
+        assert_eq!(result(line).unwrap().suite, "FlakyTests");
+    }
 
     #[test]
     fn reads_a_started_test() {

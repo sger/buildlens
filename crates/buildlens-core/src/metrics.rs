@@ -239,6 +239,31 @@ pub struct BuildMetrics {
 pub const METRICS_SCHEMA_VERSION: u32 = 2;
 
 impl BuildMetrics {
+    /// Whether this build produced a test bundle, and so is a build Xcode will
+    /// follow with a test run.
+    ///
+    /// The activity log names no action: ⌘B and ⌘U produce the same kind of
+    /// log, and nothing in it says "this was Test". What does distinguish them
+    /// is the product — a test build signs, touches and copies `.xctest`
+    /// bundles, and a plain build never mentions one. Measured on a real
+    /// project: 84 such steps for ⌘U, zero for ⌘B.
+    ///
+    /// This exists for the collector's timing problem. Xcode writes the build
+    /// log when the build finishes and the `.xcresult` only when the tests
+    /// finish afterwards — a minute later in one observed run — so a collector
+    /// that saves as soon as the log settles stores a test run with no tests.
+    /// Knowing a test run is coming is what lets it wait, and only then.
+    ///
+    /// Matched on the step title rather than a target's product type, which
+    /// the log does not carry. `.xctest` appears in titles like
+    /// `Sign UnitTestsAppTests.xctest`.
+    pub fn produces_test_bundle(&self) -> bool {
+        self.targets
+            .iter()
+            .flat_map(|target| target.steps.iter())
+            .any(|step| step.title.contains(".xctest"))
+    }
+
     /// An empty result of the given kind, carrying any warnings explaining why
     /// it is empty.
     ///
@@ -501,6 +526,62 @@ mod usability_tests {
         metrics.compiled_count = 12;
         assert!(!metrics.decoded_partially());
         assert!(metrics.is_usable());
+    }
+
+    fn with_step_titles(titles: &[&str]) -> BuildMetrics {
+        let mut metrics = BuildMetrics::empty(MetricsSourceKind::Xcactivitylog, Vec::new());
+        metrics.targets = vec![TargetMetric {
+            fingerprint: "f".into(),
+            name: "App".into(),
+            seconds: 1.0,
+            started_at: None,
+            ended_at: None,
+            fetched_from_cache: false,
+            category: BuildCategory::Clean,
+            compiled_count: 1,
+            steps: titles
+                .iter()
+                .map(|title| BuildStepMetric {
+                    fingerprint: "s".into(),
+                    step_type: "other".into(),
+                    title: (*title).into(),
+                    file: None,
+                    architecture: None,
+                    seconds: 0.1,
+                    started_at: None,
+                    ended_at: None,
+                    fetched_from_cache: false,
+                    warning_count: 0,
+                    error_count: 0,
+                })
+                .collect(),
+        }];
+        metrics
+    }
+
+    /// ⌘U and ⌘B produce the same kind of log and nothing in it names the
+    /// action, so the product is the signal: only a test build makes a
+    /// `.xctest` bundle. Titles here are the real ones from an Xcode 26 run.
+    #[test]
+    fn a_build_that_signs_a_test_bundle_expects_tests() {
+        let metrics = with_step_titles(&[
+            "Compile App.swift",
+            "Sign UnitTestsAppTests.xctest",
+            "Touch UnitTestsAppTests.xctest",
+        ]);
+        assert!(metrics.produces_test_bundle());
+    }
+
+    /// A plain build must not wait for results that will never arrive.
+    #[test]
+    fn an_ordinary_build_expects_no_tests() {
+        let metrics = with_step_titles(&["Compile App.swift", "Link App", "Copy Assets.car"]);
+        assert!(!metrics.produces_test_bundle());
+        assert!(
+            !BuildMetrics::empty(MetricsSourceKind::Xcactivitylog, Vec::new())
+                .produces_test_bundle(),
+            "a build with no steps at all expects nothing"
+        );
     }
 
     /// Evidence of compilation outranks the warning: a log that aborted near

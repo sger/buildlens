@@ -59,6 +59,21 @@ pub enum BuildStatus {
     Succeeded,
     Failed,
     Cancelled,
+    /// The compile succeeded and a test run is expected, but its results have
+    /// not arrived.
+    ///
+    /// Not a verdict Xcode ever states — BuildLens derives it. A ⌘U writes its
+    /// build log when the compile finishes and the `.xcresult` only when the
+    /// tests do, 70–92 seconds later on a measured project, so a test build is
+    /// necessarily stored before anything knows whether its suite was red.
+    /// Recording that interval as `Succeeded` made a build that was about to
+    /// go red read green, and — when results never arrived at all, because no
+    /// watcher was running or the run was interrupted — read green permanently.
+    ///
+    /// Resolves to [`BuildStatus::Failed`] or [`BuildStatus::Succeeded`] when
+    /// the results attach. A build left pending is one whose tests never
+    /// reported, which is worth seeing rather than rounding to success.
+    PendingTests,
 }
 
 impl BuildStatus {
@@ -70,6 +85,7 @@ impl BuildStatus {
             "succeeded" => Some(Self::Succeeded),
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
+            "pending_tests" => Some(Self::PendingTests),
             _ => None,
         }
     }
@@ -79,6 +95,7 @@ impl BuildStatus {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::PendingTests => "pending_tests",
         }
     }
 }
@@ -126,6 +143,21 @@ pub struct WirePhase {
 pub const MAX_FILES: usize = 500;
 pub const MAX_SWIFT_TIMINGS: usize = 500;
 pub const MAX_DIAGNOSTICS: usize = 500;
+
+/// Cap on transmitted test results.
+///
+/// Higher than the others because the unit is smaller — a `WireTest` is a few
+/// short strings, where a diagnostic carries a full message — and because a
+/// suite legitimately runs thousands of tests where it compiles hundreds of
+/// files. This field was uncapped until retries made it unbounded twice over:
+/// a test Xcode retries reports once per attempt, so a flaky suite under
+/// `-retry-tests-on-failure` multiplies rows against a payload the server
+/// refuses above 1 MiB.
+///
+/// Unlike files and timings, these are not ranked by cost before truncating.
+/// Failures are kept first: a truncated run must not drop the failing tests
+/// and leave a green-looking build, which is precisely backwards.
+pub const MAX_TESTS: usize = 2000;
 
 /// One file's compile time. `file` is a source path as the log recorded it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,8 +411,38 @@ impl WireBuild {
                 target: diagnostic.example.target.clone(),
             })
             .collect();
-        self.tests = tests
+        // A test that is not wholly successful — it failed, or a "started" row
+        // says it never reported and so crashed — comes first, so a run
+        // truncated by MAX_TESTS keeps the outcomes that explain the build
+        // rather than an arbitrary two thousand passes.
+        //
+        // Grouped by test rather than by row: every attempt of one test moves
+        // together, keeping the log's order within it. Splitting rows by status
+        // would tear a retried test apart, putting its failure in one group and
+        // its passing retry in the other — and since the receiver numbers
+        // attempts by arrival order, that would invert which run counts as
+        // final, turning a fail-then-pass into a pass-then-fail.
+        let mut order: Vec<(&str, &str)> = Vec::new();
+        for test in tests {
+            let key = (test.suite.as_str(), test.test.as_str());
+            if !order.contains(&key) {
+                order.push(key);
+            }
+        }
+        let unsuccessful: std::collections::HashSet<(&str, &str)> = tests
             .iter()
+            .filter(|test| test.status != crate::TestStatus::Passed)
+            .map(|test| (test.suite.as_str(), test.test.as_str()))
+            .collect();
+        order.sort_by_key(|key| !unsuccessful.contains(key));
+        self.tests = order
+            .into_iter()
+            .flat_map(|key| {
+                tests
+                    .iter()
+                    .filter(move |test| (test.suite.as_str(), test.test.as_str()) == key)
+            })
+            .take(MAX_TESTS)
             .map(|test| WireTest {
                 suite: test.suite.clone(),
                 name: test.test.clone(),
@@ -586,6 +648,79 @@ mod tests {
         assert!(text.contains("/Users/"), "the source path was rewritten");
         assert_eq!(build.files.len(), 1);
         assert_eq!(build.swift_timings.len(), 1);
+    }
+
+    fn test_result(suite: &str, name: &str, status: crate::TestStatus) -> crate::TestResult {
+        crate::TestResult {
+            suite: suite.into(),
+            test: name.into(),
+            status,
+            duration_seconds: Some(0.1),
+            message: None,
+            fingerprint: None,
+        }
+    }
+
+    fn with_tests(tests: &[crate::TestResult]) -> WireBuild {
+        WireBuild::from_metrics(&metrics(), "App", None, Attribution::Pseudonymous, 40)
+            .expect("a usable build")
+            .with_analysis(&[], tests, |_| "warning".into(), |_| "other".into())
+    }
+
+    /// An uncapped `tests` field is how a large suite under
+    /// `-retry-tests-on-failure` pushes a payload past the server's 1 MiB
+    /// limit: every attempt of every test is its own row.
+    #[test]
+    fn transmitted_tests_are_capped() {
+        let many: Vec<_> = (0..MAX_TESTS + 100)
+            .map(|i| test_result("S", &format!("t{i}"), crate::TestStatus::Passed))
+            .collect();
+        assert_eq!(with_tests(&many).tests.len(), MAX_TESTS);
+    }
+
+    /// Truncating must not drop the failures and leave a green-looking build.
+    #[test]
+    fn a_truncated_run_keeps_its_failures() {
+        let mut many: Vec<_> = (0..MAX_TESTS + 10)
+            .map(|i| test_result("S", &format!("pass{i}"), crate::TestStatus::Passed))
+            .collect();
+        // Last in the log, so only status ordering can save it.
+        many.push(test_result("S", "theFailure", crate::TestStatus::Failed));
+        let sent = with_tests(&many);
+        assert_eq!(sent.tests.len(), MAX_TESTS);
+        assert!(
+            sent.tests.iter().any(|test| test.name == "theFailure"),
+            "the failing test must survive truncation"
+        );
+        assert_eq!(sent.tests[0].name, "theFailure", "and it is ordered first");
+    }
+
+    /// A crashed test reports `started` and never an outcome. It is not a pass,
+    /// so it must be kept for the same reason a failure is.
+    #[test]
+    fn a_truncated_run_keeps_tests_that_never_reported() {
+        let mut many: Vec<_> = (0..MAX_TESTS + 10)
+            .map(|i| test_result("S", &format!("pass{i}"), crate::TestStatus::Passed))
+            .collect();
+        many.push(test_result("S", "theCrash", crate::TestStatus::Started));
+        assert!(with_tests(&many).tests.iter().any(|test| test.name == "theCrash"));
+    }
+
+    /// Every attempt of one test must stay together and in log order. Ordering
+    /// row-by-row would put a retried test's failure in the unsuccessful group
+    /// and its passing retry in the other, inverting which run the receiver
+    /// treats as final and reading a fail-then-pass as a pass-then-fail.
+    #[test]
+    fn retried_attempts_stay_together_and_in_order() {
+        let sent = with_tests(&[
+            test_result("S", "quiet", crate::TestStatus::Passed),
+            test_result("S", "flaky", crate::TestStatus::Failed),
+            test_result("S", "flaky", crate::TestStatus::Passed),
+        ]);
+        let names: Vec<_> = sent.tests.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["flaky", "flaky", "quiet"], "the retried test leads");
+        assert_eq!(sent.tests[0].status, "failed", "its first attempt stays first");
+        assert_eq!(sent.tests[1].status, "passed", "the retry stays second");
     }
 
     #[test]

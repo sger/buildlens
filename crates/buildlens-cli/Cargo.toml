@@ -23,6 +23,7 @@ buildlens-dashboard = { path = "../buildlens-dashboard" }
 buildlens-server = { path = "../buildlens-server" }
 buildlens-storage = { path = "../buildlens-storage" }
 buildlens-tests = { path = "../buildlens-tests" }
+buildlens-xcresult = { path = "../buildlens-xcresult" }
 clap.workspace = true
 flate2.workspace = true
 ureq.workspace = true

@@ -164,6 +164,9 @@
   .sev { @apply bg-warn-soft text-warn rounded-full px-2.5 py-[3px] text-[10.5px] font-bold uppercase tracking-[.03em] whitespace-nowrap mt-px; }
   .sev.bad { @apply bg-bad-soft text-bad; }
   .sev.ok { @apply bg-ok-soft text-ok; }
+  /* The base .sev is already warn-toned; naming it explicitly keeps a retried
+     test's badge from depending on that default staying warn. */
+  .sev.warn { @apply bg-warn-soft text-warn; }
   .meta-grid { @apply grid grid-cols-[repeat(auto-fit,minmax(210px,1fr))] gap-2.5 mt-3.5; }
   .meta-grid div { @apply bg-[#fafbfc] border border-[#f0f3f5] rounded-[10px] px-[13px] py-[11px] overflow-hidden; }
   .meta-grid span { @apply block text-faint text-[11px] mb-[3px]; }
@@ -173,6 +176,12 @@
   .mono { @apply font-mono text-xs; }
   .muted { @apply text-faint; }
   .warnpill { @apply text-warn; }
+  /* `.red` was used in the build table before it was ever defined here, so
+     failing counts rendered in body text. Defined now alongside its opposite,
+     which the Tests column uses to distinguish a green suite from a build that
+     ran no tests at all. */
+  .red { @apply text-bad font-semibold; }
+  .ok-text { @apply text-ok font-semibold; }
   .dirty { @apply text-warn not-italic font-medium; }
   .crumb { @apply text-muted no-underline hover:text-accent; }
   .empty, .empty-note { @apply text-faint text-xs py-3.5 leading-relaxed; }

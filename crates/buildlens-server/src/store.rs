@@ -17,6 +17,11 @@ pub enum ServerError {
     /// [`ServerError::Database`] because the cause is capacity, not a query.
     #[error("no database connection available: {0}")]
     Pool(#[from] r2d2::Error),
+    /// `migrations.sql` could not be parsed. A programming error rather than a
+    /// runtime one — the file is compiled in — so it surfaces at startup,
+    /// before any traffic, rather than leaving a migration quietly unapplied.
+    #[error("invalid migration definition: {0}")]
+    Migration(String),
 }
 
 /// A pool of Postgres connections shared by every worker thread.
@@ -57,14 +62,15 @@ pub fn pool(url: &str, size: u32) -> Result<Pool, ServerError> {
 /// added, every row lands in the default and neither benefit applies. The
 /// declaration is in place so adding them later needs no table rewrite.
 pub fn migrate(client: &mut Client) -> Result<(), ServerError> {
-    // Serialised against every other BuildLens process on this database:
-    // concurrent starts would run the same ALTER TABLEs and deadlock.
-    client.execute("SELECT pg_advisory_lock($1)", &[&0x6275_696c_i64])?;
-    let result = migrate_locked(client);
-    let unlock = client.execute("SELECT pg_advisory_unlock($1)", &[&0x6275_696c_i64]);
-    result?;
-    unlock?;
-    Ok(())
+    // Delegated to `buildlens-storage`, which owns the schema and the
+    // migration ledger. This function used to carry its own copy of the
+    // migration logic; two implementations of one schema is what let a server
+    // and a local collector disagree about what tables exist. The advisory
+    // lock and the versioned migrations both live there now.
+    buildlens_storage::migrate(client).map_err(|error| match error {
+        buildlens_storage::StoreError::Database(source) => ServerError::Database(source),
+        other => ServerError::Migration(other.to_string()),
+    })
 }
 
 /// Connects once and applies the schema. Used at startup and by tests.
@@ -74,17 +80,6 @@ pub fn connect_and_migrate(url: &str) -> Result<Client, ServerError> {
     Ok(client)
 }
 
-fn migrate_locked(client: &mut Client) -> Result<(), ServerError> {
-    // The canonical schema, shared with `buildlens-storage` rather than
-    // restated here. This function used to carry its own copy covering only
-    // builds, targets and phases, so a server that migrated a fresh database
-    // had no build_files, build_swift_timings, build_diagnostics or
-    // build_tests — and a pushed build carrying that detail hit "relation does
-    // not exist". One definition means the two cannot disagree about what a
-    // BuildLens database contains.
-    client.batch_execute(include_str!("../schema.sql"))?;
-    Ok(())
-}
 
 /// The query surface, over one connection borrowed from the [`Pool`] for the
 /// life of a single request.

@@ -7,6 +7,7 @@ members = [
     "crates/buildlens-metrics",
     "crates/buildlens-diagnostics",
     "crates/buildlens-tests",
+    "crates/buildlens-xcresult",
     "crates/buildlens-graph",
     "crates/buildlens-intel",
     "crates/buildlens-report",

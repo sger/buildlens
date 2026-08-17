@@ -12,7 +12,7 @@
 //! and a LIMIT, which compiles fine and fails only against Postgres.
 
 use buildlens_core::{
-    BuildAnalysis, BuildCategory, BuildMetrics, CacheMetrics, DiagnosticAggregate,
+    BuildAnalysis, BuildCategory, BuildMetrics, BuildStepMetric, CacheMetrics, DiagnosticAggregate,
     DiagnosticCategory, DiagnosticExample, DiagnosticSeverity, FileMetric, MetricsEnvironment,
     MetricsSourceKind, PhaseMetric, RegressionCaveat, RegressionConfidence, SwiftTimingKind,
     SwiftTimingMetric, TargetMetric, TestResult, TestStatus,
@@ -150,6 +150,25 @@ fn analysis(id: &str, seconds: f64, started_at: f64) -> BuildAnalysis {
     analysis.metadata.entries.insert("git.branch".into(), "main".into());
     analysis.metadata.entries.insert("git.commit".into(), "abc123".into());
     analysis
+}
+
+/// A step naming a `.xctest` product, which is what marks a build as one that
+/// will be followed by a test run. Real titles look like
+/// `Sign UnitTestsAppTests.xctest`.
+fn test_bundle_step() -> BuildStepMetric {
+    BuildStepMetric {
+        fingerprint: "sign".into(),
+        step_type: "other".into(),
+        title: "Sign AppTests.xctest".into(),
+        file: None,
+        architecture: None,
+        seconds: 0.1,
+        started_at: None,
+        ended_at: None,
+        fetched_from_cache: false,
+        warning_count: 0,
+        error_count: 0,
+    }
 }
 
 fn items(value: &serde_json::Value) -> &Vec<serde_json::Value> {
@@ -472,6 +491,264 @@ fn flaky_tests_separate_mixed_outcomes_from_always_failing() {
     assert_eq!(rows[0]["failed"], 1);
     assert_eq!(rows[0]["passed"], 1);
     assert_eq!(rows[0]["flaky"], true);
+}
+
+/// A ⌘U is two events on disk: Xcode writes the build log when the compile
+/// finishes and the `.xcresult` 70–92 seconds later when the tests do. So
+/// results always arrive after their build is stored, and must attach to a row
+/// that already exists — and correct its status when a test failed.
+#[test]
+fn test_results_attach_to_a_build_already_in_history() {
+    let Some(mut store) = connect("attach") else { return };
+    let mut build = analysis("at1", 30.0, 1_700_000_000.0);
+    // Stored as the collector stores it: a compile that succeeded, no tests.
+    build.tests.tests.clear();
+    if let Some(metrics) = build.metrics.as_mut() {
+        metrics.status = Some("succeeded".into());
+    }
+    store.save_analysis(&build, "Attach", None, false).unwrap();
+    assert_eq!(store.build_snapshot("at1").unwrap().unwrap()["status"], "succeeded");
+
+    let failing = buildlens_core::TestResult {
+        suite: "FlakyTests".into(),
+        test: "testAlwaysBroken()".into(),
+        status: TestStatus::Failed,
+        duration_seconds: Some(0.004),
+        message: Some("XCTFail".into()),
+        fingerprint: None,
+    };
+    let passing = buildlens_core::TestResult {
+        suite: "FlakyTests".into(),
+        test: "testStable()".into(),
+        status: TestStatus::Passed,
+        ..failing.clone()
+    };
+    let attached = store
+        .attach_tests("at1", &[(failing.clone(), 1), (passing, 1)])
+        .unwrap();
+    assert_eq!(attached, 2, "both results were new");
+
+    let snapshot = store.build_snapshot("at1").unwrap().unwrap();
+    assert_eq!(snapshot["status"], "failed", "a failing test fails the build");
+    assert_eq!(snapshot["test_totals"]["total"], 2);
+
+    // A watcher re-reading the same manifest must not double-count.
+    assert_eq!(
+        store.attach_tests("at1", &[(failing, 1)]).unwrap(),
+        0,
+        "attaching the same result twice inserts nothing"
+    );
+}
+
+/// A test build is stored pending, not succeeded: its results do not exist
+/// yet, and calling it green reads wrong for the ~90 seconds Xcode takes to
+/// write them — and permanently, if they never arrive.
+#[test]
+fn a_test_build_with_no_results_yet_is_pending_not_succeeded() {
+    let Some(mut store) = connect("pending") else { return };
+    let mut build = analysis("p1", 30.0, 1_700_000_000.0);
+    build.tests.tests.clear();
+    if let Some(metrics) = build.metrics.as_mut() {
+        metrics.status = Some("succeeded".into());
+        // What marks this a test build: it produced a .xctest bundle.
+        if let Some(target) = metrics.targets.first_mut() {
+            target.steps.push(test_bundle_step());
+        }
+    }
+    store.save_analysis(&build, "Pending", None, false).unwrap();
+    assert_eq!(store.build_snapshot("p1").unwrap().unwrap()["status"], "pending_tests");
+}
+
+/// A plain build compiles nothing testable and must not be left pending
+/// forever waiting for results that will never come.
+#[test]
+fn an_ordinary_build_is_never_left_pending() {
+    let Some(mut store) = connect("pending_plain") else { return };
+    let mut build = analysis("p2", 30.0, 1_700_000_000.0);
+    build.tests.tests.clear();
+    if let Some(metrics) = build.metrics.as_mut() {
+        metrics.status = Some("succeeded".into());
+    }
+    store.save_analysis(&build, "PendingPlain", None, false).unwrap();
+    assert_eq!(store.build_snapshot("p2").unwrap().unwrap()["status"], "succeeded");
+}
+
+/// Pending resolves both ways: green when the results are clean, red when they
+/// are not. A build stuck at pending is one whose tests never reported.
+#[test]
+fn attaching_passing_results_resolves_a_pending_build() {
+    let Some(mut store) = connect("pending_resolve") else { return };
+    let mut build = analysis("p3", 30.0, 1_700_000_000.0);
+    build.tests.tests.clear();
+    if let Some(metrics) = build.metrics.as_mut() {
+        metrics.status = Some("succeeded".into());
+        if let Some(target) = metrics.targets.first_mut() {
+            target.steps.push(test_bundle_step());
+        }
+    }
+    store.save_analysis(&build, "PendingResolve", None, false).unwrap();
+    assert_eq!(store.build_snapshot("p3").unwrap().unwrap()["status"], "pending_tests");
+
+    let passing = buildlens_core::TestResult {
+        suite: "S".into(),
+        test: "t()".into(),
+        status: TestStatus::Passed,
+        duration_seconds: Some(0.1),
+        message: None,
+        fingerprint: None,
+    };
+    store.attach_tests("p3", &[(passing, 1)]).unwrap();
+    assert_eq!(store.build_snapshot("p3").unwrap().unwrap()["status"], "succeeded");
+}
+
+/// Resolving a pending build must never overwrite a real verdict: a compile
+/// that failed stays failed however well its tests went.
+#[test]
+fn resolving_never_overwrites_a_failed_compile() {
+    let Some(mut store) = connect("pending_failed") else { return };
+    let mut build = analysis("p4", 30.0, 1_700_000_000.0);
+    build.tests.tests.clear();
+    if let Some(metrics) = build.metrics.as_mut() {
+        metrics.status = Some("failed".into());
+    }
+    store.save_analysis(&build, "PendingFailed", None, false).unwrap();
+    let passing = buildlens_core::TestResult {
+        suite: "S".into(),
+        test: "t()".into(),
+        status: TestStatus::Passed,
+        duration_seconds: None,
+        message: None,
+        fingerprint: None,
+    };
+    store.attach_tests("p4", &[(passing, 1)]).unwrap();
+    assert_eq!(
+        store.build_snapshot("p4").unwrap().unwrap()["status"],
+        "failed",
+        "the compile failure stands"
+    );
+}
+
+/// Results for a build that was never collected are dropped rather than
+/// attached to nothing — the watcher may have started after that build ran.
+#[test]
+fn attaching_to_an_unknown_build_is_a_no_op() {
+    let Some(mut store) = connect("attach_unknown") else { return };
+    let test = buildlens_core::TestResult {
+        suite: "S".into(),
+        test: "t()".into(),
+        status: TestStatus::Failed,
+        duration_seconds: None,
+        message: None,
+        fingerprint: None,
+    };
+    assert_eq!(store.attach_tests("never-collected", &[(test, 1)]).unwrap(), 0);
+}
+
+/// A build whose tests failed must be stored as failed, even though the
+/// activity log says the compile succeeded.
+///
+/// The regression: `WireBuild::from_metrics` takes its verdict from the
+/// activity log, which reports on the compile. A ⌘U run with a red suite
+/// compiled fine, so it was stored "succeeded" — the dashboard's failed-build
+/// tile missed it entirely and `--fail-on failures` had nothing to gate on.
+#[test]
+fn failing_tests_fail_the_build_even_when_the_compile_succeeded() {
+    let Some(mut store) = connect("status_tests") else { return };
+    let mut build = analysis("s1", 30.0, 1_700_000_000.0);
+    // What the activity log observed: the compile worked.
+    if let Some(metrics) = build.metrics.as_mut() {
+        metrics.status = Some("succeeded".into());
+    }
+    // What the log's test lines observed: one of them did not.
+    build.status.mark_failed();
+    assert!(build.tests.tests.iter().any(|t| t.status == TestStatus::Failed));
+    store.save_analysis(&build, "StatusTests", None, false).unwrap();
+
+    let snapshot = store.build_snapshot("s1").unwrap().expect("the build");
+    assert_eq!(snapshot["status"], "failed", "a red suite is a red build");
+}
+
+/// The override runs one way only. An analysis that saw no failure must not
+/// turn a compile failure green: the activity log observed something the text
+/// log did not, and downgrading it would hide a broken build.
+#[test]
+fn a_clean_analysis_never_overrides_a_failed_compile() {
+    let Some(mut store) = connect("status_compile") else { return };
+    let mut build = analysis("s2", 30.0, 1_700_000_000.0);
+    if let Some(metrics) = build.metrics.as_mut() {
+        metrics.status = Some("failed".into());
+    }
+    build.status = buildlens_core::AnalysisStatus::Passed;
+    build.tests.tests.clear();
+    store.save_analysis(&build, "StatusCompile", None, false).unwrap();
+
+    let snapshot = store.build_snapshot("s2").unwrap().expect("the build");
+    assert_eq!(snapshot["status"], "failed", "the compile failure stands");
+}
+
+/// Xcode retries a failing test in place, so one build can report the same
+/// test twice. Both runs must survive: keyed without `attempt`, the second
+/// INSERT hit `ON CONFLICT DO NOTHING` and the retry vanished, recording a
+/// fail-then-pass as a plain failure — the most common CI flakiness signal
+/// there is, discarded one step before the database.
+#[test]
+fn a_test_retried_within_one_build_keeps_every_attempt() {
+    let Some(mut store) = connect("retry") else { return };
+    let mut build = analysis("r1", 30.0, 1_700_000_000.0);
+    // Failed first, passed on the retry — same test, same build.
+    let mut retry = build.tests.tests[0].clone();
+    retry.status = TestStatus::Passed;
+    retry.message = None;
+    build.tests.tests.push(retry);
+    store.save_analysis(&build, "Retry", None, false).unwrap();
+
+    let rows = items(&store.flaky_tests(30, 10, Some("Retry")).unwrap()).clone();
+    assert_eq!(rows.len(), 1, "the test is reported once, not once per attempt");
+    assert_eq!(rows[0]["failed"], 1, "the failing attempt survived");
+    assert_eq!(rows[0]["passed"], 1, "the passing retry survived");
+    assert_eq!(rows[0]["flaky"], true);
+    assert_eq!(
+        rows[0]["retried_builds"], 1,
+        "mixed outcomes inside one build is the strongest flakiness signal"
+    );
+}
+
+/// The build page counts distinct tests, not attempts: a retry must not make
+/// the suite look bigger, and a test that failed then passed is a pass.
+#[test]
+fn build_detail_counts_tests_not_attempts() {
+    let Some(mut store) = connect("retry_detail") else { return };
+    let mut build = analysis("r2", 30.0, 1_700_000_000.0);
+    let mut retry = build.tests.tests[0].clone();
+    retry.status = TestStatus::Passed;
+    retry.message = None;
+    build.tests.tests.push(retry);
+    store.save_analysis(&build, "RetryDetail", None, false).unwrap();
+
+    let snapshot = store.build_snapshot("r2").unwrap().expect("the build");
+    assert_eq!(snapshot["test_totals"]["total"], 1, "one test, not two attempts");
+    assert_eq!(snapshot["test_totals"]["failed"], 0, "its last attempt passed");
+    let tests = snapshot["tests"].as_array().expect("tests");
+    assert_eq!(tests.len(), 1, "one row per test");
+    assert_eq!(tests[0]["status"], "passed", "the outcome that decided the build");
+    assert_eq!(tests[0]["attempts"], 2, "and it took two runs to get there");
+}
+
+/// Cross-build mixing is still flaky, but it is not a within-build retry and
+/// must not be counted as one: a source change between builds explains it.
+#[test]
+fn flakiness_across_builds_is_not_reported_as_a_retry() {
+    let Some(mut store) = connect("retry_across") else { return };
+    let failing = analysis("a1", 30.0, 1_700_000_000.0);
+    store.save_analysis(&failing, "Across", None, false).unwrap();
+    let mut passing = analysis("a2", 30.0, 1_700_100_000.0);
+    passing.tests.tests[0].status = TestStatus::Passed;
+    passing.tests.tests[0].message = None;
+    store.save_analysis(&passing, "Across", None, false).unwrap();
+
+    let rows = items(&store.flaky_tests(30, 10, Some("Across")).unwrap()).clone();
+    assert_eq!(rows[0]["flaky"], true);
+    assert_eq!(rows[0]["retried_builds"], 0, "no single build both failed and passed");
 }
 
 /// Diagnostics are deduplicated by fingerprint per build; the cluster view

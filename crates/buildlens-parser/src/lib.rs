@@ -221,7 +221,12 @@ fn handle_test(
         return true;
     }
 
-    if line.contains("Test Case")
+    // Both XCTest spellings: `Test Case '-[Suite test]'` and Xcode 16+'s
+    // `Test case 'Suite.test'`. The lowercase form has to be tried here rather
+    // than falling through, because the Swift Testing branch below would
+    // otherwise claim it and record the whole run under a suite named
+    // "SwiftTesting".
+    if (line.contains("Test Case") || line.contains("Test case '"))
         && (line.contains(" passed ") || line.contains(" failed "))
         && let Some(mut result) = xctest::result(line)
     {

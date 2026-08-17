@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 
 // Build ids are the activity log's uniqueIdentifier (or a `sha:` content hash
 // when Xcode leaves it empty) — always a string, never a row number.
-type Build = { id:string; recorded_at:number; status?:string|null; total_seconds?:number|null; test_duration_seconds?:number|null; category?:string|null; project?:string|null; raw_warnings?:number; failed_tests?:number; crashed_tests?:number; scheme?:string|null; cache_hit_rate?:number|null; };
+type Build = { id:string; recorded_at:number; status?:string|null; total_seconds?:number|null; test_duration_seconds?:number|null; category?:string|null; project?:string|null; raw_warnings?:number; total_tests?:number; failed_tests?:number; crashed_tests?:number; scheme?:string|null; cache_hit_rate?:number|null; };
 type Project = { project:string; builds:number };
 type Trend = { id:string; total_seconds?:number|null; category?:string|null; recorded_at:number; project?:string|null };
 type TargetRow = { name:string; seconds:number; category?:string|null; fetched_from_cache?:boolean; compiled_count?:number };
@@ -14,7 +14,7 @@ type PhaseRow = { name:string; seconds:number };
 type BuildFileRow = { file:string; target?:string|null; seconds:number; compilations?:number|null; step_type?:string };
 type BuildSwiftRow = { file:string; line:number; symbol?:string|null; kind:string; milliseconds:number; target?:string|null };
 type BuildDiagRow = { fingerprint:string; severity:string; category:string; message:string; file?:string|null; line?:number|null; target?:string|null; occurrences:number };
-type BuildTestRow = { suite:string; test:string; status:string; seconds?:number|null; message?:string|null };
+type BuildTestRow = { suite:string; test:string; status:string; seconds?:number|null; message?:string|null; attempts?:number };
 type TestTotals = { total:number; failed:number; seconds:number };
 type Detail = Build & { compiled_count?:number; machine_id?:string|null; xcode_version?:string|null; platform?:string|null; architecture?:string|null; targets?:TargetRow[]; phases?:PhaseRow[]; metadata?:Record<string,string>; files?:BuildFileRow[]; swift?:BuildSwiftRow[]; diagnostics?:BuildDiagRow[]; tests?:BuildTestRow[]; test_totals?:TestTotals; };
 type Percentiles = { builds:number; enough_history:boolean; p50?:number|null; p95?:number|null; min_seconds?:number|null; max_seconds?:number|null; avg_seconds?:number|null };
@@ -22,7 +22,7 @@ type Ranked = { name:string; observations:number; avg_seconds?:number|null; max_
 type FileRow = { file:string; target?:string|null; observations:number; avg_seconds?:number|null; max_seconds?:number|null; compilations?:number|null };
 type SwiftRow = { file:string; line:number; symbol?:string|null; kind:string; observations:number; avg_milliseconds?:number|null; max_milliseconds?:number|null };
 type DiagRow = { fingerprint:string; severity?:string|null; category?:string|null; message?:string|null; file?:string|null; builds:number; occurrences?:number|null };
-type FlakyRow = { suite:string; test:string; runs:number; failed:number; passed:number; flaky:boolean };
+type FlakyRow = { suite:string; test:string; runs:number; failed:number; passed:number; flaky:boolean; retried_builds?:number };
 type RegressionRow = { name:string; current_seconds:number; previous_seconds:number; delta_seconds:number; delta_percent:number; observations:number };
 type EnvRow = { xcode_version:string; platform:string; architecture:string; builds:number; machines:number; avg_seconds?:number|null };
 type GitRow = { id:string; recorded_at:number; total_seconds:number; category:string; branch?:string|null; commit?:string|null; dirty?:string|null };
@@ -56,7 +56,32 @@ function Sparkline({items}:{items:Trend[]}) { const points=items.filter(x=>x.tot
 /// A backend that does not record build status (the team server, whose wire
 /// format carries timings only) sends no `status` at all. Show that as unknown
 /// rather than inventing a green "succeeded".
-function Status({value}:{value?:string|null}) { if(!value) return <span className="status muted-status" title="This backend does not record build status"><i/>unknown</span>; const tone=value.toLowerCase().includes("fail")?"bad":value.toLowerCase().includes("run")?"warn":"good"; return <span className={`status ${tone}`}><i/>{value}</span>; }
+function Status({value}:{value?:string|null}) {
+  if(!value) return <span className="status muted-status" title="This backend does not record build status"><i/>unknown</span>;
+  // `pending_tests` is BuildLens's own, not Xcode's: the compile succeeded and
+  // a test run is expected but has not reported. Shown as its own state rather
+  // than rounded to success, because a build left pending is one whose tests
+  // never arrived — worth seeing, not worth calling green.
+  if(value==="pending_tests") return <span className="status warn" title="Compiled; waiting for test results"><i/>tests running</span>;
+  const tone=value.toLowerCase().includes("fail")?"bad":value.toLowerCase().includes("run")?"warn":"good";
+  return <span className={`status ${tone}`}><i/>{value}</span>;
+}
+
+/// What a build's row says about its tests.
+///
+/// Exists because "failed" alone is ambiguous: a compile that broke and a
+/// suite that went red are different problems needing different responses, and
+/// the status column cannot tell them apart. A plain build shows an em dash —
+/// it ran no tests, which is not the same as running tests that all passed.
+function TestCell({build}:{build:Build}) {
+  if(build.status==="pending_tests") return <span className="warnpill" title="Compiled; Xcode writes results when the test run finishes">running…</span>;
+  const total=build.total_tests||0;
+  if(!total) return <span className="muted" title="This build ran no tests">—</span>;
+  const failed=build.failed_tests||0;
+  return failed>0
+    ? <span className="red" title={`${failed} of ${total} tests failed`}>{failed}/{total} failed</span>
+    : <span className="ok-text" title={`All ${total} tests passed`}>{total} passed</span>;
+}
 
 /// A bar-ranked list. Widths are relative to the largest row, so the shape of
 /// the distribution is readable without axes.
@@ -192,9 +217,12 @@ function BuildPage({id}:{id:string}) {
             : <>All <b>{build.test_totals.total}</b> passed</>} · {seconds(build.test_totals.seconds)}</span></div>
         <ul className="diag-list">{(build.tests||[]).slice(0,25).map(t=>
           <li key={`${t.suite}.${t.test}`}>
-            <span className={`sev ${t.status==="failed"?"bad":"ok"}`}>{t.status}</span>
+            {/* A test Xcode retried is neither a clean pass nor a failure: its
+                status is the run that decided the build, and the retry count is
+                what says it was unreliable getting there. */}
+            <span className={`sev ${t.status==="failed"?"bad":(t.attempts||1)>1?"warn":"ok"}`}>{(t.attempts||1)>1?"retried":t.status}</span>
             <div><b>{t.suite}.{t.test}</b>
-              <small>{seconds(t.seconds)}{t.message?` · ${t.message}`:""}</small></div>
+              <small>{seconds(t.seconds)}{(t.attempts||1)>1?` · ${t.status} after ${t.attempts} attempts`:""}{t.message?` · ${t.message}`:""}</small></div>
           </li>)}</ul>
       </section>}
       {/* Git first: "which commit was this?" is the question asked of a build
@@ -391,6 +419,14 @@ function Overview({tab}:{tab:TabId}) {
   // without the first case an empty database reads as "this backend does not
   // record status" — blaming the backend for having nothing to report.
   const knowsStatus=builds.some(x=>x.status!=null);
+  // Tests that failed and passed inside one build, where the code, machine and
+  // environment were all held constant. Stronger evidence of flakiness than
+  // mixed outcomes across builds, which a source change also explains.
+  const retriedTests=flaky.filter(f=>(f.retried_builds||0)>0);
+  // Builds that compiled and are waiting on a test run. Normal for the ~90
+  // seconds Xcode takes to write an .xcresult; a build that stays here had
+  // tests that never reported, which is why the count is surfaced at all.
+  const pendingTests=builds.filter(x=>x.status==="pending_tests").length;
   /// Whether a failure count can be stated at all.
   const canCountFailures=builds.length>0&&knowsStatus;
   const statusNote=!builds.length
@@ -411,7 +447,9 @@ function Overview({tab}:{tab:TabId}) {
         <Attention icon={ICONS.trends} count={regressions.length} label="slower targets" tone={regressions.length?"warn":"ok"}
                    note={regressions.length?`${regressions[0].name} +${seconds(regressions[0].delta_seconds)}`:"No target trending slower"}/>
         <Attention icon={ICONS.health} count={flaky.filter(f=>f.flaky).length} label="flaky tests" tone={flaky.filter(f=>f.flaky).length?"bad":"ok"}
-                   note={flaky.filter(f=>f.flaky).length?"Passing and failing across builds":"No mixed test outcomes"}/>
+                   note={retriedTests.length?`${retriedTests.length} retried within a single build`:flaky.filter(f=>f.flaky).length?"Passing and failing across builds":"No mixed test outcomes"}/>
+        {pendingTests>0&&<Attention icon={ICONS.clock} count={pendingTests} label="awaiting tests" tone="warn"
+                   note="Compiled; results arrive when the test run finishes"/>}
       </div></section></>}
 
     {tab==="trends"&&<section className="insights">
@@ -454,12 +492,12 @@ function Overview({tab}:{tab:TabId}) {
     </section>}
 
     {tab==="diagnostics"&&flaky.length>0&&<section className="insights">
-      {<Section title="Failing and flaky tests" note="Mixed pass/fail is flaky; always-failing is broken">
-        <ul className="rows">{flaky.map(f=><li key={`${f.suite}.${f.test}`}><span className="bar-label">{f.suite}.{f.test}</span><span className={f.flaky?"mono warnpill":"mono red"}>{f.flaky?"flaky":"failing"}</span><small>{f.failed} failed · {f.passed} passed of {f.runs} runs</small></li>)}</ul>
+      {<Section title="Failing and flaky tests" note="Retried means it failed and passed inside one build; mixed across builds is flaky; always-failing is broken">
+        <ul className="rows">{flaky.map(f=><li key={`${f.suite}.${f.test}`}><span className="bar-label">{f.suite}.{f.test}</span><span className={(f.retried_builds||0)>0?"mono warnpill":f.flaky?"mono warnpill":"mono red"}>{(f.retried_builds||0)>0?"retried":f.flaky?"flaky":"failing"}</span><small>{f.failed} failed · {f.passed} passed of {f.runs} runs{(f.retried_builds||0)>0?` · retried in ${f.retried_builds} ${f.retried_builds===1?"build":"builds"}`:""}</small></li>)}</ul>
       </Section>}
     </section>}
 
-    {tab==="builds"&&<section className="panel build-panel"><div className="panel-head table-head"><div><h2>Latest builds</h2><p>{visible.length} of {builds.length} builds · select a row to inspect its analysis</p></div><div className="filters"><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search builds…"/><label><input type="checkbox" checked={onlyFailures} onChange={e=>setOnlyFailures(e.target.checked)}/> failures only</label></div></div><div className="table-wrap"><table><thead><tr><th>Build</th><th>Project / scheme</th><th>Duration</th><th>Category</th><th>Diagnostics</th><th>Status</th><th>Recorded</th></tr></thead><tbody>{visible.slice(0,80).map(b=><tr key={b.id} onClick={()=>openBuild(b.id)}><td><a className="build-id" href={`#/build/${encodeURIComponent(b.id)}`} onClick={e=>e.preventDefault()}>#{b.id}</a></td><td><b>{b.project||"Unknown project"}</b><small>{b.scheme||"No scheme"}</small></td><td className="mono">{seconds(b.total_seconds)}</td><td><span className="category">{b.category||"unknown"}</span></td><td className="mono diagnostics">{b.raw_warnings!=null?<span>{b.raw_warnings} warnings</span>:<span className="muted">—</span>}{(b.failed_tests||0)>0&&<span className="red"> · {b.failed_tests} failed tests</span>}</td><td><Status value={b.status}/></td><td className="muted">{date(b.recorded_at)}</td></tr>)}</tbody></table>{!visible.length&&<div className="empty">{builds.length?"No builds match these filters.":project?`No builds recorded for ${project}.`:"No builds recorded yet. Build in Xcode with the collector running, or run buildlens collect."}</div>}</div></section>}
+    {tab==="builds"&&<section className="panel build-panel"><div className="panel-head table-head"><div><h2>Latest builds</h2><p>{visible.length} of {builds.length} builds · select a row to inspect its analysis</p></div><div className="filters"><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search builds…"/><label><input type="checkbox" checked={onlyFailures} onChange={e=>setOnlyFailures(e.target.checked)}/> failures only</label></div></div><div className="table-wrap"><table><thead><tr><th>Build</th><th>Project / scheme</th><th>Duration</th><th>Category</th><th>Diagnostics</th><th>Tests</th><th>Status</th><th>Recorded</th></tr></thead><tbody>{visible.slice(0,80).map(b=><tr key={b.id} onClick={()=>openBuild(b.id)}><td><a className="build-id" href={`#/build/${encodeURIComponent(b.id)}`} onClick={e=>e.preventDefault()}>#{b.id}</a></td><td><b>{b.project||"Unknown project"}</b><small>{b.scheme||"No scheme"}</small></td><td className="mono">{seconds(b.total_seconds)}</td><td><span className="category">{b.category||"unknown"}</span></td><td className="mono diagnostics">{b.raw_warnings!=null?<span>{b.raw_warnings} warnings</span>:<span className="muted">—</span>}</td><td className="mono"><TestCell build={b}/></td><td><Status value={b.status}/></td><td className="muted">{date(b.recorded_at)}</td></tr>)}</tbody></table>{!visible.length&&<div className="empty">{builds.length?"No builds match these filters.":project?`No builds recorded for ${project}.`:"No builds recorded yet. Build in Xcode with the collector running, or run buildlens collect."}</div>}</div></section>}
 
     <footer>{status==="loading"?"Refreshing data…":updatedAt?`Updated ${new Date(updatedAt).toLocaleTimeString()}`:""}<span>BuildLens · local-first build observability</span></footer>
   </main></div>;

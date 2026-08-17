@@ -1,0 +1,130 @@
+{
+  "testNodes": [
+    {
+      "name": "UnitTestsApp",
+      "nodeType": "Test Plan",
+      "result": "Failed",
+      "children": [
+        {
+          "name": "UnitTestsAppTests",
+          "nodeType": "Unit test bundle",
+          "result": "Failed",
+          "children": [
+            {
+              "name": "UnitTestsAppTests",
+              "nodeType": "Test Suite",
+              "result": "Passed",
+              "children": [
+                {
+                  "durationInSeconds": 0.001963019371032715,
+                  "name": "testExample()",
+                  "nodeIdentifier": "UnitTestsAppTests/testExample()",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                },
+                {
+                  "durationInSeconds": 0.27034807205200195,
+                  "name": "testPerformanceExample()",
+                  "nodeIdentifier": "UnitTestsAppTests/testPerformanceExample()",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                }
+              ]
+            },
+            {
+              "name": "FlakyTests",
+              "nodeType": "Test Suite",
+              "result": "Failed",
+              "children": [
+                {
+                  "durationInSeconds": 0.0036846399307250977,
+                  "name": "testAlwaysBroken()",
+                  "nodeIdentifier": "FlakyTests/testAlwaysBroken()",
+                  "nodeType": "Test Case",
+                  "result": "Failed",
+                  "children": [
+                    {
+                      "durationInSeconds": 0.004292964935302734,
+                      "name": "First Run",
+                      "nodeIdentifier": "1",
+                      "nodeType": "Repetition",
+                      "result": "Failed",
+                      "children": [
+                        {
+                          "name": "FlakyTests.swift:34: failed - this test is broken, not flaky",
+                          "nodeType": "Failure Message"
+                        }
+                      ]
+                    },
+                    {
+                      "durationInSeconds": 0.0035970211029052734,
+                      "name": "Retry 1",
+                      "nodeIdentifier": "2",
+                      "nodeType": "Repetition",
+                      "result": "Failed",
+                      "children": [
+                        {
+                          "name": "FlakyTests.swift:34: failed - this test is broken, not flaky",
+                          "nodeType": "Failure Message"
+                        }
+                      ]
+                    },
+                    {
+                      "durationInSeconds": 0.003163933753967285,
+                      "name": "Retry 2",
+                      "nodeIdentifier": "3",
+                      "nodeType": "Repetition",
+                      "result": "Failed",
+                      "children": [
+                        {
+                          "name": "FlakyTests.swift:34: failed - this test is broken, not flaky",
+                          "nodeType": "Failure Message"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "durationInSeconds": 0.003084540367126465,
+                  "name": "testFlakyNetworkCall()",
+                  "nodeIdentifier": "FlakyTests/testFlakyNetworkCall()",
+                  "nodeType": "Test Case",
+                  "result": "Passed",
+                  "children": [
+                    {
+                      "durationInSeconds": 0.0040940046310424805,
+                      "name": "First Run",
+                      "nodeIdentifier": "1",
+                      "nodeType": "Repetition",
+                      "result": "Failed",
+                      "children": [
+                        {
+                          "name": "FlakyTests.swift:25: XCTAssertGreaterThan failed: (\"1\") is not greater than (\"1\") - first attempt always fails; the retry should pass",
+                          "nodeType": "Failure Message"
+                        }
+                      ]
+                    },
+                    {
+                      "durationInSeconds": 0.0020750761032104492,
+                      "name": "Retry 1",
+                      "nodeIdentifier": "2",
+                      "nodeType": "Repetition",
+                      "result": "Passed"
+                    }
+                  ]
+                },
+                {
+                  "durationInSeconds": 0.00043392181396484375,
+                  "name": "testStable()",
+                  "nodeIdentifier": "FlakyTests/testStable()",
+                  "nodeType": "Test Case",
+                  "result": "Passed"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

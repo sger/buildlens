@@ -1,0 +1,20 @@
+xcodebuild -workspace App.xcworkspace -scheme AppTests -testPlan AllTests -destination 'platform=iOS Simulator,name=iPhone 15' -retry-tests-on-failure -test-iterations 3 -resultBundlePath /tmp/App.xcresult
+Xcode 16.2
+note: Target dependency graph (2 targets)
+Target 'AppTests' in project 'App'
+    ➜ Explicit dependency on target 'App' in project 'App'
+Target 'App' in project 'App'
+Test Suite 'AppTests' started
+Test Case '-[AppTests testStable]' started.
+Test Case '-[AppTests testStable]' passed (0.104 seconds).
+Test Case '-[AppTests testFlakyNetwork]' started.
+/Users/ci/AppTests/NetworkTests.swift:42: error: -[AppTests testFlakyNetwork] : XCTAssertEqual failed: ("nil") is not equal to ("200")
+Test Case '-[AppTests testFlakyNetwork]' failed (1.204 seconds).
+Restarting after unexpected exit, crash, or test timeout
+Test Case '-[AppTests testFlakyNetwork]' started.
+Test Case '-[AppTests testFlakyNetwork]' passed (0.892 seconds).
+Test Case '-[AppTests testAlwaysBroken]' started.
+/Users/ci/AppTests/BrokenTests.swift:11: error: -[AppTests testAlwaysBroken] : XCTAssertTrue failed
+Test Case '-[AppTests testAlwaysBroken]' failed (0.051 seconds).
+Test Suite 'AppTests' passed
+IDETestOperationsObserverDebug: 8.210 elapsed

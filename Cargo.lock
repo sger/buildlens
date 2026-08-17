@@ -147,6 +147,7 @@ dependencies = [
  "buildlens-server",
  "buildlens-storage",
  "buildlens-tests",
+ "buildlens-xcresult",
  "clap",
  "flate2",
  "serde",
@@ -286,6 +287,16 @@ version = "0.0.1"
 dependencies = [
  "buildlens-core",
  "buildlens-parser",
+]
+
+[[package]]
+name = "buildlens-xcresult"
+version = "0.0.1"
+dependencies = [
+ "buildlens-core",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

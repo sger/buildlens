@@ -160,6 +160,12 @@ enum HistoryCommand {
         /// measurements; only together do both reach history.
         #[arg(long)]
         activity_log: Option<PathBuf>,
+        /// Companion .xcresult for the same run, as the source of test
+        /// results. Xcode states the suite, the verdict and the retry number
+        /// outright, where a text log only prints them for humans to read; see
+        /// `buildlens-xcresult`. Optional, and only tests come from it.
+        #[arg(long)]
+        xcresult: Option<PathBuf>,
         /// PostgreSQL connection URL. A URL, not a path: a `PathBuf` here
         /// would pass non-UTF-8 bytes through `to_string_lossy` and silently
         /// connect with a string the user never typed.
@@ -320,6 +326,91 @@ fn analysis_for(
     detail: Detail,
 ) -> Result<buildlens_core::BuildAnalysis> {
     analysis_for_pair(path, None, options, detail)
+}
+
+/// The `.xcresult` belonging to this build, if its test run has finished.
+///
+/// Matched through `Logs/Test/LogStoreManifest.plist`, where Xcode records
+/// each result bundle against the `.xcactivitylog` it built from. That pairing
+/// is what makes this exact: a build's log and its results are written 70–92
+/// seconds apart, so "the newest bundle" is frequently the *previous* run's,
+/// and attaching those results would misreport a build rather than merely miss
+/// one.
+///
+/// `None` when the tests have not finished, which for a watcher is the normal
+/// case at collect time — the manifest scan attaches them later.
+fn bundle_for_build(
+    root: &std::path::Path,
+    log: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let build_key = log.file_stem()?.to_str()?;
+    let entry = buildlens_xcresult::manifest_entries(root)
+        .into_iter()
+        .find(|entry| entry.activity_log_id.as_deref() == Some(build_key))?;
+    let bundle = root.join("Logs/Test").join(&entry.file_name);
+    bundle.exists().then_some(bundle)
+}
+
+/// The `<Project>-<hash>` DerivedData directory an activity log sits inside.
+///
+/// Found by walking up to the `Logs` directory and taking its parent, rather
+/// than by counting path components: a normal build's log is at
+/// `<root>/Logs/Build/x.xcactivitylog`, but an archive build's sits several
+/// levels deeper under `Build/Intermediates.noindex/ArchiveIntermediates`.
+/// Both have exactly one `Logs` ancestor, so this handles them alike.
+///
+/// `None` for a log kept anywhere else — a copy in `/tmp`, say — which is a
+/// normal thing to analyse and simply has no bundle to find.
+fn derived_data_root(log: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut current = log.parent()?;
+    loop {
+        if current.file_name().is_some_and(|name| name == "Logs") {
+            return current.parent().map(std::path::Path::to_path_buf);
+        }
+        current = current.parent()?;
+    }
+}
+
+/// Replaces the analysis's test results with the ones an `.xcresult` states,
+/// returning the attempt number of each.
+///
+/// Replaces rather than merges. The bundle and the text log describe the same
+/// run, so keeping both would double every test; and where they disagree the
+/// bundle is right, because Xcode wrote it as data rather than as a line for a
+/// human to read. The text-log results stand only when no bundle is given.
+///
+/// Everything else on the analysis — timings, diagnostics, the build graph —
+/// is untouched. Only tests come from here.
+fn apply_xcresult_tests(
+    analysis: &mut buildlens_core::BuildAnalysis,
+    bundle: Option<&std::path::Path>,
+) -> Result<Vec<i32>> {
+    let Some(bundle) = bundle else {
+        return Ok(Vec::new());
+    };
+    let runs = buildlens_xcresult::test_runs(bundle)
+        .with_context(|| format!("reading test results from {}", bundle.display()))?;
+    let attempts: Vec<i32> = runs.iter().map(|run| run.attempt as i32).collect();
+    let results: Vec<_> = runs.into_iter().map(|run| run.into_result()).collect();
+    // The summary counts distinct runs, matching what the text-log path
+    // produces, so a retried test is not counted as two tests.
+    analysis.tests.total = results.len();
+    analysis.tests.passed = results.iter().filter(|r| r.status == buildlens_core::TestStatus::Passed).count();
+    analysis.tests.failed = results.iter().filter(|r| r.status == buildlens_core::TestStatus::Failed).count();
+    analysis.tests.slowest = results.clone();
+    analysis.tests.slowest.sort_by(|left, right| {
+        right.duration_seconds.partial_cmp(&left.duration_seconds).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    analysis.tests.slowest.truncate(20);
+    // These results replace the text log's, so the verdict has to be restated
+    // here: a bundle read from a run whose log was never parsed would
+    // otherwise leave the analysis at its default "passed" and store a red
+    // suite as a green build.
+    if analysis.tests.failed > 0 {
+        analysis.status.mark_failed();
+    }
+    analysis.tests.tests = results;
+    Ok(attempts)
 }
 
 /// Records an explicitly supplied project name on the analysis. Without one,
@@ -856,6 +947,32 @@ fn run() -> Result<std::process::ExitCode> {
                 AnalyzeOptions { detail: Detail::Full, no_ai: true },
                 Detail::Full,
             )?;
+            // Xcode.app writes an `.xcresult` for every ⌘U run into the same
+            // DerivedData directory as the activity log, without being asked.
+            // Finding it here is what makes a UI test run record its tests
+            // with correct suites and Xcode's own retry numbers, the same as a
+            // terminal run passing --xcresult. A build-only run writes none,
+            // which is why a missing bundle is silence rather than a warning.
+            // Results already on disk for *this* build, and only this build.
+            //
+            // Nothing waits here. Xcode writes the build log when the compile
+            // finishes and the `.xcresult` only when the tests do, 70–92
+            // seconds later on a measured project, so blocking for it would
+            // stall the watcher for every test build and still race. A
+            // one-shot `collect` run after the tests finish finds them here; a
+            // watcher gets them from the manifest scan instead, once the run
+            // completes. See `attach_new_test_results`.
+            //
+            // Matched through the manifest rather than by taking the newest
+            // bundle: the newest may belong to a previous run, and attaching
+            // last run's results to this build looks right while being wrong.
+            let attempts = match derived_data_root(&log) {
+                Some(root) => {
+                    let bundle = bundle_for_build(&root, &log);
+                    apply_xcresult_tests(&mut analysis, bundle.as_deref())?
+                }
+                None => Vec::new(),
+            };
             // `--project` names the build in history. `--match-project` only
             // picks which DerivedData entry to read, but when it is the sole
             // hint it is a better name than one inferred from the log path.
@@ -883,8 +1000,11 @@ fn run() -> Result<std::process::ExitCode> {
                 }
             }
             let project = project_name_for_storage(&analysis);
-            let inserted =
-                store.save_analysis(&analysis, &project, local_machine_id(anonymous), anonymous)?;
+            let inserted = if attempts.is_empty() {
+                store.save_analysis(&analysis, &project, local_machine_id(anonymous), anonymous)?
+            } else {
+                store.save_analysis_with_attempts(&analysis, &project, local_machine_id(anonymous), anonymous, &attempts)?
+            };
             let summary = analysis
                 .metrics
                 .as_ref()
@@ -912,7 +1032,7 @@ fn run() -> Result<std::process::ExitCode> {
             }
         }
         Command::History { command } => match command {
-            HistoryCommand::Save { log, activity_log, db, repo, collect } => {
+            HistoryCommand::Save { log, activity_log, xcresult, db, repo, collect } => {
                 let log_for_metadata = log.clone();
                 let mut analysis = analysis_for_pair(
                     log,
@@ -920,13 +1040,17 @@ fn run() -> Result<std::process::ExitCode> {
                     AnalyzeOptions { detail: Detail::Full, no_ai: true },
                     Detail::Full,
                 )?;
+                let attempts = apply_xcresult_tests(&mut analysis, xcresult.as_deref())?;
                 apply_project_name(&mut analysis, collect.project.as_deref());
                 analysis.metadata = collect_metadata(&collect, &repo, Some(&log_for_metadata), &analysis);
                 reject_unusable_metrics(&analysis, &log_for_metadata)?;
                 let mut store = PostgresStore::connect(&db)?;
                 let project = project_name_for_storage(&analysis);
-                let inserted =
-                    store.save_analysis(&analysis, &project, local_machine_id(false), false)?;
+                let inserted = if attempts.is_empty() {
+                    store.save_analysis(&analysis, &project, local_machine_id(false), false)?
+                } else {
+                    store.save_analysis_with_attempts(&analysis, &project, local_machine_id(false), false, &attempts)?
+                };
                 println!("{} build in PostgreSQL", if inserted { "Saved" } else { "Skipped duplicate" });
             }
             HistoryCommand::Prune { keep_days, db, confirm } => {
@@ -1231,6 +1355,8 @@ fn watch_loop(
     let mut seen: std::collections::HashSet<(PathBuf, u64, i64)> =
         std::collections::HashSet::new();
     let mut first_scan = true;
+    // Bundles whose results are already in history, by bundle name.
+    let mut attached: std::collections::HashSet<String> = std::collections::HashSet::new();
     println!("Watching {} — press Ctrl-C to stop", root.display());
     // Said once, at startup, rather than on every scan: a watcher pointed at a
     // DerivedData that `xcodebuild` writes no logs into would otherwise sit
@@ -1293,8 +1419,97 @@ fn watch_loop(
             // end the watch.
             Err(error) => eprintln!("scan failed: {error}"),
         }
+        // Test results are a second event, not part of the scan above. Xcode
+        // writes a build's log when the compile finishes and its `.xcresult`
+        // only when the tests do — 70 to 92 seconds later on a measured
+        // project — so by the time results exist their build has long been
+        // stored. This attaches them to it.
+        //
+        // Driven by the manifest rather than by the bundle appearing: the
+        // bundle *directory* is created when tests start and filled as they
+        // run, so a watcher triggering on its existence reads a half-written
+        // result. The manifest entry is written when the run completes.
+        if !first_scan {
+            attach_new_test_results(root, match_project, &mut store, &mut attached);
+        }
         first_scan = false;
         std::thread::sleep(std::time::Duration::from_secs(interval));
+    }
+}
+
+/// Attaches results from any completed test run not yet seen this session.
+///
+/// `attached` keys on the bundle name, so a manifest re-read across scans does
+/// no repeated work; `attach_tests` is idempotent regardless, which is what
+/// makes a restarted watcher safe rather than merely cheap.
+///
+/// Failures are reported and skipped for the same reason the build scan skips
+/// them: a watcher that exits on one unreadable bundle stops collecting
+/// everything after it.
+fn attach_new_test_results(
+    root: &std::path::Path,
+    match_project: Option<&str>,
+    store: &mut PostgresStore,
+    attached: &mut std::collections::HashSet<String>,
+) {
+    let Ok(projects) = collect::list_project_dirs(root, match_project) else {
+        return;
+    };
+    for project_dir in projects {
+        for entry in buildlens_xcresult::manifest_entries(&project_dir) {
+            if attached.contains(&entry.file_name) {
+                continue;
+            }
+            // The build log this run compiled from, named by Xcode rather than
+            // matched by timestamp against a build that finished a minute and
+            // a half earlier.
+            let Some(build_key) = entry.activity_log_id.clone() else {
+                continue;
+            };
+            // Only for a build already in history. A test run whose build was
+            // never collected — the watcher started after it — is left for a
+            // later `collect`, not attached to nothing.
+            match store.build_id_for_activity_log(&build_key) {
+                Ok(Some(_)) => {}
+                Ok(None) => continue,
+                Err(error) => {
+                    eprintln!("could not look up build {build_key}: {error}");
+                    continue;
+                }
+            }
+            let bundle = project_dir.join("Logs/Test").join(&entry.file_name);
+            let runs = match buildlens_xcresult::test_runs(&bundle) {
+                Ok(runs) => runs,
+                Err(error) => {
+                    // Not marked attached: a bundle Xcode is still finishing
+                    // becomes readable on a later scan.
+                    eprintln!("skipped {}: {error}", bundle.display());
+                    continue;
+                }
+            };
+            let tests: Vec<_> = runs
+                .into_iter()
+                .map(|run| {
+                    let attempt = run.attempt as i32;
+                    (run.into_result(), attempt)
+                })
+                .collect();
+            match store.attach_tests(&build_key, &tests) {
+                Ok(count) => {
+                    attached.insert(entry.file_name.clone());
+                    if count > 0 {
+                        println!(
+                            "Attached {count} test results to build {build_key}{}",
+                            match entry.test_failures {
+                                Some(failures) if failures > 0 => format!(" ({failures} failed)"),
+                                _ => String::new(),
+                            }
+                        );
+                    }
+                }
+                Err(error) => eprintln!("could not attach tests for {build_key}: {error}"),
+            }
+        }
     }
 }
 
