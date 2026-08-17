@@ -126,9 +126,11 @@ fi
 say "==> Building the CLI"
 cargo build --quiet
 
-# One dashboard, one port. `buildlens-server` is the same UI plus a /v1/metrics
-# endpoint for receiving builds from *other* machines; it is not needed to look
-# at your own builds, so it is not started here.
+# One dashboard, one port. `buildlens dashboard` runs the same server as the
+# `buildlens-server` binary, configured for local use: loopback, no token.
+# Running both at once is what to avoid — they share this origin's
+# localStorage, so a project filter saved against one silently scopes the
+# other.
 stop_one dashboard
 stop_one watcher
 free_port "$PORT"

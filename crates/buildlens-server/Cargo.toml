@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "buildlens_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "buildlens-server"
 path = "src/main.rs"

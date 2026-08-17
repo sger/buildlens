@@ -114,15 +114,19 @@ cargo run -- collect --project MyApp --db "$DB" --collect-all   # or import once
 cargo run -- collect --all --db "$DB"                   # backfill existing logs
 ```
 
-There is one dashboard and one port: **8787**. A second binary,
-`buildlens-server`, serves that same UI plus a `/v1/metrics` endpoint for
-*receiving* builds from other machines. It is only for a shared team backend
-and is never needed to look at your own builds — run it with
-`DATABASE_URL=$DB cargo run -p buildlens-server`, and point clients at it with
-`collect --server <url> --token <token>`. What a client transmits is the
+There is one dashboard and one port: **8787**. `buildlens dashboard` and the
+`buildlens-server` binary run the *same* server — one implementation, so the
+two cannot drift. They differ only in how they are configured: the local
+command binds loopback with no token, because a password you set for yourself
+guards nothing, while `buildlens-server` reads its settings from the
+environment and refuses to start without one.
+
+So the local dashboard also exposes `/v1/metrics`, and pointing another machine
+at it with `collect --server <url>` works. What a client transmits is the
 explicit `buildlens_core::wire::WireBuild` document: build timings, target and
 phase names, and optional hardware facts — never source paths, per-file
-timings, or log contents.
+timings, or log contents. Locally collected builds keep that detail, because
+`collect --db` writes to Postgres directly rather than over the wire.
 </details>
 
 ## Running the team server in a container
@@ -138,6 +142,11 @@ printf 'BUILDLENS_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
 podman compose -f docker-compose.server.yml up -d --build
 curl -fsS http://127.0.0.1:8788/health          # {"status":"ok"}
 ```
+
+The server also serves the dashboard at **http://127.0.0.1:8788/** — the same
+UI the local `buildlens dashboard` shows, so a team can read the fleet's builds
+without running anything. Paste the token into the field in the header on first
+load; the page keeps it in `localStorage` for later visits.
 
 `docker-compose.server.yml` runs Postgres *and* the server;
 `docker-compose.yml` runs Postgres alone and is what the local workflow above
@@ -159,9 +168,19 @@ unauthenticated on a trusted network, opt out explicitly with
 pool size only block waiting for a connection. `/v1/metrics` is rate limited to
 120 requests per minute per source address.
 
-`/health` is the one route that needs no token — a container healthcheck has no
-credential to present — and it answers without touching Postgres, so a brief
-database blip does not restart a server that is otherwise fine.
+Two routes answer without a token, and neither returns build data: `/health`,
+because a container healthcheck has no credential to present (it also skips
+Postgres, so a brief database blip does not restart a working server), and `/`,
+the dashboard's HTML shell — a browser navigating to a URL cannot attach an
+`Authorization` header, so gating the page would make it unreachable rather
+than protected. Every `/api/*` call the page then makes is authenticated. If
+nobody should reach the page at all, that is a network control: a VPN, or a
+proxy in front.
+
+**What the server dashboard shows.** Builds, durations, percentiles, targets
+and phases — everything a pushed `WireBuild` carries. The Files, Swift,
+Diagnostics and Tests panels render empty, because that detail is written only
+by a local `collect --db` and is deliberately not transmitted to a team server.
 
 **No TLS.** The token crosses the network in cleartext, so keep this on a
 trusted network or a VPN, or terminate TLS in a reverse proxy in front of it.

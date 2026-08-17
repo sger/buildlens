@@ -144,6 +144,7 @@ dependencies = [
  "buildlens-parser",
  "buildlens-plugins",
  "buildlens-report",
+ "buildlens-server",
  "buildlens-storage",
  "buildlens-tests",
  "clap",

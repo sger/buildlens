@@ -20,6 +20,7 @@ buildlens-plugins = { path = "../buildlens-plugins" }
 buildlens-metrics = { path = "../buildlens-metrics" }
 buildlens-report = { path = "../buildlens-report" }
 buildlens-dashboard = { path = "../buildlens-dashboard" }
+buildlens-server = { path = "../buildlens-server" }
 buildlens-storage = { path = "../buildlens-storage" }
 buildlens-tests = { path = "../buildlens-tests" }
 clap.workspace = true

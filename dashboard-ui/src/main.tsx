@@ -297,7 +297,17 @@ function Overview({tab}:{tab:TabId}) {
     }).catch(e=>{
       // A refused request is what proves this backend authenticates, so the
       // token field appears exactly then rather than always.
-      if(isAuthError(e.message)) setNeedsToken(true);
+      if(isAuthError(e.message)){
+        setNeedsToken(true);
+        // Drop a remembered project filter too. The reset above never runs on
+        // a rejected load, so a value saved against another backend — the
+        // local dashboard on :8787 shares this origin's localStorage with a
+        // server on :8788 — would survive here and scope the page to a project
+        // this backend has never seen. The result reads as "no builds recorded
+        // for X" next to an empty dropdown, blaming the data for a filter the
+        // user cannot see or clear.
+        if(project){ setProject(""); localStorage.removeItem("buildlens-project"); }
+      }
       if(!background){setError(e.message);setStatus("error");}
     });
   },[project,scope]);

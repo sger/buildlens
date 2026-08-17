@@ -621,7 +621,19 @@ fn run() -> Result<std::process::ExitCode> {
             if let Some(path) = output { std::fs::write(path, text)?; } else { println!("{text}"); }
         }
         Command::Dashboard { db, port } => {
-            buildlens_dashboard::serve(PostgresStore::connect(&db)?, port)?;
+            // The same server the container runs, so there is one
+            // implementation rather than two that drift. Loopback and
+            // unauthenticated: this is the local dashboard, and a token would
+            // be a password you set for yourself. `buildlens-server` reads its
+            // settings from the environment instead and refuses to start
+            // without one.
+            buildlens_server::run(buildlens_server::Config {
+                database_url: db,
+                bind: format!("127.0.0.1:{port}"),
+                token: None,
+                pool_size: 4,
+                threads: 4,
+            })?;
         }
         Command::Analyze {
             log,
