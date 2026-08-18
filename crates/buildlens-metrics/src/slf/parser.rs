@@ -375,6 +375,18 @@ impl<'a> Parser<'a, '_> {
     fn read_location(&mut self) -> Option<DvtLocation> {
         let class_name = self.read_instance_class()?;
         let is_text = class_name == "DVTTextDocumentLocation";
+        // Xcode 26 attaches a storyboard diagnostic to an Interface Builder
+        // member rather than a source line. The record is the shared document
+        // prefix plus one string, the member's Interface Builder object id
+        // (e.g. `10"M22-vh-94L`).
+        //
+        // Rejecting the class cost the rest of the log, not just this location:
+        // a failed location fails its message, and a failed message ends
+        // `read_message_list`. One such record 37MB into a 44MB log discarded
+        // the final 7MB, which is where the build's `uniqueIdentifier` and
+        // `localizedResultString` live — so the build arrived with no id and no
+        // verdict, and the dashboard showed a `sha:` key with status "unknown".
+        let is_member = class_name == "DVTMemberDocumentLocation";
         // Every location class begins with a document URL and a timestamp; the
         // text variant then adds line/column fields. `IDELogDocumentLocation`
         // is what Xcode.app emits for a clickable `x-xcode-log://` link back
@@ -385,7 +397,9 @@ impl<'a> Parser<'a, '_> {
         // then landed in the dashboard as a content-hash-keyed phantom row
         // next to the real build. An unrecognized location is not a reason to
         // discard a build.
-        if !is_text && !matches!(class_name.as_str(), "DVTDocumentLocation" | "IDELogDocumentLocation")
+        if !is_text
+            && !is_member
+            && !matches!(class_name.as_str(), "DVTDocumentLocation" | "IDELogDocumentLocation")
         {
             self.fail(format!("unknown SLF location class '{class_name}'"));
             return None;
@@ -395,6 +409,12 @@ impl<'a> Parser<'a, '_> {
             timestamp: self.read_double(),
             ..Default::default()
         };
+        if is_member {
+            // Consumed, not stored: the member id has no field to go in.
+            // Reading it is what keeps the token stream aligned for every
+            // record that follows.
+            self.read_string(); // member identifier
+        }
         if is_text {
             location.starting_line = self.read_int();
             location.starting_column = self.read_int();
@@ -542,6 +562,29 @@ mod tests {
     }
 
     /// A message body carrying one location record of the given class.
+    /// As [`message_with_location`], but the location carries the trailing
+    /// Interface Builder object id that `DVTMemberDocumentLocation` adds.
+    fn message_with_member_location() -> String {
+        [
+            string("a message"), // title
+            string("a message"), // shortTitle
+            "0#".to_string(),    // timeEmitted
+            "0#".to_string(),    // rangeEndInSectionText
+            "0#".to_string(),    // rangeStartInSectionText
+            "-".to_string(),     // subMessages
+            "0#".to_string(),    // severity
+            "-".to_string(),     // type
+            format!("{}%{}3@", "DVTMemberDocumentLocation".len(), "DVTMemberDocumentLocation"),
+            string("file:///tmp/CasinoEmbed.storyboard"),
+            double(2.0),
+            string("M22-vh-94L"), // member identifier
+            "-".to_string(), // categoryIdent
+            "-".to_string(), // secondaryLocations
+            "-".to_string(), // additionalDescription
+        ]
+        .concat()
+    }
+
     fn message_with_location(location_class: &str) -> String {
         [
             string("a message"), // title
@@ -566,7 +609,15 @@ mod tests {
     /// A section whose only message carries `location_class`. Mirrors
     /// [`section_body`] but with a populated `messages` field, since the
     /// location that triggered the bug lives inside a message.
+    fn log_with_member_location() -> String {
+        log_with_message(&message_with_member_location())
+    }
+
     fn log_with_message_location(location_class: &str) -> String {
+        log_with_message(&message_with_location(location_class))
+    }
+
+    fn log_with_message(message: &str) -> String {
         let body = [
             "0#".to_string(),  // sectionType
             string("domain"),  // domainType
@@ -580,7 +631,7 @@ mod tests {
             format!(
                 "1({}%IDEActivityLogMessage2@{}",
                 "IDEActivityLogMessage".len(),
-                message_with_location(location_class)
+                message
             ),
             "0#".to_string(),  // wasCancelled
             "0#".to_string(),  // isQuiet
@@ -620,6 +671,33 @@ mod tests {
                 "{class}: location not read"
             );
         }
+    }
+
+    /// Xcode 26 attaches storyboard diagnostics to a member rather than a
+    /// source line, using `DVTMemberDocumentLocation`.
+    ///
+    /// Rejecting the class cost far more than the location: a failed location
+    /// fails its message, and a failed message ends `read_message_list`, so
+    /// every later record was dropped too. One such entry 37MB into a 44MB
+    /// Kaizen log discarded the final 7MB — which is where Xcode writes the
+    /// build's `uniqueIdentifier` and its `localizedResultString`. The build
+    /// reached the dashboard with no id (falling back to a content hash, shown
+    /// as `sha:...`) and no verdict (shown as "unknown").
+    #[test]
+    fn storyboard_member_locations_do_not_abort_the_parse() {
+        let input = log_with_member_location();
+        let (log, warnings) = parse(input.as_bytes(), &ParseOptions { keep_text: false });
+        assert_eq!(warnings, Vec::<String>::new(), "member location produced warnings");
+        let main = log.main_section.expect("no main section");
+        // The fields after the message are what the abort used to discard, and
+        // they are the ones the dashboard shows.
+        assert_eq!(main.unique_identifier, "UID", "parse stopped before the build id");
+        assert_eq!(main.messages.len(), 1, "message lost");
+        assert_eq!(
+            main.messages[0].location.as_ref().map(|l| l.document_url.as_str()),
+            Some("file:///tmp/CasinoEmbed.storyboard"),
+            "location not read"
+        );
     }
 
     /// A genuinely unknown location class must still be reported rather than

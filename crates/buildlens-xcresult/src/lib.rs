@@ -47,6 +47,29 @@ pub enum XcresultError {
     Malformed(#[from] serde_json::Error),
 }
 
+impl XcresultError {
+    /// Whether this is a bundle Xcode has not finished writing yet.
+    ///
+    /// Xcode adds the manifest entry before the bundle is readable — measured
+    /// at four seconds apart on a large suite, manifest at 23:16:26 and
+    /// `Info.plist` at 23:16:30. A watcher polling in that window sees a run it
+    /// is supposed to attach and a bundle it cannot open, which is normal and
+    /// resolves itself on the next scan.
+    ///
+    /// Matched on the message because `xcresulttool` reports it as a plain
+    /// non-zero exit with no distinguishing code. Narrow on purpose: a bundle
+    /// that is genuinely corrupt says the same thing, so this only decides
+    /// whether to *report* the failure, never whether to retry it.
+    pub fn is_incomplete_bundle(&self) -> bool {
+        match self {
+            Self::ToolFailed { message, .. } => {
+                message.contains("Info.plist") && message.contains("does not exist")
+            }
+            _ => false,
+        }
+    }
+}
+
 /// One run of one test, as the bundle records it.
 ///
 /// Distinct from [`buildlens_core::TestResult`] because that type is what the
@@ -385,6 +408,38 @@ fn status_of(result: Option<&str>) -> TestStatus {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The real message Xcode produces while it is still writing a bundle,
+    /// captured from a Kaizen run whose manifest entry landed four seconds
+    /// before its `Info.plist`.
+    #[test]
+    fn an_unfinished_bundle_is_recognized_as_transient() {
+        let error = XcresultError::ToolFailed {
+            path: "/tmp/T.xcresult".into(),
+            message: "Error: Failed to create a new result bundle reader, underlying error: \
+                      Info.plist at /tmp/T.xcresult/Info.plist does not exist, the result bundle \
+                      might be corrupted or the provided path is not a result bundle"
+                .into(),
+        };
+        assert!(error.is_incomplete_bundle());
+    }
+
+    /// Every other failure must still be reported: this flag decides whether a
+    /// message is printed, so a real fault silently classified as transient
+    /// would never be seen.
+    #[test]
+    fn other_failures_are_not_treated_as_transient() {
+        assert!(
+            !XcresultError::ToolFailed {
+                path: "/tmp/T.xcresult".into(),
+                message: "Error: unexpected argument 'test-results'".into(),
+            }
+            .is_incomplete_bundle()
+        );
+        assert!(!XcresultError::ToolMissing.is_incomplete_bundle());
+    }
+
     use super::*;
 
     /// Captured from a real Xcode 26 run of a project with a deliberately

@@ -653,6 +653,15 @@ fn collect_metadata(
         .and_then(|meta| meta.modified().ok())
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs() as i64);
+    // Which repository this build came from, not which one BuildLens is being
+    // run from. `--repo` defaults to `"."`, and a watcher or a `collect --all`
+    // is almost never started inside the project it collects, so the default
+    // stamped every build with the collector's own branch and commit. An
+    // explicit `--repo` still wins; inference only replaces the default.
+    let inferred = (repo == std::path::Path::new("."))
+        .then(|| log_path.and_then(repo_root_from_log))
+        .flatten();
+    let repo = inferred.as_deref().unwrap_or(repo);
     let probe = RealProbe;
     let tags = collect.tag_map();
     let context = PluginContext {
@@ -1169,8 +1178,19 @@ fn reject_unusable_metrics(
     analysis: &buildlens_core::BuildAnalysis,
     log: &std::path::Path,
 ) -> Result<()> {
+    // No metrics at all is a rejection, not a pass. This returned `Ok(())`,
+    // on the reading that "nothing to check" means "nothing wrong" — but the
+    // only caller stores the build immediately afterwards, and `save_analysis`
+    // rejects a metric-less analysis with `UnusableBuild`. So the permissive
+    // reading turned a clear message about *this log* into a generic store
+    // error surfaced two layers away, which in `watch` is a `skipped` line the
+    // reader cannot act on.
     let Some(metrics) = &analysis.metrics else {
-        return Ok(());
+        bail!(
+            "{} produced no build metrics at all. The file decoded but named no build: \
+             it is most likely not an `xcodebuild` build log. Nothing was recorded.",
+            log.display()
+        );
     };
     if metrics.is_usable() {
         return Ok(());
@@ -1323,6 +1343,49 @@ fn project_name_from_log(source_log: &str) -> String {
     }
 }
 
+/// The repository a build's source actually lives in, inferred from the log's
+/// own location.
+///
+/// `--repo` defaults to `"."`, which is right only when BuildLens is run from
+/// the project it is collecting. It usually is not: a watcher runs from
+/// wherever it was started, and `collect --all` spans several projects at once.
+/// Every build was then stamped with the *collector's* branch and commit — a
+/// Kaizen build recorded as `main @ 43758919` because that was BuildLens's own
+/// HEAD, which reads as real data and is impossible to spot as wrong.
+///
+/// Xcode records the project it built in `info.plist` at the root of the
+/// DerivedData directory the log sits under, so the answer is two levels up
+/// from `Logs/Build` and needs no parsing of the log body. The repository root
+/// is then the first ancestor of that project containing a `.git`, which is
+/// what makes this correct for a project nested inside its checkout.
+///
+/// Returns `None` when the log is not in a DerivedData layout or the project is
+/// not in a repository; the caller keeps its `--repo` value, so an explicit
+/// flag still wins and nothing is guessed into place.
+fn repo_root_from_log(log: &std::path::Path) -> Option<std::path::PathBuf> {
+    // <DerivedData>/<Project>-<hash>/Logs/Build/<uuid>.xcactivitylog
+    let derived_data_root = log.parent()?.parent()?.parent()?;
+    let plist = derived_data_root.join("info.plist");
+    let output = std::process::Command::new("plutil")
+        .args(["-extract", "WorkspacePath", "raw", "-o", "-"])
+        .arg(&plist)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let workspace = String::from_utf8(output.stdout).ok()?;
+    let workspace = std::path::Path::new(workspace.trim());
+    // The `.xcodeproj`/`.xcworkspace` bundle itself is not the repo; walk up
+    // from it until a `.git` appears. A submodule or worktree records `.git` as
+    // a file rather than a directory, so existence is the test, not file type.
+    workspace
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(std::path::Path::to_path_buf)
+}
+
 /// Imports one log for `--all`. Returns whether it was newly stored; an
 /// already-collected or undecodable log is a skip, not a failure, so one bad
 /// file never aborts a backfill.
@@ -1357,6 +1420,10 @@ fn watch_loop(
     let mut first_scan = true;
     // Bundles whose results are already in history, by bundle name.
     let mut attached: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Bundles whose read failure has already been reported, so a persistently
+    // unreadable one is named once rather than on every scan for as long as the
+    // watcher runs.
+    let mut reported: std::collections::HashSet<String> = std::collections::HashSet::new();
     println!("Watching {} — press Ctrl-C to stop", root.display());
     // Said once, at startup, rather than on every scan: a watcher pointed at a
     // DerivedData that `xcodebuild` writes no logs into would otherwise sit
@@ -1399,7 +1466,11 @@ fn watch_loop(
                     }
                     match import_one(&log, &mut store, repo, collect, timeout) {
                         Ok(true) => println!("Collected {}", log.display()),
-                        Ok(false) => {}
+                        // Already in history. Announced rather than passed over
+                        // in silence: "Collected" and nothing at all were once
+                        // the only two outcomes, so a build that was not stored
+                        // looked exactly like one that was.
+                        Ok(false) => println!("Already stored {}", log.display()),
                         Err(error) => {
                             // Only a log still being written is worth another
                             // look. Every other rejection is a verdict about
@@ -1430,7 +1501,13 @@ fn watch_loop(
         // run, so a watcher triggering on its existence reads a half-written
         // result. The manifest entry is written when the run completes.
         if !first_scan {
-            attach_new_test_results(root, match_project, &mut store, &mut attached);
+            attach_new_test_results(
+                root,
+                match_project,
+                &mut store,
+                &mut attached,
+                &mut reported,
+            );
         }
         first_scan = false;
         std::thread::sleep(std::time::Duration::from_secs(interval));
@@ -1451,6 +1528,7 @@ fn attach_new_test_results(
     match_project: Option<&str>,
     store: &mut PostgresStore,
     attached: &mut std::collections::HashSet<String>,
+    reported: &mut std::collections::HashSet<String>,
 ) {
     let Ok(projects) = collect::list_project_dirs(root, match_project) else {
         return;
@@ -1481,9 +1559,20 @@ fn attach_new_test_results(
             let runs = match buildlens_xcresult::test_runs(&bundle) {
                 Ok(runs) => runs,
                 Err(error) => {
-                    // Not marked attached: a bundle Xcode is still finishing
-                    // becomes readable on a later scan.
-                    eprintln!("skipped {}: {error}", bundle.display());
+                    // Not marked attached either way: a bundle Xcode is still
+                    // finishing becomes readable on a later scan, and one that
+                    // is genuinely broken costs only a re-read.
+                    //
+                    // Reported at most once per bundle, and not at all while it
+                    // is merely unfinished. Xcode writes the manifest entry
+                    // before the bundle is readable — four seconds apart on a
+                    // large suite — so the watcher reliably catches that
+                    // window, and printing `xcresulttool`'s four-line usage
+                    // dump on every scan turned a normal wait into what looked
+                    // like a failure loop.
+                    if !error.is_incomplete_bundle() && reported.insert(entry.file_name.clone()) {
+                        eprintln!("skipped {}: {error}", bundle.display());
+                    }
                     continue;
                 }
             };
@@ -1542,13 +1631,20 @@ fn import_one(
     {
         return Ok(false);
     }
-    store.save_analysis(
+    // The store's own verdict, not an assumption. This discarded the returned
+    // flag and answered `Ok(true)` unconditionally, so `watch` printed
+    // "Collected <log>" for a build it had not written — the activity-log check
+    // above catches a re-scan of the same file, but a build already stored under
+    // a different log (a `history save` of the same build, say) reaches the
+    // insert and is dropped by `ON CONFLICT DO NOTHING` with nothing to show for
+    // it. Reporting a write that did not happen is worse than reporting nothing.
+    let stored = store.save_analysis(
         &analysis,
         &project_name_for_storage(&analysis),
         local_machine_id(false),
         false,
     )?;
-    Ok(true)
+    Ok(stored)
 }
 
 #[cfg(test)]
@@ -1726,6 +1822,87 @@ mod tests {
             metrics: Some(metrics),
             ..Default::default()
         }
+    }
+
+    /// An analysis carrying no metrics must be refused here, where the message
+    /// can name the log.
+    ///
+    /// This returned `Ok(())` — "nothing to check" read as "nothing wrong" — and
+    /// the caller then handed the analysis to `save_analysis`, which rejects it
+    /// as `UnusableBuild`. Under `watch` that arrived as a generic `skipped`
+    /// line two layers from the file that caused it.
+    #[test]
+    fn an_analysis_with_no_metrics_is_rejected() {
+        let analysis = buildlens_core::BuildAnalysis::default();
+        assert!(analysis.metrics.is_none(), "the fixture must have no metrics");
+        let error = reject_unusable_metrics(&analysis, std::path::Path::new("/tmp/Empty.xcactivitylog"))
+            .expect_err("a metric-less analysis must not pass validation");
+        let message = error.to_string();
+        assert!(message.contains("Empty.xcactivitylog"), "must name the log: {message}");
+        assert!(
+            message.contains("no build metrics"),
+            "must say what was wrong rather than leaving it to the store: {message}"
+        );
+    }
+
+    /// A usable build still passes, so the check above is not simply refusing
+    /// everything.
+    #[test]
+    fn a_usable_build_still_passes_validation() {
+        let mut analysis = analysis_from(Some("/tmp/A.xcactivitylog"), Some("App"));
+        let metrics = analysis.metrics.as_mut().expect("fixture has metrics");
+        // A per-file timing is what `is_usable` treats as proof of real work.
+        metrics.files.push(buildlens_core::FileMetric {
+            file: "/src/A.swift".into(),
+            seconds: 1.0,
+            target: Some("App".into()),
+            step_type: "swift".into(),
+            architecture: Some("arm64".into()),
+            occurrences: 1,
+        });
+        assert!(metrics.is_usable(), "the fixture must be a usable build");
+        assert!(reject_unusable_metrics(&analysis, std::path::Path::new("/tmp/A.xcactivitylog")).is_ok());
+    }
+
+    /// A log outside a DerivedData layout infers nothing, so the caller keeps
+    /// whatever `--repo` it was given rather than being handed a wrong guess.
+    #[test]
+    fn a_log_outside_derived_data_infers_no_repo() {
+        assert!(repo_root_from_log(std::path::Path::new("/tmp/loose.xcactivitylog")).is_none());
+        assert!(repo_root_from_log(std::path::Path::new("relative.xcactivitylog")).is_none());
+    }
+
+    /// The real DerivedData layout, when it is present on this machine.
+    ///
+    /// Skipped rather than failed when it is not: the fixture is a developer's
+    /// own Xcode state, and CI has no DerivedData. The assertion that matters
+    /// is the negative one above, which runs everywhere.
+    #[test]
+    fn a_derived_data_log_infers_the_project_repository() {
+        let derived = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+            .join("Library/Developer/Xcode/DerivedData");
+        let Ok(entries) = std::fs::read_dir(&derived) else {
+            eprintln!("skipping: no DerivedData on this machine");
+            return;
+        };
+        for entry in entries.flatten() {
+            let logs = entry.path().join("Logs/Build");
+            let Ok(files) = std::fs::read_dir(&logs) else { continue };
+            let Some(log) = files
+                .flatten()
+                .map(|f| f.path())
+                .find(|p| p.extension().is_some_and(|e| e == "xcactivitylog"))
+            else {
+                continue;
+            };
+            if let Some(root) = repo_root_from_log(&log) {
+                // Whatever it found must actually be a repository, and must not
+                // be BuildLens itself — that confusion is the bug.
+                assert!(root.join(".git").exists(), "{root:?} is not a repository");
+                return;
+            }
+        }
+        eprintln!("skipping: no DerivedData log resolved to a repository");
     }
 
     /// The Postgres save path once hardcoded `"unknown"` whenever `--project`
