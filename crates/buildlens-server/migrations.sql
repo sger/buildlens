@@ -69,3 +69,17 @@ ALTER TABLE builds ADD COLUMN IF NOT EXISTS replayed_steps INTEGER NOT NULL DEFA
 -- row written before the tier existed.
 ALTER TABLE builds ADD COLUMN IF NOT EXISTS build_user TEXT;
 ALTER TABLE builds ADD COLUMN IF NOT EXISTS build_host TEXT;
+
+--@migration 0005 build_steps
+-- Per-step rows, so "what exactly ran, in what order" is answerable after the
+-- fact rather than only in aggregate.
+--
+-- The table itself is created by schema.sql, which runs first and is safe to
+-- re-run. This migration exists to add the index: the build-detail page reads
+-- one build's steps in timeline order, and without it that is a sequential
+-- scan of a partition holding every step of every build that day.
+--
+-- No backfill is possible. Steps are parsed from the activity log at collect
+-- time and no build already in history retains one, so existing builds simply
+-- have no steps — which the UI renders as an empty state rather than a zero.
+CREATE INDEX IF NOT EXISTS build_steps_timeline ON build_steps (day, build_key, started_at);

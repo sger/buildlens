@@ -93,6 +93,19 @@ CREATE TABLE IF NOT EXISTS build_diagnostics_default PARTITION OF build_diagnost
 CREATE TABLE IF NOT EXISTS build_tests (day DATE NOT NULL, build_key TEXT NOT NULL, suite TEXT NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL, seconds DOUBLE PRECISION, message TEXT, PRIMARY KEY (day, build_key, suite, name)) PARTITION BY RANGE (day);
 CREATE TABLE IF NOT EXISTS build_tests_default PARTITION OF build_tests DEFAULT;
 
+-- Every step a build logged, in timeline order.
+--
+-- `ordinal` is part of the key because a fingerprint is not unique within a
+-- build: measured on a real log, 6,033 steps carried 5,628 distinct
+-- fingerprints, one of them four times. Keying on the fingerprint alone would
+-- have silently dropped 405 rows per build.
+--
+-- `executed` distinguishes steps that ran in this build from ones Xcode
+-- replayed from an earlier build carrying their original durations. Sum
+-- `seconds` without filtering on it and the total is not this build's.
+CREATE TABLE IF NOT EXISTS build_steps (day DATE NOT NULL, build_key TEXT NOT NULL, ordinal INTEGER NOT NULL, fingerprint TEXT NOT NULL, step_type TEXT NOT NULL, title TEXT NOT NULL, file TEXT, target TEXT, architecture TEXT, seconds DOUBLE PRECISION NOT NULL, started_at DOUBLE PRECISION, ended_at DOUBLE PRECISION, fetched_from_cache BOOLEAN NOT NULL, executed BOOLEAN NOT NULL, PRIMARY KEY (day, build_key, ordinal)) PARTITION BY RANGE (day);
+CREATE TABLE IF NOT EXISTS build_steps_default PARTITION OF build_steps DEFAULT;
+
 -- Collected metadata (git branch/commit/dirty, hardware facts, CI provider,
 -- user tags) as key/value pairs, mirroring the local plugin namespaces.
 CREATE TABLE IF NOT EXISTS build_metadata (day DATE NOT NULL, build_key TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (day, build_key, key)) PARTITION BY RANGE (day);
@@ -119,7 +132,7 @@ JOIN pg_class parent ON parent.oid = pg_inherits.inhparent
 -- another's partitions.
 WHERE parent.relname IN ('builds', 'build_targets', 'build_phases', 'build_files',
                          'build_swift_timings', 'build_diagnostics', 'build_tests',
-                         'build_metadata')
+                         'build_steps', 'build_metadata')
   AND parent.oid = to_regclass(parent.relname)
 ORDER BY parent.relname, child.relname;
 

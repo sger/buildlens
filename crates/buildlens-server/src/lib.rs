@@ -776,6 +776,7 @@ mod tests {
             phases: vec![],
             files: vec![],
             swift_timings: vec![],
+            steps: vec![],
             diagnostics: vec![],
             tests: vec![],
         })

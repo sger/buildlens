@@ -110,6 +110,19 @@
   /* Centred only in the empty state: the sparkline fills the box on its own,
      so centring `.chart` itself would displace the chart to fix the message. */
   .chart .empty { @apply h-full flex items-center justify-center py-0; }
+
+  /* ---- Build steps ------------------------------------------------------ */
+  /* Scrolls inside its own box: 500 rows on the page itself would bury every
+     panel below it, and the list is meant to be scanned, not paged through. */
+  .steps { @apply max-h-[420px] overflow-y-auto mt-2 -mx-1; }
+  .step { @apply grid grid-cols-[7rem_minmax(0,1fr)_auto_4.5rem] items-baseline gap-2.5 px-1 py-1 text-xs border-b border-hair/60 last:border-0; }
+  .step-type { @apply text-faint text-[10px] uppercase tracking-wide truncate; }
+  .step-title { @apply truncate; }
+  .step-note { @apply text-faint text-[10px] truncate max-w-[14rem]; }
+  .step-secs { @apply text-right tabular-nums; }
+  /* Dimmed because a replayed step's duration belongs to an earlier build.
+     Legible, not hidden — the row is still real data about what Xcode did. */
+  .step.replayed { @apply opacity-45; }
   .chart-foot { @apply flex justify-between text-faint text-[11px] mt-1.5; }
   .legend i { @apply inline-block size-2 bg-accent rounded-full mr-[5px]; }
 

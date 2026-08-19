@@ -81,6 +81,7 @@ pub const DAY_PARTITIONED_TABLES: &[&str] = &[
     "build_swift_timings",
     "build_diagnostics",
     "build_tests",
+    "build_steps",
     "build_metadata",
 ];
 
@@ -777,6 +778,18 @@ impl PostgresStore {
              SELECT (SELECT COUNT(*)::bigint FROM final),
                     (SELECT COUNT(*) FILTER (WHERE status='failed')::bigint FROM final),
                     (SELECT COALESCE(SUM(seconds),0.0) FROM build_tests WHERE build_key=$1)",&[&key])?;
+        // Capped like every other detail list on this page. Ordered by ordinal,
+        // which is the timeline order the steps were transmitted in, so the
+        // first 500 rows are the *start* of the build rather than an arbitrary
+        // slice. `total_steps` reports how many exist so the page can say what
+        // it is not showing instead of implying the build had 500.
+        let steps=self.client.query(
+            "SELECT step_type,title,file,target,architecture,seconds,started_at,ended_at,fetched_from_cache,executed
+             FROM build_steps WHERE build_key=$1 ORDER BY ordinal LIMIT 500",&[&key])?;
+        let step_totals=self.client.query_one(
+            "SELECT COUNT(*)::bigint,COUNT(*) FILTER (WHERE executed)::bigint,
+                    COALESCE(SUM(seconds) FILTER (WHERE executed),0.0)
+             FROM build_steps WHERE build_key=$1",&[&key])?;
         Ok(Some(serde_json::json!({
             "id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"project":r.get::<_,String>(2),"category":r.get::<_,String>(3),
             "total_seconds":r.get::<_,f64>(4),"cache_hit_rate":r.get::<_,Option<f64>>(5),"compiled_count":r.get::<_,i32>(6),"replayed_steps":r.get::<_,i32>(15),
@@ -788,6 +801,8 @@ impl PostgresStore {
             "phases":phases.iter().map(|p|serde_json::json!({"name":p.get::<_,String>(0),"seconds":p.get::<_,f64>(1)})).collect::<Vec<_>>(),
             "metadata":metadata.iter().map(|m|(m.get::<_,String>(0),Value::String(m.get::<_,String>(1)))).collect::<serde_json::Map<_,_>>(),
             "files":files.iter().map(|f|serde_json::json!({"file":f.get::<_,String>(0),"target":f.get::<_,Option<String>>(1),"seconds":f.get::<_,f64>(2),"compilations":f.get::<_,i32>(3),"step_type":f.get::<_,String>(4)})).collect::<Vec<_>>(),
+            "steps":steps.iter().map(|s|serde_json::json!({"step_type":s.get::<_,String>(0),"title":s.get::<_,String>(1),"file":s.get::<_,Option<String>>(2),"target":s.get::<_,Option<String>>(3),"architecture":s.get::<_,Option<String>>(4),"seconds":s.get::<_,f64>(5),"started_at":s.get::<_,Option<f64>>(6),"ended_at":s.get::<_,Option<f64>>(7),"fetched_from_cache":s.get::<_,bool>(8),"executed":s.get::<_,bool>(9)})).collect::<Vec<_>>(),
+            "step_totals":serde_json::json!({"total":step_totals.get::<_,i64>(0),"executed":step_totals.get::<_,i64>(1),"executed_seconds":step_totals.get::<_,f64>(2)}),
             "swift":swift.iter().map(|s|serde_json::json!({"file":s.get::<_,String>(0),"line":s.get::<_,i32>(1),"symbol":s.get::<_,Option<String>>(2),"kind":s.get::<_,String>(3),"milliseconds":s.get::<_,f64>(4),"target":s.get::<_,Option<String>>(5)})).collect::<Vec<_>>(),
             "diagnostics":diagnostics.iter().map(|d|serde_json::json!({"fingerprint":d.get::<_,String>(0),"severity":d.get::<_,String>(1),"category":d.get::<_,String>(2),"message":d.get::<_,String>(3),"file":d.get::<_,Option<String>>(4),"line":d.get::<_,Option<i32>>(5),"target":d.get::<_,Option<String>>(6),"occurrences":d.get::<_,i32>(7)})).collect::<Vec<_>>(),
             "tests":tests.iter().map(|t|serde_json::json!({"suite":t.get::<_,String>(0),"test":t.get::<_,String>(1),"status":t.get::<_,String>(2),"seconds":t.get::<_,Option<f64>>(3),"message":t.get::<_,Option<String>>(4),"attempts":t.get::<_,i64>(5)})).collect::<Vec<_>>(),
@@ -1281,8 +1296,45 @@ pub const BUILD_SCOPED_TABLES: &[&str] = &[
     "build_swift_timings",
     "build_diagnostics",
     "build_tests",
+    "build_steps",
     "build_metadata",
 ];
+
+/// Writes one build's steps.
+///
+/// `ordinal` is the row's index in the transmitted (timeline-ordered) list
+/// rather than anything the log carries: it exists to make the primary key
+/// unique, because a fingerprint repeats within a build. Numbering by position
+/// also means reading rows back in `ordinal` order reproduces the timeline
+/// exactly, including steps whose timestamps are missing.
+fn insert_steps(tx: &mut Transaction<'_>, build: &WireBuild, day: &str) -> Result<(), StoreError> {
+    for (ordinal, step) in build.steps.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO build_steps (day,build_key,ordinal,fingerprint,step_type,title,file,target,
+                                      architecture,seconds,started_at,ended_at,fetched_from_cache,executed)
+             VALUES (to_date($1,'YYYY-MM-DD'),$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+             ON CONFLICT DO NOTHING",
+            &[
+                &day,
+                &build.build_key,
+                &(ordinal as i32),
+                &step.fingerprint,
+                &step.step_type,
+                &step.title,
+                &step.file,
+                &step.target,
+                &step.architecture,
+                &step.seconds,
+                &step.started_at,
+                &step.ended_at,
+                &step.fetched_from_cache,
+                &step.executed,
+            ],
+        )
+        .map_err(|source| StoreError::Query { operation: "inserting build step", source })?;
+    }
+    Ok(())
+}
 
 /// Writes the wire-shaped rows. Shared by `insert` and `save_analysis` so a
 /// build stored locally and one received over the wire agree exactly.
@@ -1397,6 +1449,7 @@ fn insert_wire(tx: &mut Transaction<'_>, build: &WireBuild, day: &str) -> Result
         )
         .map_err(|source| StoreError::Query { operation: "inserting swift timing", source })?;
     }
+    insert_steps(tx, build, day)?;
     for diagnostic in &build.diagnostics {
         tx.execute(
             "INSERT INTO build_diagnostics (day,build_key,fingerprint,severity,category,

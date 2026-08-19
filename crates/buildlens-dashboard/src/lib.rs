@@ -833,6 +833,7 @@ mod tests {
                 // collections, so they stay empty.
                 files: vec![],
                 swift_timings: vec![],
+                steps: vec![],
                 diagnostics: vec![],
                 tests: vec![],
             })

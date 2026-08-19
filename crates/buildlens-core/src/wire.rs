@@ -159,6 +159,14 @@ pub struct WirePhase {
 /// pushed build show thinner panels than a locally collected one — the exact
 /// asymmetry version 2 exists to remove. Ranked by cost before truncating, so
 /// the cap keeps the rows worth looking at.
+/// Steps transmitted per build.
+///
+/// Far larger than the other caps because a step row is the unit this is
+/// *for*: "what exactly ran, in what order" is unanswerable from a truncated
+/// list. Measured on real logs, a large clean build emits ~6,000 steps, so
+/// 20,000 holds the biggest builds seen with room to spare while still
+/// bounding a pathological log.
+pub const MAX_STEPS: usize = 20_000;
 pub const MAX_FILES: usize = 500;
 pub const MAX_SWIFT_TIMINGS: usize = 500;
 pub const MAX_DIAGNOSTICS: usize = 500;
@@ -189,6 +197,36 @@ pub struct WireFile {
     /// How many compilations produced this row; a file built once per
     /// architecture reports more than one.
     pub occurrences: usize,
+}
+
+/// One step Xcode logged: a compile, a link, a copy, a script run.
+///
+/// Unlike [`WireFile`], which aggregates a file's compilations into one row,
+/// this is the individual step with its own place in the build's timeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireStep {
+    /// Stable identity for the step across builds, from the parser.
+    pub fingerprint: String,
+    pub step_type: String,
+    pub title: String,
+    pub file: Option<String>,
+    pub target: Option<String>,
+    pub architecture: Option<String>,
+    pub seconds: f64,
+    /// Unix seconds. `None` for a step whose log entry carried no usable
+    /// timestamps, which is also why `executed` defaults to true for those.
+    pub started_at: Option<f64>,
+    pub ended_at: Option<f64>,
+    pub fetched_from_cache: bool,
+    /// Whether this step ran during *this* build rather than being replayed
+    /// from an earlier one.
+    ///
+    /// Xcode re-emits the whole build graph in an incremental log, carrying
+    /// each replayed step's **original duration and timestamps**. Measured on
+    /// real logs, 92–95% of an incremental build's steps are replays. Any
+    /// query that sums `seconds` without filtering on this reads durations
+    /// from builds that are not the one being examined.
+    pub executed: bool,
 }
 
 /// A slow Swift function body or type-check site.
@@ -287,6 +325,11 @@ pub struct WireBuild {
     pub files: Vec<WireFile>,
     #[serde(default)]
     pub swift_timings: Vec<WireSwiftTiming>,
+    /// Every step the log recorded, executed or replayed. Added in wire
+    /// version 2 alongside the other detail; `#[serde(default)]` so an older
+    /// client deserializes with none rather than being rejected.
+    #[serde(default)]
+    pub steps: Vec<WireStep>,
     #[serde(default)]
     pub diagnostics: Vec<WireDiagnostic>,
     #[serde(default)]
@@ -398,6 +441,39 @@ impl WireBuild {
             .collect();
         swift_timings.sort_by(|a, b| b.milliseconds.total_cmp(&a.milliseconds));
         swift_timings.truncate(MAX_SWIFT_TIMINGS);
+        // Steps hang off each target in the metrics; flattened here because
+        // the question they answer ("what ran, in what order") is build-wide,
+        // and the target is kept on each row rather than in the nesting.
+        //
+        // Ordered by start time, not by duration like every other list above:
+        // truncating a timeline by duration would leave a list that cannot be
+        // read as a sequence at all. A step with no timestamp sorts last.
+        let mut steps: Vec<WireStep> = metrics
+            .targets
+            .iter()
+            .flat_map(|target| {
+                target.steps.iter().map(move |step| WireStep {
+                    fingerprint: step.fingerprint.clone(),
+                    step_type: step.step_type.clone(),
+                    title: step.title.clone(),
+                    file: step.file.clone(),
+                    target: Some(target.name.clone()),
+                    architecture: step.architecture.clone(),
+                    seconds: step.seconds,
+                    started_at: step.started_at,
+                    ended_at: step.ended_at,
+                    fetched_from_cache: step.fetched_from_cache,
+                    executed: step.executed,
+                })
+            })
+            .collect();
+        steps.sort_by(|a, b| match (a.started_at, b.started_at) {
+            (Some(left), Some(right)) => left.total_cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        steps.truncate(MAX_STEPS);
         Some(Self {
             wire_version: WIRE_VERSION,
             build_key: metrics.build_id.clone()?,
@@ -433,6 +509,7 @@ impl WireBuild {
             phases,
             files,
             swift_timings,
+            steps,
             // Diagnostics and tests are not in `BuildMetrics` — they come from
             // the analysis of the paired text log. `with_analysis` fills them,
             // so a caller that has one transmits them and a caller that does
@@ -627,6 +704,9 @@ mod tests {
                 "project",
                 "started_at",
                 "status",
+                // Every step the log recorded, executed or replayed; see
+                // `MAX_STEPS` for why this list is not truncated by duration.
+                "steps",
                 "swift_timings",
                 "targets",
                 "tests",
