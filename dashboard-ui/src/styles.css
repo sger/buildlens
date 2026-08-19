@@ -107,6 +107,9 @@
   /* ---- Duration chart --------------------------------------------------- */
   .chart { @apply h-[170px] mt-[18px] text-accent bg-linear-to-b from-[#fdf3e6] to-transparent rounded-[10px] py-3.5; }
   .spark { @apply w-full h-full overflow-visible; }
+  /* Centred only in the empty state: the sparkline fills the box on its own,
+     so centring `.chart` itself would displace the chart to fix the message. */
+  .chart .empty { @apply h-full flex items-center justify-center py-0; }
   .chart-foot { @apply flex justify-between text-faint text-[11px] mt-1.5; }
   .legend i { @apply inline-block size-2 bg-accent rounded-full mr-[5px]; }
 

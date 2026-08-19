@@ -1157,6 +1157,12 @@ fn metric_regression_summary(comparison: &buildlens_core::HistoryComparison) -> 
 /// `--build-dir` nor `$BUILD_DIR` says otherwise.
 const DEFAULT_DERIVED_DATA: &str = "~/Library/Developer/Xcode/DerivedData";
 
+/// How many scans a log may fail the stability check before the watcher stops
+/// retrying it. A build still being written passes well inside this; a log
+/// Xcode abandoned mid-build never will, and without a bound it would be
+/// retried — and reported — on every scan for as long as the watcher runs.
+const MAX_UNSTABLE_RETRIES: u32 = 3;
+
 /// Unix seconds `keep_days` before now. Builds recorded before this go.
 ///
 /// `--keep-days 0` would delete everything except the per-project baselines,
@@ -1417,6 +1423,11 @@ fn watch_loop(
     // logs on every scan.
     let mut seen: std::collections::HashSet<(PathBuf, u64, i64)> =
         std::collections::HashSet::new();
+    // Consecutive stability failures per log identity, so a log that never
+    // finishes is given up on rather than retried forever. Keyed like `seen`:
+    // a genuinely new write of the same path starts its own count.
+    let mut unstable: std::collections::HashMap<(PathBuf, u64, i64), u32> =
+        std::collections::HashMap::new();
     let mut first_scan = true;
     // Bundles whose results are already in history, by bundle name.
     let mut attached: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1465,21 +1476,53 @@ fn watch_loop(
                         continue;
                     }
                     match import_one(&log, &mut store, repo, collect, timeout) {
-                        Ok(true) => println!("Collected {}", log.display()),
+                        Ok(true) => {
+                            // A log that was still being written on earlier
+                            // scans has now arrived; its failures were not the
+                            // abandoned-log case the bound exists for.
+                            unstable.remove(&(log.clone(), stamp.0, stamp.1));
+                            println!("Collected {}", log.display());
+                        }
                         // Already in history. Announced rather than passed over
                         // in silence: "Collected" and nothing at all were once
                         // the only two outcomes, so a build that was not stored
                         // looked exactly like one that was.
                         Ok(false) => println!("Already stored {}", log.display()),
                         Err(error) => {
+                            let message = error.to_string();
+                            let key = (log.clone(), stamp.0, stamp.1);
+                            // Xcode discards the activity log of a build it
+                            // cancels or supersedes, so a log that vanishes
+                            // between scans is an ordinary outcome rather than
+                            // a failure to report. Nothing is left to retry.
+                            if message.contains("cannot stat") {
+                                unstable.remove(&key);
+                                continue;
+                            }
                             // Only a log still being written is worth another
                             // look. Every other rejection is a verdict about
                             // this log's contents — a clean log never becomes
                             // a build log — so retrying would report the same
                             // failure on every scan, forever.
-                            let transient = error.to_string().contains("did not become stable");
+                            let transient = message.contains("did not become stable");
                             if transient {
-                                seen.remove(&(log.clone(), stamp.0, stamp.1));
+                                // Bounded: an abandoned log fails this check
+                                // identically on every scan, so retrying it
+                                // without limit spends the whole timeout per
+                                // scan and reports a build that will never
+                                // arrive.
+                                let attempts = unstable.entry(key.clone()).or_insert(0);
+                                *attempts += 1;
+                                if *attempts < MAX_UNSTABLE_RETRIES {
+                                    seen.remove(&key);
+                                    continue;
+                                }
+                                unstable.remove(&key);
+                                eprintln!(
+                                    "gave up on {} after {MAX_UNSTABLE_RETRIES} attempts: {error}",
+                                    log.display()
+                                );
+                                continue;
                             }
                             eprintln!("skipped {}: {error}", log.display());
                         }
