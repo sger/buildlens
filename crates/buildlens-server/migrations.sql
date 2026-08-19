@@ -58,3 +58,14 @@ ALTER TABLE build_tests ADD PRIMARY KEY (day, build_key, suite, name, attempt);
 -- between a build's logged size and its actual work visible on the build page,
 -- which is the number that varies on a machine with no build cache.
 ALTER TABLE builds ADD COLUMN IF NOT EXISTS replayed_steps INTEGER NOT NULL DEFAULT 0;
+
+--@migration 0004 identified_attribution
+-- Who produced a build, for the opt-in `identified` attribution tier.
+--
+-- Nullable with no default, and null for every existing row: these columns are
+-- populated only by a client that explicitly chose `--attribution identified`,
+-- so a backfill would be inventing attribution nobody asked for. A null here
+-- means "this build was not identified", which is the honest reading of every
+-- row written before the tier existed.
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS build_user TEXT;
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS build_host TEXT;

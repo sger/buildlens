@@ -308,6 +308,7 @@ pub fn route(path: &str, query: &str, store: &Arc<std::sync::Mutex<PostgresStore
         "/api/tests/flaky" => json(store.flaky_tests(builds, limit.min(50), project)),
         "/api/regressions" => json(store.target_regressions(builds, limit.min(50), project)),
         "/api/environment" => json(store.environment_breakdown(builds, project)),
+        "/api/people" => json(store.people_breakdown(builds, project)),
         "/api/git" => json(store.git_context(builds, project)),
         p if p.starts_with("/api/build/") => {
             // Percent-decoded: a build key comes from an activity log and can
@@ -355,6 +356,7 @@ mod tests {
         "/api/tests/flaky",
         "/api/regressions",
         "/api/environment",
+        "/api/people",
         "/api/git",
     ];
 
@@ -820,6 +822,8 @@ mod tests {
                 started_at: Some(1_700_000_000.0),
                 attribution: Attribution::Anonymous,
                 machine_id: None,
+                user: None,
+                host: None,
                 xcode_version: None,
                 platform: None,
                 architecture: None,

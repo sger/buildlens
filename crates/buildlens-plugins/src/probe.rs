@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::process::Command;
 
 /// Programs plugins are allowed to invoke. Nothing else can be spawned.
-const ALLOWED: &[&str] = &["git", "sysctl", "pmset"];
+const ALLOWED: &[&str] = &["git", "sysctl", "pmset", "scutil"];
 
 /// The only place in this crate that spawns a process: fixed binary, fixed argv, no shell.
 pub trait SystemProbe {

@@ -142,8 +142,15 @@ enum Command {
         #[arg(long, env = "BUILDLENS_TOKEN")]
         token: Option<String>,
         /// Send anonymously instead of with a pseudonymous machine id
-        #[arg(long)]
+        #[arg(long, conflicts_with = "attribution")]
         anonymous: bool,
+        /// How much identity to attach: anonymous, pseudonymous, or identified
+        ///
+        /// `identified` attaches your username and hostname to every build,
+        /// which is personal data your team server will retain. Use it only
+        /// where your team has agreed to it.
+        #[arg(long, value_enum)]
+        attribution: Option<AttributionArg>,
         /// Print the payload that would be sent without sending it
         #[arg(long)]
         dry_run_push: bool,
@@ -203,6 +210,28 @@ enum HistoryCommand {
         confirm: bool,
     },
 }
+/// The `--attribution` values, mapped to [`buildlens_core::wire::Attribution`].
+///
+/// A separate enum from the wire one so that clap's generated help and value
+/// names are this crate's business, and so adding a wire tier does not
+/// silently add a CLI flag value.
+#[derive(Clone, Copy, ValueEnum)]
+enum AttributionArg {
+    Anonymous,
+    Pseudonymous,
+    Identified,
+}
+
+impl From<AttributionArg> for buildlens_core::wire::Attribution {
+    fn from(arg: AttributionArg) -> Self {
+        match arg {
+            AttributionArg::Anonymous => Self::Anonymous,
+            AttributionArg::Pseudonymous => Self::Pseudonymous,
+            AttributionArg::Identified => Self::Identified,
+        }
+    }
+}
+
 #[derive(Clone, ValueEnum)]
 enum Format {
     Terminal,
@@ -894,6 +923,7 @@ fn run() -> Result<std::process::ExitCode> {
             server,
             token,
             anonymous,
+            attribution,
             dry_run_push,
             collect,
         } => {
@@ -1009,11 +1039,20 @@ fn run() -> Result<std::process::ExitCode> {
                 }
             }
             let project = project_name_for_storage(&analysis);
-            let inserted = if attempts.is_empty() {
-                store.save_analysis(&analysis, &project, local_machine_id(anonymous), anonymous)?
-            } else {
-                store.save_analysis_with_attempts(&analysis, &project, local_machine_id(anonymous), anonymous, &attempts)?
-            };
+            // Resolved once, here, so the row this collect stores carries the
+            // same tier the push below sends. Deriving it separately in each
+            // path is what let `--attribution identified` reach the server
+            // while the local database recorded no name at all.
+            let tier = resolve_attribution(anonymous, attribution);
+            let local_identity = identity_for(tier);
+            let inserted = store.save_analysis_attributed(
+                &analysis,
+                &project,
+                local_machine_id(anonymous),
+                tier,
+                local_identity,
+                if attempts.is_empty() { None } else { Some(&attempts) },
+            )?;
             let summary = analysis
                 .metrics
                 .as_ref()
@@ -1035,6 +1074,7 @@ fn run() -> Result<std::process::ExitCode> {
                     server,
                     token.as_deref(),
                     anonymous,
+                    attribution,
                     dry_run_push,
                     &log,
                 )?;
@@ -1242,6 +1282,34 @@ fn reject_unusable_metrics(
     )
 }
 
+/// The tier a run is operating at.
+///
+/// `--attribution` wins where given; `--anonymous` remains the shorthand it
+/// has always been. clap rejects the two together, so this is not a silent
+/// precedence rule.
+fn resolve_attribution(
+    anonymous: bool,
+    attribution: Option<AttributionArg>,
+) -> buildlens_core::wire::Attribution {
+    use buildlens_core::wire::Attribution;
+    match attribution {
+        Some(arg) => arg.into(),
+        None if anonymous => Attribution::Anonymous,
+        None => Attribution::Pseudonymous,
+    }
+}
+
+/// Probed only for the tier that transmits it, so a machine on any other tier
+/// never even reads its own user name.
+fn identity_for(tier: buildlens_core::wire::Attribution) -> buildlens_core::wire::Identity {
+    match tier {
+        buildlens_core::wire::Attribution::Identified => {
+            push::identity(&buildlens_plugins::RealProbe)
+        }
+        _ => buildlens_core::wire::Identity::default(),
+    }
+}
+
 /// Sends already-parsed metrics to a team server. Only ever called when the
 /// user passed --server.
 fn push_metrics(
@@ -1249,6 +1317,7 @@ fn push_metrics(
     server: &str,
     token: Option<&str>,
     anonymous: bool,
+    attribution: Option<AttributionArg>,
     dry_run: bool,
     log: &std::path::Path,
 ) -> Result<()> {
@@ -1256,11 +1325,21 @@ fn push_metrics(
     let Some(metrics) = &analysis.metrics else {
         bail!("no metrics to send for {}", log.display());
     };
-    let attribution = if anonymous { Attribution::Anonymous } else { Attribution::Pseudonymous };
+    let attribution = resolve_attribution(anonymous, attribution);
     let machine = match attribution {
         Attribution::Anonymous => None,
-        Attribution::Pseudonymous => push::machine_id(&buildlens_plugins::RealProbe),
+        Attribution::Pseudonymous | Attribution::Identified => {
+            push::machine_id(&buildlens_plugins::RealProbe)
+        }
     };
+    let identity = identity_for(attribution);
+    // Said once per push, not buried in a doc comment: this is the tier that
+    // sends personal data, and the person running it should see that it did.
+    if attribution == Attribution::Identified {
+        if let Some(user) = identity.user.as_deref() {
+            eprintln!("note: sending identified builds as {user} — this attaches your name to every build");
+        }
+    }
     // An explicit --project wins here too, so the team server groups builds
     // under the same name the local dashboard shows.
     let project = metrics
@@ -1274,6 +1353,7 @@ fn push_metrics(
         project: &project,
         attribution,
         machine_id: machine,
+        identity,
         dry_run,
         // The caller already holds the analysis these metrics came from, so a
         // pushed build carries the same diagnostics and tests a locally
@@ -1760,6 +1840,28 @@ mod tests {
     /// The exit code must be distinct from 1, which anyhow uses for a real
     /// error: a CI job needs to tell "the analysis ran and the build is bad"
     /// from "the analysis itself failed".
+    #[test]
+    fn the_identified_tier_survives_flag_resolution() {
+        use buildlens_core::wire::Attribution;
+        // The bug this pins: the collect path derived its tier from the
+        // `--anonymous` bool alone, so `--attribution identified` reached the
+        // server but was flattened to pseudonymous on the way into the local
+        // database. Both paths now resolve through this one function.
+        assert_eq!(
+            resolve_attribution(false, Some(AttributionArg::Identified)),
+            Attribution::Identified
+        );
+        assert_eq!(resolve_attribution(false, None), Attribution::Pseudonymous);
+        assert_eq!(resolve_attribution(true, None), Attribution::Anonymous);
+    }
+
+    #[test]
+    fn only_the_identified_tier_reads_an_identity() {
+        use buildlens_core::wire::{Attribution, Identity};
+        assert_eq!(identity_for(Attribution::Anonymous), Identity::default());
+        assert_eq!(identity_for(Attribution::Pseudonymous), Identity::default());
+    }
+
     #[test]
     fn the_policy_exit_code_is_distinct_from_a_hard_failure() {
         assert_eq!(POLICY_EXIT_CODE, 2);

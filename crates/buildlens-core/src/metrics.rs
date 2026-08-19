@@ -101,8 +101,7 @@ pub struct BuildStepMetric {
     /// Nothing else distinguishes them — `fetched_from_cache` is false on a
     /// replayed step, because Xcode did not fetch it from anywhere. Treating
     /// "not fetched from cache" as "compiled" is what made every incremental
-    /// build report as `clean` with its full clean-build file count. XCMetrics
-    /// classifies builds the same way and has the same blind spot.
+    /// build report as `clean` with its full clean-build file count.
     ///
     /// `true` for a step with no usable timestamps: a step that cannot be
     /// placed is counted as real, so an unreadable log under-reports nothing.

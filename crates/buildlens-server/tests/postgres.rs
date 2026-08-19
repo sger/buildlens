@@ -65,6 +65,8 @@ fn build(key: &str, seconds: f64, started_at: Option<f64>, machine: Option<&str>
         started_at,
         attribution: Attribution::Pseudonymous,
         machine_id: machine.map(str::to_owned),
+        user: None,
+        host: None,
         xcode_version: Some("16.2".into()),
         platform: Some("iOS Simulator".into()),
         architecture: Some("arm64".into()),

@@ -489,10 +489,25 @@ impl PostgresStore {
         self.save_inner(analysis, project, machine_id, anonymous, None)
     }
 
+    /// As [`Self::save_analysis`], with an explicit tier and the identity the
+    /// identified tier records.
+    ///
+    /// A local collect stores through the same `WireBuild` a push sends, so
+    /// without this the two paths disagreed: `--attribution identified`
+    /// reached the server but was flattened back to pseudonymous on the way
+    /// into the local database, which then had no name to break down by.
+    pub fn save_analysis_attributed(&mut self, analysis: &BuildAnalysis, project: &str, machine_id: Option<String>, attribution: Attribution, identity: buildlens_core::wire::Identity, attempts: Option<&[i32]>) -> Result<bool, StoreError> {
+        self.save_with(analysis, project, machine_id, attribution, identity, attempts)
+    }
+
     fn save_inner(&mut self, analysis: &BuildAnalysis, project: &str, machine_id: Option<String>, anonymous: bool, explicit_attempts: Option<&[i32]>) -> Result<bool, StoreError> {
-        let metrics = analysis.metrics.as_ref().ok_or(StoreError::UnusableBuild)?;
         let attribution = if anonymous { Attribution::Anonymous } else { Attribution::Pseudonymous };
-        let mut build = WireBuild::from_metrics(metrics, project, machine_id, attribution, 100).ok_or(StoreError::UnusableBuild)?;
+        self.save_with(analysis, project, machine_id, attribution, buildlens_core::wire::Identity::default(), explicit_attempts)
+    }
+
+    fn save_with(&mut self, analysis: &BuildAnalysis, project: &str, machine_id: Option<String>, attribution: Attribution, identity: buildlens_core::wire::Identity, explicit_attempts: Option<&[i32]>) -> Result<bool, StoreError> {
+        let metrics = analysis.metrics.as_ref().ok_or(StoreError::UnusableBuild)?;
+        let mut build = WireBuild::from_metrics_with_identity(metrics, project, machine_id, attribution, identity, 100).ok_or(StoreError::UnusableBuild)?;
         // A failing test fails the build.
         //
         // `WireBuild::from_metrics` takes its verdict from the activity log,
@@ -724,7 +739,7 @@ impl PostgresStore {
     /// a normal answer to a stale dashboard link, and a caller should not have
     /// to read error text to tell it apart from a real database failure.
     pub fn build_snapshot(&mut self, key:&str) -> Result<Option<Value>,StoreError> {
-        let Some(r)=self.client.query_opt("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate,compiled_count,machine_id,xcode_version,platform,architecture,status,error_count,warning_count,scheme,replayed_steps FROM builds WHERE build_key=$1",&[&key])? else {
+        let Some(r)=self.client.query_opt("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate,compiled_count,machine_id,xcode_version,platform,architecture,status,error_count,warning_count,scheme,replayed_steps,build_user,build_host FROM builds WHERE build_key=$1",&[&key])? else {
             return Ok(None);
         };
         let targets=self.client.query("SELECT name,seconds,category,fetched_from_cache,compiled_count FROM build_targets WHERE build_key=$1 ORDER BY seconds DESC LIMIT 100",&[&key])?;
@@ -766,6 +781,8 @@ impl PostgresStore {
             "id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"project":r.get::<_,String>(2),"category":r.get::<_,String>(3),
             "total_seconds":r.get::<_,f64>(4),"cache_hit_rate":r.get::<_,Option<f64>>(5),"compiled_count":r.get::<_,i32>(6),"replayed_steps":r.get::<_,i32>(15),
             "machine_id":r.get::<_,Option<String>>(7),"xcode_version":r.get::<_,Option<String>>(8),"platform":r.get::<_,Option<String>>(9),
+            // Null for every build except one sent at the identified tier.
+            "user":r.get::<_,Option<String>>(16),"host":r.get::<_,Option<String>>(17),
             "architecture":r.get::<_,Option<String>>(10),"status":r.get::<_,Option<String>>(11),"errors":r.get::<_,i32>(12),"raw_warnings":r.get::<_,i32>(13),"scheme":r.get::<_,Option<String>>(14),
             "targets":targets.iter().map(|t|serde_json::json!({"name":t.get::<_,String>(0),"seconds":t.get::<_,f64>(1),"category":t.get::<_,String>(2),"fetched_from_cache":t.get::<_,bool>(3),"compiled_count":t.get::<_,i32>(4)})).collect::<Vec<_>>(),
             "phases":phases.iter().map(|p|serde_json::json!({"name":p.get::<_,String>(0),"seconds":p.get::<_,f64>(1)})).collect::<Vec<_>>(),
@@ -960,6 +977,30 @@ impl PostgresStore {
              FROM recent GROUP BY 1,2,3 ORDER BY COUNT(*) DESC",
             &[&project,&builds])?;
         Ok(serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"xcode_version":r.get::<_,String>(0),"platform":r.get::<_,String>(1),"architecture":r.get::<_,String>(2),"builds":r.get::<_,i64>(3),"machines":r.get::<_,i64>(4),"avg_seconds":r.get::<_,Option<f64>>(5)})).collect::<Vec<_>>()}))
+    }
+
+    /// Build counts per person, for the opt-in identified attribution tier.
+    ///
+    /// Rows with no `build_user` are excluded rather than bucketed as
+    /// "unknown": a team part-way through opting in would otherwise show one
+    /// giant anonymous bar that says nothing, and counting non-participants
+    /// alongside participants invites reading the result as a full picture
+    /// when it is only the identified subset.
+    ///
+    /// Returns an empty list where nobody has opted in, which is the normal
+    /// case and is what the panel renders its empty state from.
+    pub fn people_breakdown(&mut self, builds:i64, project:Option<&str>) -> Result<Value,StoreError> {
+        let rows=self.client.query(
+            "WITH recent AS (SELECT build_user,build_host,machine_id,total_seconds,status
+                             FROM builds WHERE ($1::TEXT IS NULL OR project=$1) AND build_user IS NOT NULL
+                             ORDER BY received_at DESC LIMIT $2)
+             SELECT build_user,COUNT(*)::bigint,COUNT(DISTINCT COALESCE(build_host,machine_id))::bigint,
+                    AVG(total_seconds),COUNT(*) FILTER (WHERE status='failed')::bigint
+             FROM recent GROUP BY 1 ORDER BY COUNT(*) DESC",
+            &[&project,&builds])?;
+        Ok(serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({
+            "user":r.get::<_,String>(0),"builds":r.get::<_,i64>(1),"machines":r.get::<_,i64>(2),
+            "avg_seconds":r.get::<_,Option<f64>>(3),"failed":r.get::<_,i64>(4)})).collect::<Vec<_>>()}))
     }
 
     /// Builds older than `keep_days`, excluding the newest build of each
@@ -1256,8 +1297,8 @@ fn insert_wire(tx: &mut Transaction<'_>, build: &WireBuild, day: &str) -> Result
         .execute(
             "INSERT INTO builds (build_key,day,project,category,total_seconds,compiled_count,
                                  cache_hit_rate,started_at,machine_id,xcode_version,platform,
-                                 architecture,error_count,warning_count,status)
-             VALUES ($1,to_date($2,'YYYY-MM-DD'),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                                 architecture,error_count,warning_count,status,build_user,build_host)
+             VALUES ($1,to_date($2,'YYYY-MM-DD'),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
              ON CONFLICT (day,build_key) DO NOTHING",
             &[
                 &build.build_key,
@@ -1275,6 +1316,10 @@ fn insert_wire(tx: &mut Transaction<'_>, build: &WireBuild, day: &str) -> Result
                 &(build.error_count as i32),
                 &(build.warning_count as i32),
                 &status,
+                // Null unless the client chose the identified tier; the wire
+                // type already discarded these for every weaker tier.
+                &build.user,
+                &build.host,
             ],
         )
         .map_err(|source| StoreError::Query { operation: "inserting build", source })?;

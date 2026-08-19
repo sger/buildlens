@@ -767,6 +767,8 @@ mod tests {
             started_at: Some(1_700_000_000.0),
             attribution: buildlens_core::wire::Attribution::Anonymous,
             machine_id: None,
+            user: None,
+            host: None,
             xcode_version: None,
             platform: None,
             architecture: None,

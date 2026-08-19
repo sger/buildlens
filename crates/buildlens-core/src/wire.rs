@@ -116,6 +116,25 @@ pub enum Attribution {
     /// A stable, non-reversible id derived from the machine, so recurring
     /// hardware-specific slowness is visible without naming a person.
     Pseudonymous,
+    /// The machine id plus the user and host that produced the build, so a
+    /// team lead can break results down by person or machine.
+    ///
+    /// This transmits personal data and is never reached by default: it is
+    /// selected explicitly, per invocation or per config file, by someone who
+    /// knows their team has agreed to it. Everything the weaker tiers send is
+    /// still sent — this only adds.
+    Identified,
+}
+
+/// Who produced a build, for [`Attribution::Identified`].
+///
+/// Empty by default, and carried separately from the metrics so that nothing
+/// in the parsing path can populate it as a side effect: it is filled in only
+/// where the user's attribution choice is known.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Identity {
+    pub user: Option<String>,
+    pub host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,8 +262,17 @@ pub struct WireBuild {
     /// Unix seconds; the server derives its partition day from this.
     pub started_at: Option<f64>,
     pub attribution: Attribution,
-    /// Present only when attribution is pseudonymous.
+    /// Present when attribution is pseudonymous or identified.
     pub machine_id: Option<String>,
+    /// The local account name. Present only under [`Attribution::Identified`],
+    /// and `#[serde(default)]` so a client on an older build — which has no
+    /// such field — still deserializes rather than being rejected wholesale.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// The machine's hostname, for telling two machines of one person apart.
+    /// Present only under [`Attribution::Identified`].
+    #[serde(default)]
+    pub host: Option<String>,
     pub xcode_version: Option<String>,
     pub platform: Option<String>,
     pub architecture: Option<String>,
@@ -282,6 +310,32 @@ impl WireBuild {
         project: &str,
         machine_id: Option<String>,
         attribution: Attribution,
+        max_targets: usize,
+    ) -> Option<Self> {
+        Self::from_metrics_with_identity(
+            metrics,
+            project,
+            machine_id,
+            attribution,
+            Identity::default(),
+            max_targets,
+        )
+    }
+
+    /// As [`Self::from_metrics`], with the personal identity that
+    /// [`Attribution::Identified`] transmits.
+    ///
+    /// Split from `from_metrics` so that every existing call site keeps the
+    /// tier it already had: the identity is only reachable by asking for this
+    /// function by name, and is discarded below unless the tier is
+    /// `Identified`. A caller that passes an identity with a weaker tier sends
+    /// nothing personal — the tier decides, not the argument.
+    pub fn from_metrics_with_identity(
+        metrics: &BuildMetrics,
+        project: &str,
+        machine_id: Option<String>,
+        attribution: Attribution,
+        identity: Identity,
         max_targets: usize,
     ) -> Option<Self> {
         if metrics.metrics_schema_version != SUPPORTED_METRICS_SCHEMA {
@@ -358,7 +412,18 @@ impl WireBuild {
             started_at: metrics.started_at,
             machine_id: match attribution {
                 Attribution::Anonymous => None,
-                Attribution::Pseudonymous => machine_id,
+                Attribution::Pseudonymous | Attribution::Identified => machine_id,
+            },
+            // Gated on the tier alone. An identity supplied alongside a weaker
+            // tier is dropped here rather than trusted, so no call path can
+            // transmit a name by populating a struct field.
+            user: match attribution {
+                Attribution::Identified => identity.user,
+                _ => None,
+            },
+            host: match attribution {
+                Attribution::Identified => identity.host,
+                _ => None,
             },
             attribution,
             xcode_version: metrics.environment.xcode_version.clone(),
@@ -553,6 +618,9 @@ mod tests {
                 "diagnostics",
                 "error_count",
                 "files",
+                // Null unless the sender chose `Attribution::Identified`; see
+                // `weaker_tiers_drop_an_identity_they_were_handed`.
+                "host",
                 "machine_id",
                 "phases",
                 "platform",
@@ -563,6 +631,7 @@ mod tests {
                 "targets",
                 "tests",
                 "total_seconds",
+                "user",
                 "warning_count",
                 "wire_version",
                 "xcode_version",
@@ -649,6 +718,74 @@ mod tests {
         assert!(text.contains("/Users/"), "the source path was rewritten");
         assert_eq!(build.files.len(), 1);
         assert_eq!(build.swift_timings.len(), 1);
+    }
+
+    fn identity() -> Identity {
+        Identity { user: Some("s.gerokostas".into()), host: Some("Spiros-MBP".into()) }
+    }
+
+    #[test]
+    fn identified_attribution_transmits_the_user_and_host() {
+        let build = WireBuild::from_metrics_with_identity(
+            &metrics(),
+            "App",
+            Some("machine-abc".into()),
+            Attribution::Identified,
+            identity(),
+            40,
+        )
+        .unwrap();
+        assert_eq!(build.user.as_deref(), Some("s.gerokostas"));
+        assert_eq!(build.host.as_deref(), Some("Spiros-MBP"));
+        assert_eq!(build.machine_id.as_deref(), Some("machine-abc"));
+    }
+
+    #[test]
+    fn weaker_tiers_drop_an_identity_they_were_handed() {
+        // The tier decides what is transmitted, not the caller's struct. A
+        // call path that populates an identity but leaves the tier alone must
+        // not leak a name — this is the whole guarantee of the gating.
+        for tier in [Attribution::Anonymous, Attribution::Pseudonymous] {
+            let build = WireBuild::from_metrics_with_identity(
+                &metrics(),
+                "App",
+                Some("machine-abc".into()),
+                tier,
+                identity(),
+                40,
+            )
+            .unwrap();
+            let text = serde_json::to_string(&build).unwrap();
+            assert_eq!(build.user, None, "{tier:?} transmitted a user");
+            assert_eq!(build.host, None, "{tier:?} transmitted a host");
+            assert!(!text.contains("s.gerokostas"), "{tier:?} leaked the user name");
+            assert!(!text.contains("Spiros-MBP"), "{tier:?} leaked the hostname");
+        }
+    }
+
+    #[test]
+    fn the_plain_constructor_never_identifies() {
+        // `from_metrics` has no identity parameter, so even the identified
+        // tier sends no name through it. Callers that have not been updated
+        // cannot start transmitting one by accident.
+        let build =
+            WireBuild::from_metrics(&metrics(), "App", None, Attribution::Identified, 40).unwrap();
+        assert_eq!(build.user, None);
+        assert_eq!(build.host, None);
+    }
+
+    #[test]
+    fn identified_is_never_the_default() {
+        assert_eq!(Attribution::default(), Attribution::Anonymous);
+        // Deserialization of a config that omits the field must not reach the
+        // identified tier by any route.
+        #[derive(Deserialize)]
+        struct Config {
+            #[serde(default)]
+            attribution: Attribution,
+        }
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_ne!(config.attribution, Attribution::Identified);
     }
 
     fn test_result(suite: &str, name: &str, status: crate::TestStatus) -> crate::TestResult {

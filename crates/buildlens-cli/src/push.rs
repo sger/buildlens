@@ -30,12 +30,55 @@ pub fn machine_id(probe: &dyn buildlens_plugins::SystemProbe) -> Option<String> 
     Some(buildlens_plugins::pseudonymize_email(&material).replace("user-", "machine-"))
 }
 
+/// The local user and host, for `--attribution identified`.
+///
+/// Unlike [`machine_id`] this is deliberately *not* hashed: the entire point
+/// of the identified tier is that a team lead can read the name. It is
+/// therefore only ever called from a path where that tier was explicitly
+/// chosen.
+///
+/// Read from the environment rather than by spawning `id` and `hostname`:
+/// the plugin probe allowlist exists to keep this crate from running arbitrary
+/// programs, and widening it for two values libc already exposes would trade a
+/// real safety property for nothing. `USER` is set by every login shell;
+/// `HOSTNAME` is not, so the hostname falls back to the system call.
+pub fn identity(probe: &dyn buildlens_plugins::SystemProbe) -> buildlens_core::wire::Identity {
+    let clean = |value: String| {
+        let value = value.trim().to_owned();
+        if value.is_empty() { None } else { Some(value) }
+    };
+    let user = std::env::var("USER").ok().or_else(|| std::env::var("LOGNAME").ok()).and_then(clean);
+    let host = hostname(probe);
+    buildlens_core::wire::Identity { user, host }
+}
+
+/// The short hostname.
+///
+/// `scutil --get LocalHostName` is the macOS answer, and goes through the
+/// plugin probe like every other system call in this crate — fixed binary,
+/// fixed argv, no shell. `HOST` (set by zsh) is tried first so an interactive
+/// run answers without spawning anything.
+///
+/// Truncated at the first dot to match what `hostname -s` reports: a machine
+/// on a corporate network answers with a fully-qualified name whose domain is
+/// the same for everyone and only makes the value harder to read.
+fn hostname(probe: &dyn buildlens_plugins::SystemProbe) -> Option<String> {
+    let raw = std::env::var("HOST")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| probe.run("scutil", &["--get", "LocalHostName"]).ok())?;
+    let short = raw.trim().split('.').next().unwrap_or_default().trim().to_owned();
+    if short.is_empty() { None } else { Some(short) }
+}
+
 pub struct PushOptions<'a> {
     pub server: &'a str,
     pub token: Option<&'a str>,
     pub project: &'a str,
     pub attribution: Attribution,
     pub machine_id: Option<String>,
+    /// Only populated for [`Attribution::Identified`]; ignored otherwise.
+    pub identity: buildlens_core::wire::Identity,
     pub dry_run: bool,
     /// The analysis the metrics came from, when the caller has one.
     ///
@@ -48,11 +91,12 @@ pub struct PushOptions<'a> {
 
 /// Returns the payload that was sent (or would be sent, for a dry run).
 pub fn push(metrics: &BuildMetrics, options: &PushOptions<'_>) -> Result<serde_json::Value> {
-    let build = WireBuild::from_metrics(
+    let build = WireBuild::from_metrics_with_identity(
         metrics,
         options.project,
         options.machine_id.clone(),
         options.attribution,
+        options.identity.clone(),
         MAX_TARGETS,
     )
     .context("metrics did not decode into a usable build, so nothing was sent")?;

@@ -16,7 +16,7 @@ type BuildSwiftRow = { file:string; line:number; symbol?:string|null; kind:strin
 type BuildDiagRow = { fingerprint:string; severity:string; category:string; message:string; file?:string|null; line?:number|null; target?:string|null; occurrences:number };
 type BuildTestRow = { suite:string; test:string; status:string; seconds?:number|null; message?:string|null; attempts?:number };
 type TestTotals = { total:number; failed:number; seconds:number };
-type Detail = Build & { compiled_count?:number; replayed_steps?:number; machine_id?:string|null; xcode_version?:string|null; platform?:string|null; architecture?:string|null; targets?:TargetRow[]; phases?:PhaseRow[]; metadata?:Record<string,string>; files?:BuildFileRow[]; swift?:BuildSwiftRow[]; diagnostics?:BuildDiagRow[]; tests?:BuildTestRow[]; test_totals?:TestTotals; };
+type Detail = Build & { compiled_count?:number; replayed_steps?:number; machine_id?:string|null; user?:string|null; host?:string|null; xcode_version?:string|null; platform?:string|null; architecture?:string|null; targets?:TargetRow[]; phases?:PhaseRow[]; metadata?:Record<string,string>; files?:BuildFileRow[]; swift?:BuildSwiftRow[]; diagnostics?:BuildDiagRow[]; tests?:BuildTestRow[]; test_totals?:TestTotals; };
 type Percentiles = { builds:number; enough_history:boolean; p50?:number|null; p95?:number|null; min_seconds?:number|null; max_seconds?:number|null; avg_seconds?:number|null };
 type Ranked = { name:string; observations:number; avg_seconds?:number|null; max_seconds?:number|null; cached_builds?:number };
 type FileRow = { file:string; target?:string|null; observations:number; avg_seconds?:number|null; max_seconds?:number|null; compilations?:number|null };
@@ -24,6 +24,7 @@ type SwiftRow = { file:string; line:number; symbol?:string|null; kind:string; ob
 type DiagRow = { fingerprint:string; severity?:string|null; category?:string|null; message?:string|null; file?:string|null; builds:number; occurrences?:number|null };
 type FlakyRow = { suite:string; test:string; runs:number; failed:number; passed:number; flaky:boolean; retried_builds?:number };
 type RegressionRow = { name:string; current_seconds:number; previous_seconds:number; delta_seconds:number; delta_percent:number; observations:number };
+type PeopleRow = { user:string; builds:number; machines:number; avg_seconds?:number|null; failed:number };
 type EnvRow = { xcode_version:string; platform:string; architecture:string; builds:number; machines:number; avg_seconds?:number|null };
 type GitRow = { id:string; recorded_at:number; total_seconds:number; category:string; branch?:string|null; commit?:string|null; dirty?:string|null };
 type DailyRow = { day:string; builds:number; p50?:number|null; p95?:number|null };
@@ -264,6 +265,10 @@ function BuildPage({id}:{id:string}) {
           {build.platform&&<div><span>Platform</span><b>{build.platform}</b></div>}
           {build.architecture&&<div><span>Architecture</span><b>{build.architecture}</b></div>}
           {build.machine_id&&<div><span>Machine</span><b className="mono">{build.machine_id}</b></div>}
+          {/* Only present when the build was sent with --attribution identified;
+              every other build has no name to show and shows no row. */}
+          {build.user&&<div><span>User</span><b className="mono">{build.user}</b></div>}
+          {build.host&&<div><span>Host</span><b className="mono">{build.host}</b></div>}
           {Object.entries(build.metadata||{}).map(([k,v])=><div key={k}><span>{k}</span><b className="mono">{v}</b></div>)}
         </div>
         {!Object.keys(build.metadata||{}).length&&<p className="empty-note">No collected metadata for this build. Re-collect with <code>--collect-all</code> to record git, hardware and CI context.</p>}
@@ -330,6 +335,7 @@ function Overview({tab}:{tab:TabId}) {
   const [flaky,setFlaky]=useState<FlakyRow[]>([]);
   const [regressions,setRegressions]=useState<RegressionRow[]>([]);
   const [environment,setEnvironment]=useState<EnvRow[]>([]);
+  const [people,setPeople]=useState<PeopleRow[]>([]);
   const [git,setGit]=useState<GitRow[]>([]);
   const [daily,setDaily]=useState<DailyRow[]>([]);
   const [diagTrend,setDiagTrend]=useState<DiagTrendRow[]>([]);
@@ -356,6 +362,7 @@ function Overview({tab}:{tab:TabId}) {
       ok(get<{items:FlakyRow[]}>(scope("/api/tests/flaky","builds=30&limit=8")),{items:[]}),
       ok(get<{items:RegressionRow[]}>(scope("/api/regressions","builds=10&limit=8")),{items:[]}),
       ok(get<{items:EnvRow[]}>(scope("/api/environment","builds=50")),{items:[]}),
+      ok(get<{items:PeopleRow[]}>(scope("/api/people","builds=50")),{items:[]}),
       ok(get<{items:GitRow[]}>(scope("/api/git","builds=15")),{items:[]}),
       ok(get<{items:DailyRow[]}>(scope("/api/trends/daily","limit=30")),{items:[]}),
       ok(get<{items:DiagTrendRow[]}>(scope("/api/trends/diagnostics","limit=50")),{items:[]}),
@@ -363,7 +370,7 @@ function Overview({tab}:{tab:TabId}) {
       // project dropdown, so a project whose first build arrived while the
       // page was open never showed up in it.
       ok(get<{items:Project[]}>("/api/projects"),{items:null as unknown as Project[]}),
-    ]).then(([t,s,pc,tg,ph,fl,sw,cl,fk,rg,en,gt,dy,dt,pj])=>{
+    ]).then(([t,s,pc,tg,ph,fl,sw,cl,fk,rg,en,pe,gt,dy,dt,pj])=>{
       const items=t.items||[];
       const byId=new Map(items.map(x=>[x.id,x]));
       const allowed=new Set(items.map(x=>x.id));
@@ -371,7 +378,7 @@ function Overview({tab}:{tab:TabId}) {
       setBuilds((s.builds||[]).filter(b=>!project||allowed.has(b.id)).map(b=>({...b,...(byId.get(b.id)||{})})));
       setPercentiles(pc); setTargets(tg.items||[]); setPhases(ph.items||[]); setFiles(fl.items||[]);
       setSwift(sw.items||[]); setClusters(cl.items||[]); setFlaky(fk.items||[]);
-      setRegressions(rg.items||[]); setEnvironment(en.items||[]); setGit(gt.items||[]);
+      setRegressions(rg.items||[]); setEnvironment(en.items||[]); setPeople(pe.items||[]); setGit(gt.items||[]);
       setDaily(dy.items||[]); setDiagTrend(dt.items||[]);
       // `null` means the request failed, `[]` means there are genuinely no
       // projects. Conflating them is what let a stale filter survive against
@@ -482,6 +489,13 @@ function Overview({tab}:{tab:TabId}) {
       </Section>
       <Section title="Environment mix" note="A duration shift here is a setup change, not a code change">
         <Bars empty="No environment recorded." rows={environment.map(e=>({key:`${e.xcode_version}-${e.platform}-${e.architecture}`,label:`Xcode ${e.xcode_version} · ${e.architecture}`,value:e.builds,display:`${e.builds} builds`,note:`${e.platform} · ${e.machines} machine(s) · avg ${seconds(e.avg_seconds)}`}))}/>
+      </Section>
+      {/* Only the identified subset: the query excludes builds with no user, so
+          this counts who opted in rather than implying it covers the team. The
+          empty state says so, because an empty panel otherwise reads as "nobody
+          is building" rather than "nobody has opted in". */}
+      <Section title="Builds by person" note="Only builds sent with --attribution identified appear here">
+        <Bars empty="No identified builds. Send with --attribution identified to break builds down by person." rows={people.map(p=>({key:p.user,label:p.user,value:p.builds,display:`${p.builds} builds`,note:`${p.machines} machine(s) · avg ${seconds(p.avg_seconds)}${p.failed?` · ${p.failed} failed`:""}`}))}/>
       </Section>
       <Section title="Day over day" note="Median and p95 per calendar day">
         <Bars empty="No daily history yet." rows={daily.map(d=>({key:d.day,label:d.day,value:d.p50||0,display:`${seconds(d.p50)} / ${seconds(d.p95)}`,note:`${d.builds} build(s) · median / p95`}))}/>

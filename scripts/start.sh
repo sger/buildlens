@@ -5,6 +5,10 @@
 #   ./scripts/start.sh          # start all three, follow the logs
 #   ./scripts/start.sh --stop   # stop the dashboard and watcher
 #
+#   BUILDLENS_ATTRIBUTION=identified ./scripts/start.sh
+#                               # record who produced each build, so the
+#                               # dashboard can break builds down by person
+#
 # PostgreSQL keeps running after --stop, because dropping it would take your
 # build history offline; `podman compose down` stops it, and `down -v` deletes
 # the data.
@@ -15,6 +19,18 @@ cd "$(dirname "$0")/.."
 DB="${BUILDLENS_DATABASE_URL:-postgres://buildlens:buildlens@localhost:5433/buildlens}"
 PORT="${BUILDLENS_PORT:-8787}"
 BUILD_DIR="${BUILDLENS_BUILD_DIR:-$HOME/Library/Developer/Xcode/DerivedData}"
+# How much identity each collected build carries: anonymous, pseudonymous, or
+# identified. Unset means the CLI's own default (pseudonymous, a hashed machine
+# id and no name).
+#
+# Deliberately not defaulted to `identified` here. This script is the quickest
+# path to a running BuildLens, and a default that attaches your username and
+# hostname to every build would opt each new user into transmitting personal
+# data by way of a convenience script they did not read. The tier is worth
+# having; it is not worth having by accident.
+#
+#   BUILDLENS_ATTRIBUTION=identified ./scripts/start.sh
+ATTRIBUTION="${BUILDLENS_ATTRIBUTION:-}"
 # Matches container_name in docker-compose.yml. docker-compose.dev.yml sets
 # none, so db_ready falls back to a direct connection.
 DB_CONTAINER="${BUILDLENS_DB_CONTAINER:-buildlens_db}"
@@ -141,11 +157,25 @@ say "==> Dashboard on http://127.0.0.1:$PORT"
 echo $! >"$RUN_DIR/dashboard.pid"
 
 say "==> Watching $BUILD_DIR"
+# Passed as an array so that an unset ATTRIBUTION contributes no argument at
+# all: `--attribution ""` is a parse error, not a default.
+attribution_args=()
+if [[ -n "$ATTRIBUTION" ]]; then
+  attribution_args=(--attribution "$ATTRIBUTION")
+  say "    attribution: $ATTRIBUTION"
+  # Said here rather than only in the CLI's own notice, because a watcher runs
+  # unattended: the person who set this sees it once, at the moment every
+  # future build starts carrying their name.
+  if [[ "$ATTRIBUTION" == "identified" ]]; then
+    say "    note: every collected build will record your username and hostname"
+  fi
+fi
 # --watch-interval 2 rather than the 5s default: this watcher exists so a build
 # shows up while you are still looking at the dashboard, and a scan is a cheap
 # directory stat.
 ./target/debug/buildlens collect --watch --collect-all --watch-interval 2 \
-  --build-dir "$BUILD_DIR" --db "$DB" >"$RUN_DIR/watcher.log" 2>&1 &
+  --build-dir "$BUILD_DIR" --db "$DB" "${attribution_args[@]}" \
+  >"$RUN_DIR/watcher.log" 2>&1 &
 echo $! >"$RUN_DIR/watcher.pid"
 
 sleep 3
