@@ -15,13 +15,10 @@ type BuildFileRow = { file:string; target?:string|null; seconds:number; compilat
 type BuildStepRow = { step_type:string; title:string; file?:string|null; target?:string|null; architecture?:string|null; seconds:number; started_at?:number|null; ended_at?:number|null; fetched_from_cache:boolean; executed:boolean };
 type StepTotals = { total:number; executed:number; executed_seconds:number };
 type BuildSwiftRow = { file:string; line:number; symbol?:string|null; kind:string; milliseconds:number; target?:string|null };
-/// Derived server-side by `buildlens_intel::from_timings`, so the dashboard and
-/// the CLI cannot disagree about which hotspots are worth acting on.
-type AdviceRow = { kind:string; file:string; line?:number; column?:number; symbol?:string|null; target?:string|null; milliseconds:number; explanation:string };
 type BuildDiagRow = { fingerprint:string; severity:string; category:string; message:string; file?:string|null; line?:number|null; target?:string|null; occurrences:number };
 type BuildTestRow = { suite:string; test:string; status:string; seconds?:number|null; message?:string|null; attempts?:number };
 type TestTotals = { total:number; failed:number; seconds:number };
-type Detail = Build & { compiled_count?:number; replayed_steps?:number; machine_id?:string|null; user?:string|null; host?:string|null; xcode_version?:string|null; platform?:string|null; architecture?:string|null; targets?:TargetRow[]; phases?:PhaseRow[]; metadata?:Record<string,string>; files?:BuildFileRow[]; swift?:BuildSwiftRow[]; advice?:AdviceRow[]; diagnostics?:BuildDiagRow[]; tests?:BuildTestRow[]; test_totals?:TestTotals; steps?:BuildStepRow[]; step_totals?:StepTotals; };
+type Detail = Build & { compiled_count?:number; replayed_steps?:number; machine_id?:string|null; user?:string|null; host?:string|null; xcode_version?:string|null; platform?:string|null; architecture?:string|null; targets?:TargetRow[]; phases?:PhaseRow[]; metadata?:Record<string,string>; files?:BuildFileRow[]; swift?:BuildSwiftRow[]; diagnostics?:BuildDiagRow[]; tests?:BuildTestRow[]; test_totals?:TestTotals; steps?:BuildStepRow[]; step_totals?:StepTotals; };
 type Percentiles = { builds:number; enough_history:boolean; p50?:number|null; p95?:number|null; min_seconds?:number|null; max_seconds?:number|null; avg_seconds?:number|null };
 type Ranked = { name:string; observations:number; avg_seconds?:number|null; max_seconds?:number|null; cached_builds?:number };
 type FileRow = { file:string; target?:string|null; observations:number; avg_seconds?:number|null; max_seconds?:number|null; compilations?:number|null };
@@ -138,30 +135,6 @@ function Bars({rows,empty}:{rows:{key:string;label:React.ReactNode;note?:React.R
   </>;
 }
 
-/// Advice reads as prose, not as a ranking, so it deliberately does not reuse
-/// `Bars`: the number is evidence for the sentence rather than the point.
-///
-/// Empty means one of two unrelated things, and saying the wrong one is worse
-/// than saying nothing. No timings at all means the `-warn-long-*` flags were
-/// absent, so the build was never measured. Timings but no advice means it was
-/// measured and nothing crossed a threshold -- a healthy build, and telling
-/// someone to enable flags they already have reads as a broken panel.
-function AdviceList({rows,measured,noop}:{rows:AdviceRow[];measured:boolean;noop:boolean}) {
-  if(!rows.length) return <div className="empty">{
-    noop
-      ? "Nothing was compiled in this build — the hotspots below were recorded in the build Xcode replayed, not in this one."
-      : measured
-        ? "Nothing stands out — type-checking is a small share of this build, and no single site or file dominates it."
-        : "Not enabled for this build — add -warn-long-function-bodies or -warn-long-expression-type-checking to see advice."}</div>;
-  return <ul className="advice">{rows.map((a,index)=>{
-    const where = a.file ? (a.line ? `${short(a.file)}:${a.line}` : short(a.file)) : (a.target||"");
-    return <li key={`${a.kind}:${a.file}:${a.line??0}:${index}`}>
-      <div className="bar-head"><span className="bar-label" title={a.file||a.target||""}>{a.symbol||where||"this build"}</span><span className="bar-value mono">{ms(a.milliseconds)}</span></div>
-      <p>{a.explanation}</p>
-      {where&&a.symbol&&<small>{where}</small>}
-    </li>;
-  })}</ul>;
-}
 
 function Section({title,note,children}:{title:string;note?:string;children:React.ReactNode}) {
   return <div className="panel insight"><div className="panel-head"><div><h2>{title}</h2>{note&&<p>{note}</p>}</div></div>{children}</div>;
@@ -273,9 +246,6 @@ function BuildPage({id}:{id:string}) {
         </Section>
         <Section title="Slowest files" note="Compile time in this build">
           <Bars empty="No per-file timings in this build." rows={(build.files||[]).slice(0,25).map(f=>({key:f.file,label:<span title={f.file}>{short(f.file)}</span>,value:f.seconds,display:seconds(f.seconds),note:`${f.target||"unknown target"}${(f.compilations||0)>1?` · compiled ${f.compilations}×`:""}`}))}/>
-        </Section>
-        <Section title="Swift type-checking advice" note="What the hotspots below add up to">
-          <AdviceList rows={build.advice||[]} measured={(build.swift||[]).length>0} noop={build.category==="noop"}/>
         </Section>
         <Section title="Swift type-check hotspots" note="Needs -warn-long-function-bodies">
           <Bars empty="Not enabled for this build — add -warn-long-function-bodies or -warn-long-expression-type-checking to see hotspots." rows={(build.swift||[]).slice(0,25).map(s=>({key:`${s.file}:${s.line}:${s.kind}`,label:<span title={`${s.file}:${s.line}`}>{s.symbol||`${short(s.file)}:${s.line}`}</span>,value:s.milliseconds,display:ms(s.milliseconds),note:`${s.kind.replace(/_/g," ")} · ${short(s.file)}:${s.line}`}))}/>

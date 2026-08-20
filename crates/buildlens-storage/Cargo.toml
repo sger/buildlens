@@ -6,9 +6,6 @@ license.workspace = true
 
 [dependencies]
 buildlens-core = { path = "../buildlens-core" }
-# For Swift type-check advice on the dashboard: the same thresholds the CLI
-# uses, rather than a second copy that could drift from them.
-buildlens-intel = { path = "../buildlens-intel" }
 postgres.workspace = true
 serde.workspace = true
 serde_json.workspace = true
