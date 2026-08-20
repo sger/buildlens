@@ -1632,6 +1632,70 @@ fn repo_root_from_log(log: &std::path::Path) -> Option<std::path::PathBuf> {
 /// for a log already in history — so a log seen on every scan is imported
 /// once. Errors are reported and skipped: a watcher that exits on one bad log
 /// stops collecting the builds after it.
+/// Watches `root` for changes, sending a unit on `tx` for each one.
+///
+/// Recursive, because a log's path is
+/// `DerivedData/<Project>-<hash>/Logs/Build/<uuid>.xcactivitylog` — three
+/// levels below the root, and the intermediate directories are created by the
+/// same build that writes the log.
+///
+/// The payload is deliberately discarded. The scan that follows re-reads the
+/// directory anyway, so which file changed adds nothing, and treating every
+/// event alike means a dropped or coalesced one costs nothing either.
+fn new_build_watcher(
+    root: &std::path::Path,
+    tx: std::sync::mpsc::Sender<()>,
+) -> Result<impl notify::Watcher> {
+    use notify::Watcher as _;
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        // Errors are dropped rather than reported: the interval still fires, and
+        // a watcher that printed on every transient event would be noise in a
+        // process that runs unattended for days.
+        if event.is_ok() {
+            // A closed receiver means the loop has ended; nothing to do.
+            let _ = tx.send(());
+        }
+    })?;
+    watcher.watch(root, notify::RecursiveMode::Recursive)?;
+    Ok(watcher)
+}
+
+/// Waits for the next scan, returning as soon as the build directory changes.
+///
+/// The periodic scan is kept as a backstop rather than replaced. FSEvents
+/// coalesces and can drop events under load, and a watcher that only ever
+/// reacts to them would miss a build with no way to notice; the interval bounds
+/// how long such a miss can last. So this waits for *either* a filesystem event
+/// or the interval, whichever comes first.
+///
+/// A `None` watcher means the event stream could not be created, which is not
+/// fatal: the caller falls back to sleeping out the interval, which is exactly
+/// the behaviour before FSEvents was used at all.
+fn wait_for_change(events: Option<&std::sync::mpsc::Receiver<()>>, interval: std::time::Duration) {
+    let Some(events) = events else {
+        std::thread::sleep(interval);
+        return;
+    };
+    // A build writes many events; take the first, then let the debounce below
+    // absorb the rest so one build causes one scan rather than dozens.
+    if events.recv_timeout(interval).is_err() {
+        // Timed out (or the sender is gone, in which case the interval is all
+        // that is left). Either way it is time to scan.
+        return;
+    }
+    // Xcode writes the log in one pass, so events arrive in a burst. Waiting
+    // out a short quiet period means the scan sees a settled directory instead
+    // of racing the first write — `wait_until_stable` would handle that anyway,
+    // but blocking a scan on a log that has barely started costs the whole
+    // stability timeout for nothing.
+    while events.recv_timeout(FSEVENT_DEBOUNCE).is_ok() {}
+}
+
+/// How long the watcher waits for filesystem events to stop arriving before
+/// scanning. Long enough to collapse one build's burst of writes into a single
+/// scan, short enough to stay imperceptible.
+const FSEVENT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// What to do about a log that failed the stability check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unstable {
@@ -1714,6 +1778,26 @@ fn watch_loop(
     let mut unstable: std::collections::HashMap<PathBuf, (u64, u32)> =
         std::collections::HashMap::new();
     let mut first_scan = true;
+    // Filesystem events for the build directory, so a finished build is
+    // collected when it lands rather than up to `interval` later. Kept
+    // alongside the interval, never instead of it: see `wait_for_change`.
+    //
+    // A failure here is reported once and then ignored — the watcher still
+    // works on its timer, which is what it did before.
+    let (events_tx, events_rx) = std::sync::mpsc::channel();
+    // Held for the life of the loop: dropping the watcher stops the event
+    // stream, so this binding is what keeps FSEvents delivering.
+    let watcher = match new_build_watcher(root, events_tx) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            eprintln!(
+                "warning: could not watch {} for changes ({error}); \
+                 falling back to scanning every {interval}s",
+                root.display()
+            );
+            None
+        }
+    };
     // Bundles whose results are already in history, by bundle name.
     let mut attached: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Bundles whose read failure has already been reported, so a persistently
@@ -1856,7 +1940,10 @@ fn watch_loop(
             );
         }
         first_scan = false;
-        std::thread::sleep(std::time::Duration::from_secs(interval));
+        wait_for_change(
+            watcher.as_ref().map(|_| &events_rx),
+            std::time::Duration::from_secs(interval),
+        );
     }
 }
 
@@ -2011,6 +2098,49 @@ mod tests {
         analysis.diagnostics.raw_warnings = warnings;
         analysis.tests.failed = failed;
         analysis
+    }
+
+    /// With no watcher, the wait is the plain interval it always was.
+    #[test]
+    fn without_a_watcher_the_wait_is_the_interval() {
+        let start = std::time::Instant::now();
+        wait_for_change(None, std::time::Duration::from_millis(150));
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(150),
+            "a watcherless wait must still sleep out the interval"
+        );
+    }
+
+    /// A filesystem event ends the wait early, which is the whole point: a
+    /// build must not sit uncollected for the rest of a long interval.
+    #[test]
+    fn an_event_ends_the_wait_before_the_interval() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = tx.send(());
+        });
+        let start = std::time::Instant::now();
+        wait_for_change(Some(&rx), std::time::Duration::from_secs(30));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "an event must not wait out a 30s interval"
+        );
+    }
+
+    /// The interval still bounds the wait when no event arrives, so a dropped
+    /// or coalesced FSEvent cannot leave a build uncollected indefinitely.
+    #[test]
+    fn a_silent_watcher_still_falls_back_to_the_interval() {
+        // Held so the channel stays open: a dropped sender would end the wait
+        // through disconnection rather than through the timeout under test.
+        let (_tx, rx) = std::sync::mpsc::channel::<()>();
+        let start = std::time::Instant::now();
+        wait_for_change(Some(&rx), std::time::Duration::from_millis(150));
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(150),
+            "a quiet watcher must still scan when the interval expires"
+        );
     }
 
     /// A log that is still growing must never be abandoned, however many scans

@@ -51,6 +51,17 @@ const MIGRATIONS_SQL: &str = include_str!("../../buildlens-server/migrations.sql
 /// Arbitrary constant, shared by every BuildLens process on this database.
 const MIGRATION_LOCK: i64 = 0x6275_696c;
 
+/// The Postgres channel a write is announced on, and that a dashboard LISTENs
+/// to so it learns about builds it did not store itself.
+///
+/// The local setup is two processes — `buildlens collect --watch` writes, and
+/// the dashboard reads — so the dashboard cannot know a build arrived by any
+/// in-process means. It used to find out only when its response cache expired,
+/// which is why a freshly finished build did not appear until the page was
+/// reloaded. Postgres is the one thing both processes already share, so the
+/// announcement goes through it.
+pub const BUILD_CHANNEL: &str = "buildlens_builds";
+
 /// Advisory-lock class for per-day partition DDL, distinct from
 /// [`MIGRATION_LOCK`] so a long migration on one database does not block an
 /// ingest that only needs today's partition. The second key is the day, so two
@@ -100,6 +111,34 @@ pub const DAY_PARTITIONED_TABLES: &[&str] = &[
 /// this one and not the reverse; the server delegates to it. Two
 /// implementations of one schema is exactly what produced the missing-table
 /// bug the comment above `SCHEMA_SQL` describes.
+/// Announces that a build landed, so a dashboard in another process can drop
+/// its cached answers now rather than when they expire.
+///
+/// Sent after the transaction commits, never inside it. A NOTIFY issued in a
+/// transaction is queued until commit anyway, but sending it after also means a
+/// listener cannot be woken for a build that then rolls back.
+///
+/// Failure is logged and swallowed. This is a latency optimisation on top of
+/// polling that still works: a dashboard that misses the announcement refreshes
+/// on its next tick as it always did, and refusing to store a build because the
+/// notification failed would trade a real feature for a cosmetic one.
+fn notify_build_stored(client: &mut Client, build_key: &str) {
+    // `pg_notify` rather than `NOTIFY`, whose channel and payload are literals
+    // that cannot be parameterised — a build key is Xcode's string, not ours.
+    if let Err(error) = client.execute("SELECT pg_notify($1, $2)", &[&BUILD_CHANNEL, &build_key]) {
+        // Once per process, as with the partition warning above: a database
+        // that refuses NOTIFY refuses every one of them, and the fact worth
+        // seeing is that announcements are not arriving at all.
+        static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        WARNED.get_or_init(|| {
+            eprintln!(
+                "buildlens: could not announce a stored build ({error}); dashboards will \
+                 update on their next refresh instead of immediately"
+            );
+        });
+    }
+}
+
 pub fn migrate(client: &mut Client) -> Result<(), StoreError> {
     client.execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK])?;
     let result = migrate_locked(client);
@@ -502,6 +541,11 @@ impl PostgresStore {
         let mut tx = self.client.transaction()?;
         let inserted = insert_wire(&mut tx, build, &day)?;
         tx.commit()?;
+        // Only a real insert. A duplicate push changed nothing, and announcing
+        // it would wake every dashboard for a build they already show.
+        if inserted {
+            notify_build_stored(&mut self.client, &build.build_key);
+        }
         Ok(inserted)
     }
 
@@ -755,6 +799,7 @@ impl PostgresStore {
         }
 
         tx.commit()?;
+        notify_build_stored(&mut self.client, &key);
         Ok(true)
     }
 
@@ -844,6 +889,12 @@ impl PostgresStore {
             .map_err(|source| StoreError::Query { operation: "resolving a pending build", source })?;
         }
         tx.commit()?;
+        // Announced like a stored build: results arriving is what resolves a
+        // build held at `pending_tests`, so the verdict a dashboard is showing
+        // has just changed even though no new build row appeared.
+        if inserted > 0 {
+            notify_build_stored(&mut self.client, build_key);
+        }
         Ok(inserted)
     }
 

@@ -21,9 +21,16 @@ const MAX_LIMIT: i64 = 500;
 ///
 /// Five seconds is chosen against the refresh interval, not against how fast
 /// builds arrive: it collapses the repeat fetches of one polling cycle while
-/// staying far below the time it takes to notice a stale panel. A new build
-/// shows up on the next tick after this expires, and `invalidate` makes the
-/// local `collect` path immediate anyway.
+/// staying far below the time it takes to notice a stale panel.
+///
+/// It is no longer what decides when a build appears. A `LISTEN`/`NOTIFY`
+/// listener invalidates the cache as soon as one is stored, including builds
+/// written by another process — which is the normal case locally, where
+/// `collect --watch` writes and the dashboard only reads. This comment used to
+/// claim `invalidate` already made that path immediate; it did not, because
+/// nothing called it from outside this process, and a finished build could sit
+/// behind a still-fresh entry until the page was reloaded. The TTL is now only
+/// the backstop for an announcement that never arrives.
 const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Cached API responses, keyed by the exact path and query that produced them.
@@ -41,6 +48,13 @@ const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 #[derive(Default)]
 pub struct ResponseCache {
     entries: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>>,
+    /// Bumped on every [`ResponseCache::invalidate`].
+    ///
+    /// A number rather than a flag, so a client can say which value it has
+    /// already seen and be answered immediately if the data moved on while it
+    /// was away. A flag would have to be consumed by one reader, and every
+    /// other open tab would miss the edge.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl ResponseCache {
@@ -56,6 +70,20 @@ impl ResponseCache {
     /// so working out which entries survive costs more than recomputing them.
     pub fn invalidate(&self) {
         self.lock().clear();
+        // Release, paired with the Acquire in `generation`: a reader that sees
+        // the new number must also see the cleared map, or it would answer from
+        // entries this call was meant to drop.
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// How many times the cache has been invalidated.
+    ///
+    /// The dashboard's change token: a client holding a number lower than this
+    /// has stale data, whether it was invalidated by a local write or by a
+    /// build another process stored.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn lock(

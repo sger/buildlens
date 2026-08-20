@@ -39,6 +39,28 @@ type DiagTrendRow = { id:string; recorded_at:number; warnings:number; errors:num
 /// is readable by any script on this origin; that is acceptable for a token
 /// that only grants read access to build timings, but it is not a password.
 const get = async <T,>(url:string):Promise<T> => { const token=localStorage.getItem("buildlens-token")||""; const r=await fetch(url,token?{headers:{Authorization:`Bearer ${token}`}}:undefined); if(!r.ok) throw Error(`${r.status} ${url}`); return r.json(); };
+/// Waits for the backend to say the data changed, and returns the generation it
+/// reports.
+///
+/// `fetch` rather than `EventSource`, which cannot send an Authorization header
+/// and so could not talk to a `buildlens-server` with a token set. The response
+/// is one short SSE frame, so it is read as text rather than streamed.
+///
+/// The backend holds the request open until a build arrives or its own window
+/// passes, so this is a long poll: no timer decides when the page updates, the
+/// data does. `since` is what closes the gap between two calls — a build stored
+/// while no request was in flight bumps the generation, and the next call sees
+/// it has fallen behind and returns at once.
+const waitForChange = async (since:number|null):Promise<number|null> => {
+  const token=localStorage.getItem("buildlens-token")||"";
+  const url=`/api/events${since==null?"":`?since=${since}`}`;
+  const r=await fetch(url,token?{headers:{Authorization:`Bearer ${token}`}}:undefined);
+  if(!r.ok) throw Error(`${r.status} ${url}`);
+  const text=await r.text();
+  const data=/^data: (\d+)$/m.exec(text);
+  return data?Number(data[1]):null;
+};
+
 /// A 401/403 from any panel means this backend authenticates.
 const isAuthError = (message:string) => /^40[13] /.test(message);
 const seconds = (n?:number|null) => n == null ? "—" : `${n < 10 ? n.toFixed(1) : n.toFixed(0)}s`;
@@ -46,13 +68,12 @@ const ms = (n?:number|null) => n == null ? "—" : `${n.toFixed(0)}ms`;
 const percent = (n?:number|null) => n == null ? "—" : `${(n*100).toFixed(0)}%`;
 const date = (n:number) => new Date(n*1000).toLocaleString(undefined,{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
 const short = (s?:string|null) => s ? s.split("/").pop() || s : "—";
-/// How often the overview re-fetches.
+/// How often the overview re-fetches when it has to fall back to a timer.
 ///
-/// The end-to-end delay from finishing a build to seeing it is this plus the
-/// watcher's scan interval plus about a second of waiting for Xcode to finish
-/// writing the log. Two seconds here keeps that inside a few seconds, which is
-/// short enough that a build feels like it appears on its own; the requests are
-/// small reads against a local database, so the cost is trivial.
+/// No longer the normal path: the page waits on `/api/events` and refetches
+/// when a build actually lands. This is what a backend too old to serve that
+/// endpoint gets, and what takes over if it ever fails — a dashboard that
+/// stops updating is worse than one that updates on a schedule.
 const REFRESH_MS = 2000;
 
 function Sparkline({items}:{items:Trend[]}) { const points=items.filter(x=>x.total_seconds!=null); if(!points.length) return <div className="empty">Collect a build to start the trend.</div>; const max=Math.max(...points.map(x=>x.total_seconds!),1); const path=points.map((x,i)=>`${i?"L":"M"}${(i/(points.length-1||1))*100},${100-(x.total_seconds!/max)*82}`).join(" "); return <svg className="spark" viewBox="0 0 100 100" preserveAspectRatio="none"><path d={path} fill="none" stroke="currentColor" strokeWidth="2.5" vectorEffect="non-scaling-stroke"/><path d={`${path} L100,100 L0,100 Z`} fill="currentColor" opacity=".10"/></svg>; }
@@ -444,18 +465,73 @@ function Overview({tab}:{tab:TabId}) {
 
   useEffect(()=>{ load(); },[load]);
 
-  // Poll so a build collected while this page is open shows up on its own.
-  // Paused when the tab is hidden — a background tab polling forever is pure
-  // waste, and it refreshes on return anyway.
+  // Refresh when a build actually arrives, rather than on a timer.
+  //
+  // `waitForChange` is a long poll the backend holds open until something is
+  // stored, so a build shows up in well under a second without the page asking
+  // sixteen times every two seconds for answers that had not changed. The
+  // fixed interval survives only as the fallback below, for a backend too old
+  // to serve `/api/events` — and as a backstop if the endpoint fails for any
+  // other reason, since a dashboard that stops updating is worse than one that
+  // updates slowly.
+  //
+  // Paused while the tab is hidden: a background tab holding a request open
+  // occupies a worker thread for nothing, and it refreshes on return anyway.
   useEffect(()=>{
     if(!autoRefresh) return;
+    let stopped=false;
     let timer=0;
-    const tick=()=>{ if(!document.hidden) load(true); };
-    const start=()=>{ timer=window.setInterval(tick,REFRESH_MS); };
-    const onVisible=()=>{ if(!document.hidden) load(true); };
-    start();
+    // Set once `/api/events` has failed, so a backend without it is polled
+    // exactly as before instead of retrying a 404 forever.
+    let fallback=false;
+    let since:number|null=null;
+
+    const poll=()=>{ if(!document.hidden) load(true); };
+    const startFallback=()=>{
+      if(timer) return;
+      timer=window.setInterval(poll,REFRESH_MS);
+    };
+
+    const listen=async()=>{
+      while(!stopped && !fallback){
+        if(document.hidden){
+          // Wait for the tab to come back rather than holding a request open
+          // for a page nobody is looking at.
+          await new Promise<void>(resolve=>{
+            const onVisible=()=>{ if(!document.hidden){ document.removeEventListener("visibilitychange",onVisible); resolve(); } };
+            document.addEventListener("visibilitychange",onVisible);
+          });
+          if(stopped) return;
+          load(true);
+          continue;
+        }
+        try {
+          const generation=await waitForChange(since);
+          if(stopped) return;
+          if(generation==null){ fallback=true; break; }
+          // First answer only establishes the baseline; the data on screen was
+          // fetched by the load above and is already current.
+          if(since!=null && generation!==since) load(true);
+          since=generation;
+        } catch {
+          if(stopped) return;
+          // The endpoint is missing or the request failed. Either way, polling
+          // is the behaviour to fall back to.
+          fallback=true;
+          break;
+        }
+      }
+      if(!stopped && fallback) startFallback();
+    };
+
+    void listen();
+    const onVisible=()=>{ if(!document.hidden && fallback) load(true); };
     document.addEventListener("visibilitychange",onVisible);
-    return ()=>{ window.clearInterval(timer); document.removeEventListener("visibilitychange",onVisible); };
+    return ()=>{
+      stopped=true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange",onVisible);
+    };
   },[autoRefresh,load]);
 
   const visible=useMemo(()=>builds.filter(b=>(!onlyFailures||(b.status||"").toLowerCase().includes("fail"))&&(!query||`${b.id} ${b.project||""} ${b.scheme||""} ${b.status||""}`.toLowerCase().includes(query.toLowerCase()))),[builds,query,onlyFailures]);
@@ -487,7 +563,7 @@ function Overview({tab}:{tab:TabId}) {
       : "Not recorded by this backend";
   const view=TABS.find(t=>t.id===tab)!;
   return <div className="shell"><Sidebar tab={tab}/><main>
-    <header><div><h1>{view.label}</h1><p className="lede">{view.lede}</p></div><div className="header-actions">{needsToken&&<input className="token-input" type="password" value={token} onChange={e=>{setToken(e.target.value);localStorage.setItem("buildlens-token",e.target.value)}} placeholder="Server token" aria-label="Server token" title="This backend refused a request; a buildlens-server needs its BUILDLENS_TOKEN here."/>}<select value={project} onChange={e=>{setProject(e.target.value);localStorage.setItem("buildlens-project",e.target.value)}}><option value="">All projects</option>{projects.map(p=><option key={p.project} value={p.project}>{p.project} · {p.builds}</option>)}</select><button className="icon-button" onClick={()=>load(true)} title="Refresh now">↻</button><button className={`icon-button live${autoRefresh?" on":""}`} onClick={()=>{const next=!autoRefresh;setAutoRefresh(next);localStorage.setItem("buildlens-autorefresh",next?"on":"off");}} title={autoRefresh?`Updating every ${REFRESH_MS/1000}s — click to pause`:"Auto-refresh paused — click to resume"}><i/>{autoRefresh?"Live":"Paused"}</button></div></header>
+    <header><div><h1>{view.label}</h1><p className="lede">{view.lede}</p></div><div className="header-actions">{needsToken&&<input className="token-input" type="password" value={token} onChange={e=>{setToken(e.target.value);localStorage.setItem("buildlens-token",e.target.value)}} placeholder="Server token" aria-label="Server token" title="This backend refused a request; a buildlens-server needs its BUILDLENS_TOKEN here."/>}<select value={project} onChange={e=>{setProject(e.target.value);localStorage.setItem("buildlens-project",e.target.value)}}><option value="">All projects</option>{projects.map(p=><option key={p.project} value={p.project}>{p.project} · {p.builds}</option>)}</select><button className="icon-button" onClick={()=>load(true)} title="Refresh now">↻</button><button className={`icon-button live${autoRefresh?" on":""}`} onClick={()=>{const next=!autoRefresh;setAutoRefresh(next);localStorage.setItem("buildlens-autorefresh",next?"on":"off");}} title={autoRefresh?"Updating as builds arrive — click to pause":"Auto-refresh paused — click to resume"}><i/>{autoRefresh?"Live":"Paused"}</button></div></header>
     {error&&<div className="error">{error}</div>}
     {tab==="builds"&&<><section className="kpis"><Kpi icon={ICONS.layers} tone="blue" label="Builds recorded" value={String(builds.length)} foot={project||"All projects"}/><Kpi icon={ICONS.clock} tone="" label="Average duration" value={seconds(avg)} foot="Recent saved builds"/><Kpi icon={ICONS.gauge} tone="violet" label="Median / p95" value={percentiles?.enough_history?`${seconds(percentiles.p50)} / ${seconds(percentiles.p95)}`:"—"} foot={percentiles?.enough_history?`Over ${percentiles.builds} builds`:`Needs 5+ builds (${percentiles?.builds||0})`}/><Kpi icon={ICONS.alert} tone={knowsStatus&&failures?"bad":"ok"} label="Failed builds" value={canCountFailures?String(failures):"—"} foot={statusNote} valueTone={knowsStatus&&failures?"bad":undefined}/></section>
 

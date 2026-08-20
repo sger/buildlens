@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use buildlens_core::wire::{WIRE_VERSION, WireBuild};
 use std::io::Read;
 use std::sync::Arc;
+use std::time::Duration;
 use store::{Pool, PooledConnection, PostgresStore, ServerError};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
@@ -182,6 +183,113 @@ impl DashboardPool {
     }
 }
 
+/// How long a LISTEN connection waits for a notification before checking that
+/// it is still alive.
+///
+/// `timeout_iter` reports "nothing arrived" and "the server hung up" the same
+/// way, as `None`, so a listener that never times out cannot tell a quiet
+/// database from a dead connection. Waking periodically to run a trivial query
+/// is what turns the second case into a reconnect instead of a thread that
+/// sits forever believing no build has ever been stored.
+const LISTEN_POLL: Duration = Duration::from_secs(20);
+
+/// How long to wait before reconnecting a listener that failed.
+///
+/// A database that is down stays down for longer than this, so the delay only
+/// has to stop a tight reconnect loop from spinning; the dashboard keeps
+/// serving from Postgres throughout, because losing announcements costs
+/// immediacy, not correctness.
+const LISTEN_RETRY: Duration = Duration::from_secs(5);
+
+/// Watches for builds stored by *other* processes and drops the cached answers
+/// they invalidate.
+///
+/// This is what makes a locally collected build appear without a reload. The
+/// local setup runs two processes — `buildlens collect --watch` writes to
+/// Postgres, this one reads — so a write leaves no trace in this process's
+/// memory. Before this, the dashboard's cache expired on a timer and a
+/// finished build could sit invisible behind an entry that was still fresh;
+/// the fix people found was to reload the page, which built a new cache key.
+///
+/// Runs on its own connection, deliberately outside the dashboard pool: a
+/// connection parked in LISTEN is not available for queries, and taking one
+/// from a pool of four would cost a quarter of the dashboard's throughput.
+///
+/// Failure is never fatal. Every path here falls back to the polling the UI
+/// already does.
+fn listen_for_builds(database_url: String, dashboard: Arc<DashboardPool>) {
+    loop {
+        match postgres::Client::connect(&database_url, postgres::NoTls) {
+            Ok(mut client) => {
+                if let Err(error) =
+                    client.batch_execute(&format!("LISTEN {}", buildlens_storage::BUILD_CHANNEL))
+                {
+                    eprintln!(
+                        "dashboard: could not listen for builds ({error}); it will refresh on its own schedule instead"
+                    );
+                    std::thread::sleep(LISTEN_RETRY);
+                    continue;
+                }
+                // Drain until the connection breaks, then reconnect.
+                loop {
+                    // Scoped so the iterator's borrow of `client` ends before
+                    // the liveness check below needs it again.
+                    let drained = {
+                        // Re-exported by `postgres`, so reaching for it here
+                        // adds no dependency of our own.
+                        use postgres::fallible_iterator::FallibleIterator;
+                        let mut notifications = client.notifications();
+                        // Blocks until a build is announced or the timeout
+                        // passes, so an idle dashboard costs nothing.
+                        let first = notifications.timeout_iter(LISTEN_POLL).next();
+                        match first {
+                            // Take whatever else is already buffered, but do
+                            // not wait for more: `timeout_iter` spends the
+                            // whole timeout before admitting the queue is
+                            // empty, so draining it that way would hold every
+                            // notification back by `LISTEN_POLL`. The
+                            // non-blocking iterator returns what has already
+                            // arrived and stops.
+                            Ok(Some(_)) => {
+                                let mut extra = notifications.iter();
+                                while matches!(extra.next(), Ok(Some(_))) {}
+                                Ok(true)
+                            }
+                            // Nothing arrived, or the connection is gone. Which
+                            // one is settled below.
+                            Ok(None) => Ok(false),
+                            Err(error) => Err(error),
+                        }
+                    };
+                    let woken = match drained {
+                        Ok(woken) => woken,
+                        Err(error) => {
+                            eprintln!("dashboard: lost the build listener ({error}); reconnecting");
+                            break;
+                        }
+                    };
+                    if woken {
+                        // One invalidation for however many builds arrived
+                        // together: the cache is cleared wholesale, so draining
+                        // the queue first turns a burst into a single clear.
+                        dashboard.cache.invalidate();
+                    }
+                    // Proves the connection is still usable. Without it a
+                    // dropped connection looks exactly like an idle database
+                    // and this thread would never reconnect.
+                    if client.simple_query("").is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("dashboard: could not connect to listen for builds ({error}); retrying");
+            }
+        }
+        std::thread::sleep(LISTEN_RETRY);
+    }
+}
+
 /// Whether a path may be served without a token.
 ///
 /// Exactly two things, and no data among them:
@@ -323,6 +431,22 @@ pub fn run(config: Config) -> Result<()> {
             .context("connecting the dashboard to Postgres")?,
     );
 
+    // Learns about builds stored by other processes — the local
+    // `collect --watch` above all — so their cached answers are dropped as soon
+    // as they land rather than when the entry happens to expire.
+    //
+    // Detached rather than scoped: it has no shutdown path because it should
+    // outlive nothing. The process exits when the accept loop does, and a
+    // listener blocked on a socket has nothing to clean up.
+    {
+        let dashboard = Arc::clone(&dashboard);
+        let database_url = database_url.clone();
+        std::thread::Builder::new()
+            .name("buildlens-listen".into())
+            .spawn(move || listen_for_builds(database_url, dashboard))
+            .context("starting the build listener")?;
+    }
+
     let server = Arc::new(Server::http(&bind).map_err(|error| anyhow::anyhow!(error.to_string()))?);
     let limiter = Arc::new(RateLimiter::new(INGEST_PER_MINUTE));
     eprintln!("BuildLens server listening on {bind} ({threads} threads, {pool_size} connections)");
@@ -403,6 +527,69 @@ fn handle(mut request: Request, context: &Handler<'_>) -> Result<()> {
 /// Dispatches one request. Every arm returns a [`Reply`], so no path can end
 /// with the connection closed and nothing sent — a database error on a read
 /// endpoint previously did exactly that.
+/// How long `/api/events` waits for a build before answering "nothing yet".
+///
+/// Short-lived by design. A stream held open for as long as the tab is open
+/// would occupy one of the server's few worker threads for that whole time,
+/// and four open tabs would starve the local dashboard completely — its
+/// default is four threads. Answering within this window and letting
+/// `EventSource` reconnect keeps thread use bounded by *concurrent* requests
+/// rather than by open tabs, at the cost of one cheap request per tab per
+/// window.
+///
+/// Comfortably under the 30s that proxies and browsers tend to treat as an
+/// idle timeout, so a reconnect is never mistaken for a network error.
+const EVENTS_WAIT: Duration = Duration::from_secs(25);
+
+/// How often the wait checks whether the cache moved on.
+///
+/// A condvar would avoid the poll, but the generation is an atomic shared with
+/// every request path and adding a lock around it to make it waitable would
+/// slow the common case to speed up an idle one. At this interval a build is
+/// on screen well inside the time it takes to look at the page.
+const EVENTS_TICK: Duration = Duration::from_millis(100);
+
+/// Tells a browser when the dashboard's data changed, so it can refetch then
+/// rather than on a timer.
+///
+/// The client sends the generation it last saw as `?since=`; if the cache has
+/// moved past it the answer is immediate, which is what stops an update falling
+/// through the gap between two connections. Otherwise this waits for a build to
+/// arrive and answers as soon as the listener invalidates the cache.
+///
+/// One event and then the connection closes: `EventSource` reconnects on its
+/// own, so the client needs no retry logic and the server holds no state per
+/// client.
+fn events_reply(query: &str, cache: &buildlens_dashboard::ResponseCache) -> Reply {
+    let since = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("since="))
+        .and_then(|value| value.parse::<u64>().ok());
+
+    let deadline = std::time::Instant::now() + EVENTS_WAIT;
+    loop {
+        let generation = cache.generation();
+        // `None` means a client that has never seen a generation, which is
+        // answered immediately so it learns the current one and can detect
+        // every change after this point.
+        if since != Some(generation) {
+            return sse(&format!("event: builds\ndata: {generation}\n\n"));
+        }
+        if std::time::Instant::now() >= deadline {
+            // Says the generation even when nothing happened, so a client whose
+            // reconnect straddled an invalidation still resynchronises.
+            return sse(&format!("event: idle\ndata: {generation}\n\n"));
+        }
+        std::thread::sleep(EVENTS_TICK);
+    }
+}
+
+/// An SSE body. `no-store` matters more here than elsewhere: a cached event
+/// stream would replay one stale notification forever.
+fn sse(body: &str) -> Reply {
+    Reply::typed(200, body.to_owned(), "text/event-stream")
+}
+
 fn route(
     method: &Method,
     path: &str,
@@ -422,6 +609,11 @@ fn route(
     // served here behaves exactly as the local `buildlens dashboard` does.
     // Duplicating its query surface would be two implementations to keep in
     // step, and the UI would silently disagree with itself when they drifted.
+    // Before the generic `/api/` delegation: this one does not answer from the
+    // store at all, and must not be cached.
+    if method == &Method::Get && path == "/api/events" {
+        return Ok(events_reply(query, &dashboard.cache));
+    }
     if method == &Method::Get && (path == "/" || path.starts_with("/api/")) {
         let routed =
             buildlens_dashboard::route_cached(path, query, dashboard.next(), &dashboard.cache);

@@ -30,6 +30,11 @@ clap = { version = "4", features = ["derive", "env"] }
 criterion = "0.5"
 flate2 = "1"
 tiny_http = "0.12"
+# FSEvents on macOS, so the watcher reacts to a build finishing instead of
+# waiting out a scan interval. Default features off: the crate's cross-platform
+# fallback spawns a polling thread this does not want, and FSEvents is what
+# BuildLens actually runs on.
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 petgraph = "0.6"
 regex = "1"
 postgres = "0.19"

@@ -89,8 +89,15 @@ build as Xcode writes it:
 ```
 
 Then build in Xcode as usual (⌘B). Each build appears at
-**http://127.0.0.1:8787** within a few seconds — no command to run per build,
-and builds started from Xcode's UI are captured too.
+**http://127.0.0.1:8787** as it lands — no command to run per build, and builds
+started from Xcode's UI are captured too.
+
+The collector watches DerivedData with FSEvents, so it reacts when Xcode
+finishes writing a log rather than waiting out a scan interval, and the
+dashboard is told over PostgreSQL `LISTEN`/`NOTIFY` the moment a build is
+stored. The page updates when a build arrives rather than on a timer; the
+periodic scan and the timed refresh both remain as fallbacks, so a missed
+filesystem event or an older backend costs latency rather than a lost build.
 
 ```sh
 ./scripts/start.sh --stop   # stop the dashboard and collector
