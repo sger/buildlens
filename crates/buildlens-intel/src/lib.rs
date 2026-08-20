@@ -6,6 +6,7 @@
 //! reach back out to the filesystem, and no wording that assigns
 //! responsibility (see [`language`]).
 
+mod advice;
 mod bottleneck;
 mod evidence;
 mod impact;
@@ -23,10 +24,14 @@ pub fn analyze(analysis: &BuildAnalysis, regressions: &[MetricRegression]) -> In
     let impacts = impact::impacts(analysis, &graph);
     let bottlenecks = bottleneck::bottlenecks(analysis, &graph);
     let chains = evidence::chains(analysis, &impacts, regressions);
+    // Empty unless the project builds with the `-warn-long-*` frontend flags;
+    // see `advice::advice`.
+    let advice = advice::advice(analysis);
     Intelligence {
         impacts,
         bottlenecks,
         chains,
+        advice,
     }
 }
 

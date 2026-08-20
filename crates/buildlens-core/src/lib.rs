@@ -32,7 +32,10 @@ pub use diagnostics::{
 };
 pub use git::{GitCorrelation, GitOwnership, LikelyRelated};
 pub use graph::{TargetDependency, TargetGraphSummary, TargetNode};
-pub use intel::{Bottleneck, EvidenceChain, EvidenceLink, Intelligence, MatchKind, TargetImpact};
+pub use intel::{
+    Advice, AdviceKind, Bottleneck, EvidenceChain, EvidenceLink, Intelligence, MatchKind,
+    TargetImpact,
+};
 pub use metrics::{
     BuildCategory, BuildMetrics, BuildStepMetric, CacheMetrics, FileMetric, METRICS_SCHEMA_VERSION,
     MetricDiagnostic, MetricKind, MetricRegression, MetricsEnvironment, MetricsSourceKind,

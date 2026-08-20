@@ -6,7 +6,9 @@
 //! its own, and so a section with nothing to say can return `""` and disappear
 //! instead of printing an empty heading.
 
-use buildlens_core::{BuildAnalysis, BuildMetrics, GitCorrelation, GitOwnership, Intelligence};
+use buildlens_core::{
+    Advice, BuildAnalysis, BuildMetrics, GitCorrelation, GitOwnership, Intelligence,
+};
 
 /// Caps on list rendering.
 ///
@@ -17,6 +19,7 @@ use buildlens_core::{BuildAnalysis, BuildMetrics, GitCorrelation, GitOwnership, 
 const MAX_IMPACTS: usize = 5;
 const MAX_BOTTLENECKS: usize = 5;
 const MAX_CHAINS: usize = 3;
+const MAX_ADVICE: usize = 5;
 const MAX_OWNERSHIP: usize = 5;
 const MAX_SWIFT_TIMINGS: usize = 10;
 const MAX_SLOWEST_TARGETS: usize = 5;
@@ -177,6 +180,7 @@ fn intelligence_terminal(intelligence: &Intelligence) -> String {
     if intelligence.impacts.is_empty()
         && intelligence.bottlenecks.is_empty()
         && intelligence.chains.is_empty()
+        && intelligence.advice.is_empty()
     {
         return String::new();
     }
@@ -228,7 +232,26 @@ fn intelligence_terminal(intelligence: &Intelligence) -> String {
             text.push_str(&format!("  [{sign}{}] {}\n", link.weight, link.description));
         }
     }
+    if !intelligence.advice.is_empty() {
+        text.push_str("Swift type-checking:\n");
+        for advice in intelligence.advice.iter().take(MAX_ADVICE) {
+            text.push_str(&format!("  {}\n", advice_line(advice)));
+        }
+    }
     text
+}
+
+/// One advice line: where it points, then why.
+///
+/// File- and target-level advice carries no line number, so the location is
+/// built from whichever parts exist rather than printing `:0`.
+fn advice_line(advice: &Advice) -> String {
+    let location = match (advice.file.as_str(), advice.line) {
+        ("", _) => advice.target.clone().unwrap_or_default(),
+        (file, 0) => file.to_owned(),
+        (file, line) => format!("{file}:{line}"),
+    };
+    format!("{location} - {}", advice.explanation)
 }
 
 /// Metrics section, shared shape across both formats.
@@ -390,6 +413,7 @@ fn intelligence_markdown(intelligence: &Intelligence) -> String {
     if intelligence.impacts.is_empty()
         && intelligence.bottlenecks.is_empty()
         && intelligence.chains.is_empty()
+        && intelligence.advice.is_empty()
     {
         return String::new();
     }
@@ -419,6 +443,9 @@ fn intelligence_markdown(intelligence: &Intelligence) -> String {
         for link in &chain.links {
             text.push_str(&format!("\n  - {}", link.description));
         }
+    }
+    for advice in intelligence.advice.iter().take(MAX_ADVICE) {
+        text.push_str(&format!("\n- **Type-checking:** {}", advice_line(advice)));
     }
     text.push('\n');
     text
