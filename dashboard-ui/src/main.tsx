@@ -400,9 +400,21 @@ function Overview({tab}:{tab:TabId}) {
   const load=useCallback((background=false)=>{
     if(!background) setStatus("loading");
     const ok=<T,>(p:Promise<T>,fallback:T)=>p.catch(()=>fallback);
+    // The build list and the trend behind it. These two decide whether the load
+    // is reported as a failure at all — the others degrade to an empty panel,
+    // but a page with no builds and no trend has nothing to show and must say
+    // so rather than look like an empty database.
+    //
+    // They resolve rather than reject, which is the whole point: `Promise.all`
+    // rejects the moment any input does, so one failing request discarded the
+    // fourteen that had answered, and on a background poll it did that
+    // silently. Recording the reason instead lets every panel that succeeded
+    // reach the screen while the failure is still reported.
+    let failure:Error|null=null;
+    const required=<T,>(p:Promise<T>,fallback:T)=>p.catch((e:Error)=>{ failure ??= e; return fallback; });
     return Promise.all([
-      get<{items:Trend[]}>(scope("/api/trends/duration","limit=80")),
-      get<{builds:Build[]}>("/api/summary"),
+      required(get<{items:Trend[]}>(scope("/api/trends/duration","limit=80")),{items:[] as Trend[]}),
+      required(get<{builds:Build[]}>("/api/summary"),{builds:[] as Build[]}),
       ok(get<Percentiles>(scope("/api/trends/percentiles","limit=100")),null as any),
       ok(get<{items:Ranked[]}>(scope("/api/trends/targets","builds=30&top=8")),{items:[]}),
       ok(get<{items:Ranked[]}>(scope("/api/trends/phases","builds=30&top=8")),{items:[]}),
@@ -421,11 +433,20 @@ function Overview({tab}:{tab:TabId}) {
       // page was open never showed up in it.
       ok(get<{items:Project[]}>("/api/projects"),{items:null as unknown as Project[]}),
     ]).then(([t,s,pc,tg,ph,fl,sw,cl,fk,rg,en,pe,gt,dy,dt,pj])=>{
+      // Applied before the failure below is raised, so the panels that did
+      // answer reach the screen either way.
+      //
+      // The two required panels are the exception: their fallback is empty, and
+      // writing that over a good build list would turn a failed request into a
+      // dashboard reporting no builds — the very thing the fallback exists to
+      // avoid. When they failed, whatever is already on screen stays.
       const items=t.items||[];
       const byId=new Map(items.map(x=>[x.id,x]));
       const allowed=new Set(items.map(x=>x.id));
-      setTrend(items);
-      setBuilds((s.builds||[]).filter(b=>!project||allowed.has(b.id)).map(b=>({...b,...(byId.get(b.id)||{})})));
+      if(!failure){
+        setTrend(items);
+        setBuilds((s.builds||[]).filter(b=>!project||allowed.has(b.id)).map(b=>({...b,...(byId.get(b.id)||{})})));
+      }
       setPercentiles(pc); setTargets(tg.items||[]); setPhases(ph.items||[]); setFiles(fl.items||[]);
       setSwift(sw.items||[]); setClusters(cl.items||[]); setFlaky(fk.items||[]);
       setRegressions(rg.items||[]); setEnvironment(en.items||[]); setPeople(pe.items||[]); setGit(gt.items||[]);
@@ -442,6 +463,10 @@ function Overview({tab}:{tab:TabId}) {
       if(project && known && !known.some(p=>p.project===project)){
         setProject(""); localStorage.removeItem("buildlens-project");
       }
+      // Reported after the panels above have been applied, so a partial answer
+      // is a page with a banner over real data rather than a blank one. The
+      // banner is additive — it renders above the panels, not instead of them.
+      if(failure) throw failure;
       setStatus("ready"); setError(""); setUpdatedAt(Date.now());
     // A failed poll leaves the last good data on screen: a dropped request is
     // not a reason to replace a working dashboard with an error page.
