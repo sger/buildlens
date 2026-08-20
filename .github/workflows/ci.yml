@@ -1,0 +1,177 @@
+# Continuous integration.
+#
+# Runs on Linux for everything that is platform-neutral, and on macOS for the
+# parts that are not. BuildLens is a macOS tool — it reads .xcactivitylog files
+# and shells out to sysctl/pmset — but none of that is gated at compile time, so
+# the code builds and unit-tests fine on Linux. Linux runners are the cheaper
+# and faster of the two, so they carry the bulk of the work and macOS runs the
+# suite once to catch anything genuinely platform-dependent.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets a red main be re-run without an empty commit.
+  workflow_dispatch:
+
+# A force-push or a quick follow-up commit makes the in-flight run obsolete.
+# Cancel it rather than paying for a result nobody will read. Not applied to
+# main, where each commit's result is a record worth keeping.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # A CI failure that prints no backtrace costs a whole round trip to reproduce.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Formatting and lints. Split from the test job because they need no database
+  # and no build artifacts, so they report in well under a minute and give the
+  # fast "you forgot to run fmt" answer without waiting on the suite.
+  lint:
+    name: rustfmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        # Pinned to the toolchain the Dockerfile builds with, so a lint that
+        # passes here cannot fail in the release image.
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.96.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      # Warnings are denied rather than merely printed: a warning nobody is
+      # forced to read accumulates until the output is noise. The workspace is
+      # clean as of this commit, so this starts green.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # The dashboard UI is a React app bundled into a single committed HTML file
+  # that buildlens-dashboard embeds with include_str!. Editing dashboard-ui/src
+  # without rebuilding leaves a stale bundle that still compiles and still
+  # passes every Rust test — the failure is invisible until someone opens the
+  # page. build.mjs --check exists precisely for this, so CI runs it.
+  dashboard-bundle:
+    name: dashboard bundle is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard-ui/package-lock.json
+
+      - name: Install dependencies
+        working-directory: dashboard-ui
+        # `npm ci` rather than `install`: the lockfile is committed and CI
+        # should build what it pins, not silently resolve something newer.
+        run: npm ci
+
+      - name: Check the committed bundle matches the sources
+        working-directory: dashboard-ui
+        run: node build.mjs --check
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing is not a reason to cancel the other: knowing
+      # whether a failure is macOS-specific is most of the diagnosis.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}
+
+      - name: cargo build
+        run: cargo build --workspace --all-targets
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  # The Postgres-backed tests in buildlens-server and buildlens-storage skip
+  # themselves when BUILDLENS_TEST_DATABASE_URL is unset, and report the skip as
+  # `ignored`. That is right for a laptop without a database and wrong for CI:
+  # a run that silently exercises none of the storage layer looks identical to
+  # one that passes it. This job supplies a real database and sets
+  # BUILDLENS_REQUIRE_DATABASE=1 so a missing URL is a failure, not a skip.
+  test-postgres:
+    name: test against Postgres
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: buildlens
+          POSTGRES_PASSWORD: buildlens
+          POSTGRES_DB: buildlens_test
+        ports:
+          - 5432:5432
+        # Without this the steps below start racing the database's own
+        # initialisation, which fails intermittently rather than outright.
+        options: >-
+          --health-cmd "pg_isready -U buildlens -d buildlens_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-postgres
+
+      - name: cargo test -p buildlens-server -p buildlens-storage
+        env:
+          BUILDLENS_TEST_DATABASE_URL: postgres://buildlens:buildlens@localhost:5432/buildlens_test
+          BUILDLENS_REQUIRE_DATABASE: "1"
+        run: cargo test -p buildlens-server -p buildlens-storage
+
+  # Builds the team-server image the same way a deployment would. Does not push:
+  # publishing is the release workflow's job. This only answers "does the
+  # Dockerfile still build", which breaks quietly whenever a crate is added to
+  # the workspace, because the Dockerfile lists every manifest by hand.
+  docker:
+    name: docker image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

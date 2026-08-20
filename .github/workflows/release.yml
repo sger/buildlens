@@ -1,0 +1,210 @@
+# Release: cut a GitHub Release with prebuilt macOS binaries.
+#
+# Triggered by pushing a tag:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# macOS only, and both architectures. The README's requirements are explicit —
+# activity logs, sysctl/pmset metadata, Xcode — so a Linux build of the CLI
+# would be a binary that runs but cannot do the one thing it is for. The team
+# server is distributed as a container image instead (see Dockerfile).
+#
+# The tag is the source of truth for the version, and it is checked against
+# Cargo.toml rather than trusted: a v0.2.0 tag on a tree that still says 0.1.0
+# produces binaries that report the wrong version to every user who runs
+# `buildlens --version`, and tags are painful to retract once pushed.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Allows a dry run against a branch: builds and uploads the artifacts to the
+  # Actions run, but publishes no Release (see the `if` on `publish`).
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  # Fails the release before anything is built, rather than after two matrix
+  # legs have run. A mismatch here means the tag was cut from the wrong commit.
+  verify-version:
+    name: tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: check
+        run: |
+          set -euo pipefail
+          manifest="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
+
+          # workflow_dispatch has no tag to compare against; the check applies
+          # to real tag pushes only.
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "manual run — skipping tag comparison (workspace version $manifest)"
+            exit 0
+          fi
+
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::tag v$tag does not match the workspace version $manifest in Cargo.toml." \
+                 "Update [workspace.package] version, commit, and re-cut the tag."
+            exit 1
+          fi
+          echo "tag v$tag matches Cargo.toml"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: verify-version
+    # macos-14 and later are Apple Silicon, which cross-compiles to x86_64
+    # through the same SDK, so one runner covers both slices.
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            label: macos-arm64
+          - target: x86_64-apple-darwin
+            label: macos-x86_64
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # Only the CLI. buildlens-server is a Linux/container deployment and has
+      # no business in a macOS release archive.
+      - name: cargo build --release
+        run: cargo build --release --locked --target ${{ matrix.target }} -p buildlens-cli
+
+      # The suite runs here too, on the host architecture only — a
+      # cross-compiled x86_64 binary cannot be executed on an arm64 runner.
+      # Publishing an untested binary is how a broken release reaches users.
+      - name: cargo test
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: cargo test --workspace --locked
+
+      - name: Smoke-test the binary
+        if: matrix.target == 'aarch64-apple-darwin'
+        # Proves the artifact actually runs and can do real work, against a
+        # fixture committed to this repo. A binary that fails to launch —
+        # a missing dylib, a bad target — otherwise ships silently.
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/buildlens"
+          "$bin" --version
+          "$bin" analyze fixtures/sample.log > /dev/null
+          echo "smoke test passed"
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version="${{ needs.verify-version.outputs.version }}"
+          name="buildlens-${version}-${{ matrix.label }}"
+          staging="dist/$name"
+          mkdir -p "$staging"
+
+          cp "target/${{ matrix.target }}/release/buildlens" "$staging/"
+          cp README.md "$staging/"
+          # The post-action script is how a user wires BuildLens into Xcode;
+          # a release without it is a binary with no obvious way in.
+          cp scripts/xcode-post-action.sh "$staging/"
+
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          # Checksums are generated next to the archive and published with it,
+          # so a download can be verified without trusting the transport.
+          shasum -a 256 "dist/$name.tar.gz" | awk '{print $1"  '"$name"'.tar.gz"}' \
+            > "dist/$name.tar.gz.sha256"
+          echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: buildlens-${{ matrix.label }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: [verify-version, build]
+    # Never publishes from a manual run — that mode exists to rehearse the
+    # build, and a dry run that creates a public Release is not a dry run.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      # The only job that needs write access, and it needs it solely to create
+      # the Release. Every other job above runs read-only.
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Collect checksums
+        # One file listing every archive, which is what a `shasum -c` against a
+        # full download expects.
+        run: |
+          set -euo pipefail
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+          echo "released artifacts:"
+          ls -la
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          # Notes are assembled from the commits since the previous tag. The
+          # repo writes descriptive commit subjects, so this reads well without
+          # a hand-maintained changelog.
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## Install
+
+            Download the archive for your Mac, verify it, and put the binary on your `PATH`:
+
+            ```sh
+            tar -xzf buildlens-${{ needs.verify-version.outputs.version }}-macos-arm64.tar.gz
+            shasum -a 256 -c SHA256SUMS
+            install buildlens-${{ needs.verify-version.outputs.version }}-macos-arm64/buildlens /usr/local/bin/
+            ```
+
+            Use `macos-x86_64` instead on an Intel Mac.
+
+            The binaries are unsigned, so the first run needs Gatekeeper to be told
+            explicitly that they are yours:
+
+            ```sh
+            xattr -d com.apple.quarantine /usr/local/bin/buildlens
+            ```
+
+            **Requirements:** macOS and Xcode. The team server ships as a container
+            image built from the `Dockerfile` in this repo, not as a binary here.

@@ -1,5 +1,7 @@
 # BuildLens
 
+[![CI](https://github.com/sger/buildlens/actions/workflows/ci.yml/badge.svg)](https://github.com/sger/buildlens/actions/workflows/ci.yml)
+
 Deterministic intelligence for `xcodebuild` logs. Point it at a build log or an
 `.xcactivitylog` and it extracts diagnostics, test results, target dependency
 graphs, precise build timings, PostgreSQL-backed history and regression
@@ -313,6 +315,57 @@ compiled has no test results at all — and `any` covers both.
 | Dependency graph | including `why <target>` |
 | Retention | `history prune --keep-days N` |
 | Works with no backend | yes — `analyze` needs nothing but a log |
+
+## Continuous integration and releases
+
+CI runs on every pull request and every push to `main`
+(`.github/workflows/ci.yml`). It gates on formatting (`cargo fmt --check`) and
+lints (`cargo clippy -- -D warnings`), builds and tests on both Linux and
+macOS, builds the team-server image, and checks two things that otherwise fail
+silently:
+
+- **The dashboard bundle is current.** `crates/buildlens-dashboard/assets/index.html`
+  is generated from `dashboard-ui/src` and committed. Editing the sources
+  without rebuilding leaves a stale UI that still compiles and still passes
+  every Rust test, so CI runs `node dashboard-ui/build.mjs --check`.
+- **The storage tests actually ran.** The Postgres tests skip themselves when
+  `BUILDLENS_TEST_DATABASE_URL` is unset. CI supplies a real database and sets
+  `BUILDLENS_REQUIRE_DATABASE=1`, which turns a missing URL into a failure
+  rather than a green run that exercised nothing.
+
+Everything CI checks can be run locally:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+node dashboard-ui/build.mjs --check
+```
+
+### Cutting a release
+
+Releases are built by `.github/workflows/release.yml` when a `v*` tag is
+pushed. Bump `[workspace.package] version` in `Cargo.toml` first — the workflow
+compares the tag against it and refuses to publish a mismatch, because the
+version is compiled into the binary and a wrong one is reported to every user
+who runs `buildlens --version`.
+
+```sh
+# after committing the version bump
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow builds `buildlens` for both `aarch64-apple-darwin` and
+`x86_64-apple-darwin`, runs the suite and a smoke test against a fixture on the
+native slice, and publishes a GitHub Release with the two archives, a
+`SHA256SUMS` file, and notes generated from the commits since the previous tag.
+
+Only the CLI is released as a binary; macOS is a hard requirement for it. The
+team server is distributed as a container image built from the `Dockerfile`.
+
+Running the workflow manually from the Actions tab builds and uploads the
+archives without publishing a Release, which is the way to rehearse a release.
 
 ## Notes
 
