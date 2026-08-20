@@ -146,10 +146,13 @@ function Bars({rows,empty}:{rows:{key:string;label:React.ReactNode;note?:React.R
 /// absent, so the build was never measured. Timings but no advice means it was
 /// measured and nothing crossed a threshold -- a healthy build, and telling
 /// someone to enable flags they already have reads as a broken panel.
-function AdviceList({rows,measured}:{rows:AdviceRow[];measured:boolean}) {
-  if(!rows.length) return <div className="empty">{measured
-    ? "Nothing stands out — type-checking is a small share of this build, and no single site or file dominates it."
-    : "Not enabled for this build — add -warn-long-function-bodies or -warn-long-expression-type-checking to see advice."}</div>;
+function AdviceList({rows,measured,noop}:{rows:AdviceRow[];measured:boolean;noop:boolean}) {
+  if(!rows.length) return <div className="empty">{
+    noop
+      ? "Nothing was compiled in this build — the hotspots below were recorded in the build Xcode replayed, not in this one."
+      : measured
+        ? "Nothing stands out — type-checking is a small share of this build, and no single site or file dominates it."
+        : "Not enabled for this build — add -warn-long-function-bodies or -warn-long-expression-type-checking to see advice."}</div>;
   return <ul className="advice">{rows.map((a,index)=>{
     const where = a.file ? (a.line ? `${short(a.file)}:${a.line}` : short(a.file)) : (a.target||"");
     return <li key={`${a.kind}:${a.file}:${a.line??0}:${index}`}>
@@ -272,7 +275,7 @@ function BuildPage({id}:{id:string}) {
           <Bars empty="No per-file timings in this build." rows={(build.files||[]).slice(0,25).map(f=>({key:f.file,label:<span title={f.file}>{short(f.file)}</span>,value:f.seconds,display:seconds(f.seconds),note:`${f.target||"unknown target"}${(f.compilations||0)>1?` · compiled ${f.compilations}×`:""}`}))}/>
         </Section>
         <Section title="Swift type-checking advice" note="What the hotspots below add up to">
-          <AdviceList rows={build.advice||[]} measured={(build.swift||[]).length>0}/>
+          <AdviceList rows={build.advice||[]} measured={(build.swift||[]).length>0} noop={build.category==="noop"}/>
         </Section>
         <Section title="Swift type-check hotspots" note="Needs -warn-long-function-bodies">
           <Bars empty="Not enabled for this build — add -warn-long-function-bodies or -warn-long-expression-type-checking to see hotspots." rows={(build.swift||[]).slice(0,25).map(s=>({key:`${s.file}:${s.line}:${s.kind}`,label:<span title={`${s.file}:${s.line}`}>{s.symbol||`${short(s.file)}:${s.line}`}</span>,value:s.milliseconds,display:ms(s.milliseconds),note:`${s.kind.replace(/_/g," ")} · ${short(s.file)}:${s.line}`}))}/>

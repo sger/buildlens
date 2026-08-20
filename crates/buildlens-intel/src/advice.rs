@@ -7,7 +7,9 @@
 //! to see the expression text is a separate, local-only concern.
 
 use crate::language;
-use buildlens_core::{Advice, AdviceKind, BuildAnalysis, SwiftTimingKind, SwiftTimingMetric};
+use buildlens_core::{
+    Advice, AdviceKind, BuildAnalysis, BuildCategory, SwiftTimingKind, SwiftTimingMetric,
+};
 use std::collections::BTreeMap;
 
 /// A single site below this is not worth a line of output.
@@ -61,7 +63,7 @@ pub fn advice(analysis: &BuildAnalysis) -> Vec<Advice> {
         .iter()
         .map(|target| (target.name.as_str(), target.seconds))
         .collect();
-    from_timings(&metrics.swift_timings, &seconds_by_target)
+    from_timings(&metrics.swift_timings, &seconds_by_target, metrics.category)
 }
 
 /// The same analysis, over timings that did not come from a parsed log.
@@ -76,7 +78,20 @@ pub fn advice(analysis: &BuildAnalysis) -> Vec<Advice> {
 pub fn from_timings(
     timings: &[SwiftTimingMetric],
     seconds_by_target: &[(&str, f64)],
+    category: BuildCategory,
 ) -> Vec<Advice> {
+    // A noop build compiled nothing: Xcode replayed a previous build's log, so
+    // these timings record type-checking that happened in *that* build, beside
+    // per-target seconds inherited from it. Advising on them would attribute
+    // another build's cost to this one, and the share rules would divide this
+    // build's milliseconds by a duration it never spent — one real noop here
+    // reported 0.59s total against a 27.22s target.
+    //
+    // Silence rather than a caveat: there is no version of "this expression is
+    // slow" that is true of a build which ran no compiler.
+    if category == BuildCategory::Noop {
+        return Vec::new();
+    }
     if timings.is_empty() {
         return Vec::new();
     }
@@ -549,6 +564,34 @@ mod tests {
         assert!(
             advice(&analysis).is_empty(),
             "a build spending 7% of a target on type-checking has nothing to advise"
+        );
+    }
+
+    /// A noop build compiled nothing — Xcode replayed a previous build's log,
+    /// so its timings and its per-target seconds both belong to that earlier
+    /// build. A real one recorded 0.59s total beside a 27.22s target, which is
+    /// the denominator the share rules would otherwise divide by.
+    #[test]
+    fn a_noop_build_gets_no_advice_however_slow_its_replayed_timings() {
+        let timings = vec![timing(
+            SwiftTimingKind::TypeCheck,
+            "/app/Slow.swift",
+            47,
+            None,
+            3_800.0,
+            "App",
+        )];
+        // The same timings on a real build do produce advice, so this is the
+        // category deciding it and not the threshold.
+        assert!(!advice(&analysis_with_timings(timings.clone())).is_empty());
+
+        let mut analysis = analysis_with_timings(timings);
+        if let Some(metrics) = analysis.metrics.as_mut() {
+            metrics.category = BuildCategory::Noop;
+        }
+        assert!(
+            advice(&analysis).is_empty(),
+            "a build that ran no compiler has no type-checking to advise on"
         );
     }
 

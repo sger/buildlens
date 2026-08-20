@@ -1061,7 +1061,15 @@ impl PostgresStore {
                 .iter()
                 .map(|(name, seconds)| (name.as_str(), *seconds))
                 .collect();
-            buildlens_intel::from_timings(&timings, &seconds_by_target)
+            // Stored as the string `BuildCategory::as_str` writes, so it round
+            // trips through the same names rather than a second mapping.
+            let category = match r.get::<_, String>(3).as_str() {
+                "clean" => buildlens_core::BuildCategory::Clean,
+                "incremental" => buildlens_core::BuildCategory::Incremental,
+                "noop" => buildlens_core::BuildCategory::Noop,
+                _ => buildlens_core::BuildCategory::Unknown,
+            };
+            buildlens_intel::from_timings(&timings, &seconds_by_target, category)
         };
         Ok(Some(serde_json::json!({
             "id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"project":r.get::<_,String>(2),"category":r.get::<_,String>(3),
