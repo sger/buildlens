@@ -25,6 +25,8 @@ use buildlens_core::wire::{
     WireSwiftTiming, WireTarget, WireTest,
 };
 use postgres::{Client, NoTls};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 
 fn database_url() -> Option<String> {
     match std::env::var("BUILDLENS_TEST_DATABASE_URL") {
@@ -39,7 +41,17 @@ fn database_url() -> Option<String> {
 /// Tests run in parallel, so each gets its own Postgres schema rather than
 /// sharing `public` — concurrent CREATE TABLE in one schema deadlocks on
 /// pg_type regardless of IF NOT EXISTS.
+///
+/// The name must be unique across the whole file, and that is enforced rather
+/// than left to review. Two tests sharing one name do not merely share a
+/// schema: the second one to start executes `DROP SCHEMA ... CASCADE` on the
+/// tables the first is still using, so the first fails somewhere far from the
+/// cause — a deadlock between the migrating connection and the inserting one,
+/// or a missing relation, depending on where it had got to. That is exactly
+/// what happened once CI first ran these against a real database, and it
+/// presented as a flake in an unrelated-looking assertion.
 fn isolated_url(base: &str, name: &str) -> String {
+    claim_schema_name(name);
     let mut client = Client::connect(base, NoTls).expect("connect to test database");
     client
         .batch_execute(&format!(
@@ -48,6 +60,23 @@ fn isolated_url(base: &str, name: &str) -> String {
         .expect("create test schema");
     let separator = if base.contains('?') { '&' } else { '?' };
     format!("{base}{separator}options=-c%20search_path%3D{name}")
+}
+
+/// Fails the moment a schema name is used twice, naming the collision.
+///
+/// A duplicate is a test bug, not a database problem, and it is worth turning
+/// into an immediate and legible failure: debugging it from the downstream
+/// symptom means reading a deadlock report about relation OIDs.
+fn claim_schema_name(name: &str) {
+    static CLAIMED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    assert!(
+        CLAIMED
+            .lock()
+            .expect("schema registry")
+            .insert(name.to_owned()),
+        "two tests both use the schema {name:?}; each test needs its own, \
+         because isolated_url drops and recreates the schema it is given"
+    );
 }
 
 fn build(key: &str, seconds: f64, started_at: Option<f64>, machine: Option<&str>) -> WireBuild {
@@ -409,7 +438,7 @@ fn build_detail_reports_both_diagnostic_counts() {
         eprintln!("skipping: BUILDLENS_TEST_DATABASE_URL not set");
         return;
     };
-    let url = isolated_url(&url, "t_detail");
+    let url = isolated_url(&url, "t_detail_counts");
     let mut store = buildlens_server_store(&url);
 
     let mut wire = build("counts", 10.0, Some(1_700_000_000.0), Some("m1"));

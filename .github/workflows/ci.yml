@@ -123,12 +123,15 @@ jobs:
     runs-on: ubuntu-latest
 
     services:
+      # The same image the compose files use, from quay.io. Not Docker Hub:
+      # the Dockerfile is explicit that this project does not depend on it, and
+      # a CI service container is no reason to start.
       postgres:
-        image: postgres:16
+        image: quay.io/sclorg/postgresql-16-c9s:latest
         env:
-          POSTGRES_USER: buildlens
-          POSTGRES_PASSWORD: buildlens
-          POSTGRES_DB: buildlens_test
+          POSTGRESQL_USER: buildlens
+          POSTGRESQL_PASSWORD: buildlens
+          POSTGRESQL_DATABASE: buildlens_test
         ports:
           - 5432:5432
         # Without this the steps below start racing the database's own
