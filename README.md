@@ -12,6 +12,34 @@ loop.
 dashboard binds `127.0.0.1` only. Logs are read in place, never copied. The
 optional team server is inert unless you explicitly pass `--server`.
 
+**Two tiers, and only one of them needs a database.** Analysis — `analyze`,
+`why`, `warnings`, `failures`, `tests`, `graph`, `metrics` — is a single binary
+reading a log, with no services and nothing to configure. History across builds
+— the dashboard, regression detection, flaky-test tracking — needs PostgreSQL,
+and [one command](#record-every-build-automatically) starts it. Start with the
+first tier; you can stay there indefinitely.
+
+## Why was this target rebuilt?
+
+The question every incremental build raises, answered from the log:
+
+```sh
+cargo run -- why FirebaseCrashlytics fixtures/sample.log
+```
+
+```
+Why was FirebaseCrashlytics built?
+
+AppTests
+    ↓
+App
+    ↓
+FirebaseCrashlytics
+```
+
+The shortest path through the dependency graph explaining the rebuild — not a
+list of what changed, but the chain that carried the change to this target.
+
 ## Install
 
 Build from a clone:
@@ -21,8 +49,9 @@ cargo build --release          # binary at target/release/buildlens
 cargo test --workspace         # confirm the build is sound
 ```
 
-One binary, no services, nothing to configure. Copy `target/release/buildlens`
-onto your `PATH`, or run it through `cargo run --` as the examples below do.
+One binary. Copy `target/release/buildlens` onto your `PATH`, or run it through
+`cargo run --` as the examples below do. Every analysis command works from here
+with no further setup; only the history and dashboard commands need PostgreSQL.
 
 The dashboard UI is a React app bundled into a single HTML file at
 `crates/buildlens-dashboard/assets/index.html`, which the crate embeds with
@@ -81,8 +110,9 @@ cargo run -- analyze build.log
 
 ### Record every build automatically
 
-One command starts PostgreSQL, the dashboard, and a collector that imports each
-build as Xcode writes it:
+This is the tier that needs PostgreSQL. One command starts it, the dashboard,
+and a collector that imports each build as Xcode writes it — `podman` or
+`docker` is the only prerequisite:
 
 ```sh
 ./scripts/start.sh
@@ -389,7 +419,9 @@ archives without publishing a Release, which is the way to rehearse a release.
 ## Repository layout
 
 A workspace of small crates, all depending on `buildlens-core`, which holds the
-shared data types and no logic.
+shared data types and no logic. [ARCHITECTURE.md](ARCHITECTURE.md) covers the
+parts that are not obvious from the code: the SLF0 activity-log decoder, the
+day-partitioned storage layout, and how liveness works.
 
 | Crate | Responsibility |
 | --- | --- |
