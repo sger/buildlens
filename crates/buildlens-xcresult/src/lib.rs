@@ -136,7 +136,9 @@ pub struct ManifestEntry {
 /// manifest observed is XML — so an unreadable file yields no entries rather
 /// than an error, and the caller falls back to no results instead of failing.
 pub fn manifest_entries(project_dir: impl AsRef<Path>) -> Vec<ManifestEntry> {
-    let path = project_dir.as_ref().join("Logs/Test/LogStoreManifest.plist");
+    let path = project_dir
+        .as_ref()
+        .join("Logs/Test/LogStoreManifest.plist");
     let Ok(xml) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
@@ -172,7 +174,9 @@ pub fn parse_manifest(xml: &str) -> Vec<ManifestEntry> {
             pending_key = Some(key.to_owned());
             continue;
         }
-        let Some(key) = pending_key.take() else { continue };
+        let Some(key) = pending_key.take() else {
+            continue;
+        };
         match key.as_str() {
             "auxiliaryLogUniqueIdentifier" => {
                 // First key of an entry, so the previous entry is complete.
@@ -234,7 +238,10 @@ pub fn newest_bundle(project_dir: impl AsRef<Path>) -> Result<Option<PathBuf>, X
     let mut bundles: Vec<(std::time::SystemTime, PathBuf)> = entries
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "xcresult"))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "xcresult")
+        })
         .filter_map(|path| {
             let modified = path.metadata().and_then(|meta| meta.modified()).ok()?;
             Some((modified, path))
@@ -255,16 +262,29 @@ pub fn test_runs(bundle: impl AsRef<Path>) -> Result<Vec<TestRun>, XcresultError
     if !path.exists() {
         return Err(XcresultError::Missing { path: display });
     }
-    if path.extension().is_none_or(|extension| extension != "xcresult") {
+    if path
+        .extension()
+        .is_none_or(|extension| extension != "xcresult")
+    {
         return Err(XcresultError::NotABundle { path: display });
     }
     let output = Command::new("xcrun")
-        .args(["xcresulttool", "get", "test-results", "tests", "--compact", "--path"])
+        .args([
+            "xcresulttool",
+            "get",
+            "test-results",
+            "tests",
+            "--compact",
+            "--path",
+        ])
         .arg(path)
         .output()
         .map_err(|error| match error.kind() {
             std::io::ErrorKind::NotFound => XcresultError::ToolMissing,
-            _ => XcresultError::ToolFailed { path: display.clone(), message: error.to_string() },
+            _ => XcresultError::ToolFailed {
+                path: display.clone(),
+                message: error.to_string(),
+            },
         })?;
     if !output.status.success() {
         return Err(XcresultError::ToolFailed {
@@ -523,7 +543,11 @@ mod tests {
     fn durations_are_read_from_each_attempt() {
         let runs = runs();
         let flaky = find(&runs, "testFlakyNetworkCall()");
-        assert!(flaky[0].duration_seconds.is_some_and(|seconds| seconds > 0.0));
+        assert!(
+            flaky[0]
+                .duration_seconds
+                .is_some_and(|seconds| seconds > 0.0)
+        );
         assert_ne!(flaky[0].duration_seconds, flaky[1].duration_seconds);
     }
 
@@ -539,7 +563,10 @@ mod tests {
     #[test]
     fn an_unknown_verdict_is_never_treated_as_passing() {
         assert_eq!(status_of(Some("unknown")), TestStatus::Started);
-        assert_eq!(status_of(Some("Something Apple Adds In 2027")), TestStatus::Started);
+        assert_eq!(
+            status_of(Some("Something Apple Adds In 2027")),
+            TestStatus::Started
+        );
         assert_eq!(status_of(None), TestStatus::Started);
     }
 
@@ -573,7 +600,11 @@ mod tests {
     /// after a plain build, not an error.
     #[test]
     fn a_project_with_no_test_run_yields_no_bundle() {
-        assert!(newest_bundle("/tmp/definitely-not-a-derived-data-dir").unwrap().is_none());
+        assert!(
+            newest_bundle("/tmp/definitely-not-a-derived-data-dir")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Xcode.app names its bundles `Test-<Scheme>-<timestamp>.xcresult` and
@@ -584,14 +615,19 @@ mod tests {
         let root = std::env::temp_dir().join(format!("buildlens-xcr-{}", std::process::id()));
         let logs = root.join("Logs/Test");
         std::fs::create_dir_all(&logs).expect("temp dirs");
-        for name in ["Test-App-2026.01.01_10-00-00.xcresult", "Test-App-2026.06.01_10-00-00.xcresult"] {
+        for name in [
+            "Test-App-2026.01.01_10-00-00.xcresult",
+            "Test-App-2026.06.01_10-00-00.xcresult",
+        ] {
             std::fs::create_dir_all(logs.join(name)).expect("bundle dir");
             // Touched in order, so the second is newer by mtime.
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         // A non-bundle sibling must be ignored rather than chosen.
         std::fs::write(logs.join("LogStoreManifest.plist"), b"x").expect("manifest");
-        let found = newest_bundle(&root).expect("discovery succeeds").expect("a bundle");
+        let found = newest_bundle(&root)
+            .expect("discovery succeeds")
+            .expect("a bundle");
         assert_eq!(
             found.file_name().unwrap().to_string_lossy(),
             "Test-App-2026.06.01_10-00-00.xcresult"
@@ -635,9 +671,9 @@ mod tests {
     #[test]
     fn unit_test_runs_are_labelled_as_such() {
         assert!(
-            parse_manifest(MANIFEST)
-                .iter()
-                .any(|entry| entry.domain_type.as_deref() == Some("com.apple.dt.unit.cocoaUnitTest"))
+            parse_manifest(MANIFEST).iter().any(
+                |entry| entry.domain_type.as_deref() == Some("com.apple.dt.unit.cocoaUnitTest")
+            )
         );
     }
 

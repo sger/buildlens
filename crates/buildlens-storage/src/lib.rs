@@ -20,14 +20,22 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
-    #[error("PostgreSQL error: {0}")] Database(#[from] postgres::Error),
-    #[error("serialization error: {0}")] Json(#[from] serde_json::Error),
-    #[error("build has no usable activity-log metrics")] UnusableBuild,
-    #[error("PostgreSQL {operation}: {source}")] Query { operation: &'static str, source: postgres::Error },
+    #[error("PostgreSQL error: {0}")]
+    Database(#[from] postgres::Error),
+    #[error("serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("build has no usable activity-log metrics")]
+    UnusableBuild,
+    #[error("PostgreSQL {operation}: {source}")]
+    Query {
+        operation: &'static str,
+        source: postgres::Error,
+    },
     /// `migrations.sql` could not be parsed. A programming error rather than a
     /// runtime one — the file is compiled in — so it surfaces at startup,
     /// before any work, rather than leaving a migration quietly unapplied.
-    #[error("invalid migration definition: {0}")] Migration(String),
+    #[error("invalid migration definition: {0}")]
+    Migration(String),
 }
 
 /// The canonical schema, shared by every crate that opens a BuildLens
@@ -136,15 +144,25 @@ fn parse_migrations(sql: &str) -> Result<Vec<Migration<'_>>, String> {
             let (Some(version), Some(name)) = (parts.next(), parts.next()) else {
                 return Err(format!("malformed migration header: {line}"));
             };
-            migrations.push(Migration { version, name, sql: String::new() });
+            migrations.push(Migration {
+                version,
+                name,
+                sql: String::new(),
+            });
         } else if let Some(current) = migrations.last_mut() {
             current.sql.push_str(line);
             current.sql.push('\n');
         }
     }
     for (index, migration) in migrations.iter().enumerate() {
-        if migrations[..index].iter().any(|other| other.version == migration.version) {
-            return Err(format!("duplicate migration version: {}", migration.version));
+        if migrations[..index]
+            .iter()
+            .any(|other| other.version == migration.version)
+        {
+            return Err(format!(
+                "duplicate migration version: {}",
+                migration.version
+            ));
         }
     }
     Ok(migrations)
@@ -212,8 +230,10 @@ fn partition_name(table: &str, day: &str) -> String {
 /// `DROP TABLE` — would otherwise report as present and quietly send the missing
 /// tables' rows to their defaults.
 fn day_partition_exists(client: &mut Client, day: &str) -> Result<bool, StoreError> {
-    let names: Vec<String> =
-        DAY_PARTITIONED_TABLES.iter().map(|table| partition_name(table, day)).collect();
+    let names: Vec<String> = DAY_PARTITIONED_TABLES
+        .iter()
+        .map(|table| partition_name(table, day))
+        .collect();
     let row = client
         .query_one(
             "SELECT count(*) = cardinality($1::TEXT[])
@@ -221,7 +241,10 @@ fn day_partition_exists(client: &mut Client, day: &str) -> Result<bool, StoreErr
              WHERE to_regclass(name) IS NOT NULL",
             &[&names],
         )
-        .map_err(|source| StoreError::Query { operation: "checking for a partition", source })?;
+        .map_err(|source| StoreError::Query {
+            operation: "checking for a partition",
+            source,
+        })?;
     Ok(row.get(0))
 }
 
@@ -298,7 +321,10 @@ pub fn ensure_day_partitions(client: &mut Client, day: &str) -> Result<(), Store
         if error.code().map(|code| code.code()) == Some("42P07") {
             return Ok(());
         }
-        return Err(StoreError::Query { operation: "creating a day partition", source: error });
+        return Err(StoreError::Query {
+            operation: "creating a day partition",
+            source: error,
+        });
     }
     Ok(())
 }
@@ -329,7 +355,10 @@ pub fn ensure_partition_window(
              WHERE to_regclass('builds_p' || replace(day, '-', '')) IS NULL",
             &[&days],
         )
-        .map_err(|source| StoreError::Query { operation: "listing missing partitions", source })?
+        .map_err(|source| StoreError::Query {
+            operation: "listing missing partitions",
+            source,
+        })?
         .iter()
         .map(|row| row.get(0))
         .collect();
@@ -344,7 +373,9 @@ fn window_days(anchor: &str, back: i64, ahead: i64) -> Vec<String> {
     let Ok(center) = days_from_civil(anchor) else {
         return Vec::new();
     };
-    ((center - back)..=(center + ahead)).map(civil_from_days).collect()
+    ((center - back)..=(center + ahead))
+        .map(civil_from_days)
+        .collect()
 }
 
 /// A stable per-day key for the advisory lock's second argument.
@@ -410,7 +441,10 @@ pub struct PostgresStore {
 
 impl PostgresStore {
     pub fn connect(url: &str) -> Result<Self, StoreError> {
-        let mut store = Self { client: Client::connect(url, NoTls)?, url: url.to_owned() };
+        let mut store = Self {
+            client: Client::connect(url, NoTls)?,
+            url: url.to_owned(),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -482,11 +516,24 @@ impl PostgresStore {
     /// result is, where a text log only implies it by position. Passing them
     /// through rather than re-deriving keeps Xcode's numbering intact even
     /// when parallel destinations interleaved the log the run also produced.
-    pub fn save_analysis_with_attempts(&mut self, analysis: &BuildAnalysis, project: &str, machine_id: Option<String>, anonymous: bool, attempts: &[i32]) -> Result<bool, StoreError> {
+    pub fn save_analysis_with_attempts(
+        &mut self,
+        analysis: &BuildAnalysis,
+        project: &str,
+        machine_id: Option<String>,
+        anonymous: bool,
+        attempts: &[i32],
+    ) -> Result<bool, StoreError> {
         self.save_inner(analysis, project, machine_id, anonymous, Some(attempts))
     }
 
-    pub fn save_analysis(&mut self, analysis: &BuildAnalysis, project: &str, machine_id: Option<String>, anonymous: bool) -> Result<bool, StoreError> {
+    pub fn save_analysis(
+        &mut self,
+        analysis: &BuildAnalysis,
+        project: &str,
+        machine_id: Option<String>,
+        anonymous: bool,
+    ) -> Result<bool, StoreError> {
         self.save_inner(analysis, project, machine_id, anonymous, None)
     }
 
@@ -497,18 +544,67 @@ impl PostgresStore {
     /// without this the two paths disagreed: `--attribution identified`
     /// reached the server but was flattened back to pseudonymous on the way
     /// into the local database, which then had no name to break down by.
-    pub fn save_analysis_attributed(&mut self, analysis: &BuildAnalysis, project: &str, machine_id: Option<String>, attribution: Attribution, identity: buildlens_core::wire::Identity, attempts: Option<&[i32]>) -> Result<bool, StoreError> {
-        self.save_with(analysis, project, machine_id, attribution, identity, attempts)
+    pub fn save_analysis_attributed(
+        &mut self,
+        analysis: &BuildAnalysis,
+        project: &str,
+        machine_id: Option<String>,
+        attribution: Attribution,
+        identity: buildlens_core::wire::Identity,
+        attempts: Option<&[i32]>,
+    ) -> Result<bool, StoreError> {
+        self.save_with(
+            analysis,
+            project,
+            machine_id,
+            attribution,
+            identity,
+            attempts,
+        )
     }
 
-    fn save_inner(&mut self, analysis: &BuildAnalysis, project: &str, machine_id: Option<String>, anonymous: bool, explicit_attempts: Option<&[i32]>) -> Result<bool, StoreError> {
-        let attribution = if anonymous { Attribution::Anonymous } else { Attribution::Pseudonymous };
-        self.save_with(analysis, project, machine_id, attribution, buildlens_core::wire::Identity::default(), explicit_attempts)
+    fn save_inner(
+        &mut self,
+        analysis: &BuildAnalysis,
+        project: &str,
+        machine_id: Option<String>,
+        anonymous: bool,
+        explicit_attempts: Option<&[i32]>,
+    ) -> Result<bool, StoreError> {
+        let attribution = if anonymous {
+            Attribution::Anonymous
+        } else {
+            Attribution::Pseudonymous
+        };
+        self.save_with(
+            analysis,
+            project,
+            machine_id,
+            attribution,
+            buildlens_core::wire::Identity::default(),
+            explicit_attempts,
+        )
     }
 
-    fn save_with(&mut self, analysis: &BuildAnalysis, project: &str, machine_id: Option<String>, attribution: Attribution, identity: buildlens_core::wire::Identity, explicit_attempts: Option<&[i32]>) -> Result<bool, StoreError> {
+    fn save_with(
+        &mut self,
+        analysis: &BuildAnalysis,
+        project: &str,
+        machine_id: Option<String>,
+        attribution: Attribution,
+        identity: buildlens_core::wire::Identity,
+        explicit_attempts: Option<&[i32]>,
+    ) -> Result<bool, StoreError> {
         let metrics = analysis.metrics.as_ref().ok_or(StoreError::UnusableBuild)?;
-        let mut build = WireBuild::from_metrics_with_identity(metrics, project, machine_id, attribution, identity, 100).ok_or(StoreError::UnusableBuild)?;
+        let mut build = WireBuild::from_metrics_with_identity(
+            metrics,
+            project,
+            machine_id,
+            attribution,
+            identity,
+            100,
+        )
+        .ok_or(StoreError::UnusableBuild)?;
         // A failing test fails the build.
         //
         // `WireBuild::from_metrics` takes its verdict from the activity log,
@@ -588,7 +684,12 @@ impl PostgresStore {
             ).map_err(|source| StoreError::Query { operation: "inserting swift timing", source })?;
         }
 
-        for diagnostic in analysis.diagnostics.diagnostics.iter().take(MAX_DIAGNOSTICS) {
+        for diagnostic in analysis
+            .diagnostics
+            .diagnostics
+            .iter()
+            .take(MAX_DIAGNOSTICS)
+        {
             let severity = serde_plain(&diagnostic.severity)?;
             let category = serde_plain(&diagnostic.category)?;
             tx.execute(
@@ -603,7 +704,13 @@ impl PostgresStore {
         // every run instead of the first one winning the ON CONFLICT. See
         // `attempt_numbers`. A supplied slice shorter than the test list falls
         // back per-entry rather than silently dropping the tail.
-        let derived = attempt_numbers(analysis.tests.tests.iter().map(|test| (test.suite.as_str(), test.test.as_str())));
+        let derived = attempt_numbers(
+            analysis
+                .tests
+                .tests
+                .iter()
+                .map(|test| (test.suite.as_str(), test.test.as_str())),
+        );
         let attempts: Vec<i32> = match explicit_attempts {
             Some(explicit) => derived
                 .iter()
@@ -615,12 +722,29 @@ impl PostgresStore {
         for (test, attempt) in analysis.tests.tests.iter().zip(attempts) {
             // A "started" row means the test never reported an outcome, which
             // is how a crash shows up; recording it as-is keeps that visible.
-            let status = match test.status { TestStatus::Passed => "passed", TestStatus::Failed => "failed", TestStatus::Started => "started" };
+            let status = match test.status {
+                TestStatus::Passed => "passed",
+                TestStatus::Failed => "failed",
+                TestStatus::Started => "started",
+            };
             tx.execute(
                 "INSERT INTO build_tests (day,build_key,suite,name,status,seconds,message,attempt)
                  VALUES (to_date($1,'YYYY-MM-DD'),$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING",
-                &[&day, &key, &test.suite, &test.test, &status, &test.duration_seconds, &test.message, &attempt],
-            ).map_err(|source| StoreError::Query { operation: "inserting test result", source })?;
+                &[
+                    &day,
+                    &key,
+                    &test.suite,
+                    &test.test,
+                    &status,
+                    &test.duration_seconds,
+                    &test.message,
+                    &attempt,
+                ],
+            )
+            .map_err(|source| StoreError::Query {
+                operation: "inserting test result",
+                source,
+            })?;
         }
 
         for (metadata_key, value) in &analysis.metadata.entries {
@@ -635,7 +759,13 @@ impl PostgresStore {
     }
 
     pub fn build_id_for_activity_log(&mut self, key: &str) -> Result<Option<String>, StoreError> {
-        Ok(self.client.query_opt("SELECT build_key FROM builds WHERE build_key=$1 LIMIT 1", &[&key])?.map(|row| row.get(0)))
+        Ok(self
+            .client
+            .query_opt(
+                "SELECT build_key FROM builds WHERE build_key=$1 LIMIT 1",
+                &[&key],
+            )?
+            .map(|row| row.get(0)))
     }
 
     /// Attaches test results to a build already in history, and corrects its
@@ -652,8 +782,16 @@ impl PostgresStore {
     /// manifest is harmless.
     ///
     /// Returns how many rows were newly inserted.
-    pub fn attach_tests(&mut self, build_key: &str, tests: &[(buildlens_core::TestResult, i32)]) -> Result<usize, StoreError> {
-        let Some(row) = self.client.query_opt("SELECT day::TEXT FROM builds WHERE build_key=$1 LIMIT 1", &[&build_key])? else {
+    pub fn attach_tests(
+        &mut self,
+        build_key: &str,
+        tests: &[(buildlens_core::TestResult, i32)],
+    ) -> Result<usize, StoreError> {
+        let Some(row) = self.client.query_opt(
+            "SELECT day::TEXT FROM builds WHERE build_key=$1 LIMIT 1",
+            &[&build_key],
+        )?
+        else {
             return Ok(0);
         };
         let day: String = row.get(0);
@@ -665,7 +803,11 @@ impl PostgresStore {
         let mut inserted = 0;
         let mut tx = self.client.transaction()?;
         for (test, attempt) in tests {
-            let status = match test.status { TestStatus::Passed => "passed", TestStatus::Failed => "failed", TestStatus::Started => "started" };
+            let status = match test.status {
+                TestStatus::Passed => "passed",
+                TestStatus::Failed => "failed",
+                TestStatus::Started => "started",
+            };
             inserted += tx.execute(
                 "INSERT INTO build_tests (day,build_key,suite,name,status,seconds,message,attempt)
                  VALUES (to_date($1,'YYYY-MM-DD'),$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING",
@@ -678,9 +820,18 @@ impl PostgresStore {
         //
         // One direction only, as in `save_inner`: a passing suite never turns
         // a failed compile green.
-        if tests.iter().any(|(test, _)| test.status == TestStatus::Failed) {
-            tx.execute("UPDATE builds SET status='failed' WHERE build_key=$1", &[&build_key])
-                .map_err(|source| StoreError::Query { operation: "marking the build failed", source })?;
+        if tests
+            .iter()
+            .any(|(test, _)| test.status == TestStatus::Failed)
+        {
+            tx.execute(
+                "UPDATE builds SET status='failed' WHERE build_key=$1",
+                &[&build_key],
+            )
+            .map_err(|source| StoreError::Query {
+                operation: "marking the build failed",
+                source,
+            })?;
         } else if !tests.is_empty() {
             // Results arrived and none failed, so a build held at
             // `pending_tests` is now genuinely green. Scoped to that status so
@@ -696,7 +847,12 @@ impl PostgresStore {
         Ok(inserted)
     }
 
-    pub fn projects(&mut self) -> Result<Value, StoreError> { let rows=self.client.query("SELECT project,COUNT(*)::bigint FROM builds GROUP BY project ORDER BY COUNT(*) DESC,project",&[])?; Ok(serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"project":r.get::<_,String>(0),"builds":r.get::<_,i64>(1)})).collect::<Vec<_>>() })) }
+    pub fn projects(&mut self) -> Result<Value, StoreError> {
+        let rows=self.client.query("SELECT project,COUNT(*)::bigint FROM builds GROUP BY project ORDER BY COUNT(*) DESC,project",&[])?;
+        Ok(
+            serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"project":r.get::<_,String>(0),"builds":r.get::<_,i64>(1)})).collect::<Vec<_>>() }),
+        )
+    }
     /// The dashboard build list. `status` and the diagnostic counts come from the
     /// stored columns: hardcoding "succeeded" here painted every failed build
     /// green, which is exactly what the failed-build column exists to show.
@@ -722,9 +878,24 @@ impl PostgresStore {
                     b.warning_count,b.scheme,COALESCE(c.total,0),COALESCE(c.failed,0)
              FROM builds b LEFT JOIN counts c ON c.build_key=b.build_key
              ORDER BY b.received_at DESC LIMIT 100",&[])?;
-        Ok(serde_json::json!({"builds":rows.iter().map(|r|serde_json::json!({"id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"project":r.get::<_,String>(2),"category":r.get::<_,String>(3),"total_seconds":r.get::<_,f64>(4),"status":r.get::<_,Option<String>>(6),"raw_warnings":r.get::<_,i32>(8),"errors":r.get::<_,i32>(7),"cache_hit_rate":r.get::<_,Option<f64>>(5),"scheme":r.get::<_,Option<String>>(9),"total_tests":r.get::<_,i32>(10),"failed_tests":r.get::<_,i32>(11)})).collect::<Vec<_>>() }))
+        Ok(
+            serde_json::json!({"builds":rows.iter().map(|r|serde_json::json!({"id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"project":r.get::<_,String>(2),"category":r.get::<_,String>(3),"total_seconds":r.get::<_,f64>(4),"status":r.get::<_,Option<String>>(6),"raw_warnings":r.get::<_,i32>(8),"errors":r.get::<_,i32>(7),"cache_hit_rate":r.get::<_,Option<f64>>(5),"scheme":r.get::<_,Option<String>>(9),"total_tests":r.get::<_,i32>(10),"failed_tests":r.get::<_,i32>(11)})).collect::<Vec<_>>() }),
+        )
     }
-    pub fn duration_trend_for(&mut self, limit:i64, project:Option<&str>) -> Result<Value,StoreError> { let rows=if let Some(project)=project {self.client.query("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate FROM builds WHERE project=$1 ORDER BY received_at DESC LIMIT $2",&[&project,&limit])?} else {self.client.query("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate FROM builds ORDER BY received_at DESC LIMIT $1",&[&limit])?}; Ok(serde_json::json!({"items":rows.iter().rev().map(|r|serde_json::json!({"id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"project":r.get::<_,String>(2),"category":r.get::<_,String>(3),"total_seconds":r.get::<_,f64>(4),"cache_hit_rate":r.get::<_,Option<f64>>(5)})).collect::<Vec<_>>() })) }
+    pub fn duration_trend_for(
+        &mut self,
+        limit: i64,
+        project: Option<&str>,
+    ) -> Result<Value, StoreError> {
+        let rows = if let Some(project) = project {
+            self.client.query("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate FROM builds WHERE project=$1 ORDER BY received_at DESC LIMIT $2",&[&project,&limit])?
+        } else {
+            self.client.query("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate FROM builds ORDER BY received_at DESC LIMIT $1",&[&limit])?
+        };
+        Ok(
+            serde_json::json!({"items":rows.iter().rev().map(|r|serde_json::json!({"id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"project":r.get::<_,String>(2),"category":r.get::<_,String>(3),"total_seconds":r.get::<_,f64>(4),"cache_hit_rate":r.get::<_,Option<f64>>(5)})).collect::<Vec<_>>() }),
+        )
+    }
 
     /// One build with everything recorded about it — the detail view a
     /// developer opens after spotting a slow or failed build in the trend.
@@ -739,13 +910,16 @@ impl PostgresStore {
     /// `Ok(None)` for an unknown key rather than an error: "no such build" is
     /// a normal answer to a stale dashboard link, and a caller should not have
     /// to read error text to tell it apart from a real database failure.
-    pub fn build_snapshot(&mut self, key:&str) -> Result<Option<Value>,StoreError> {
+    pub fn build_snapshot(&mut self, key: &str) -> Result<Option<Value>, StoreError> {
         let Some(r)=self.client.query_opt("SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint,project,category,total_seconds,cache_hit_rate,compiled_count,machine_id,xcode_version,platform,architecture,status,error_count,warning_count,scheme,replayed_steps,build_user,build_host FROM builds WHERE build_key=$1",&[&key])? else {
             return Ok(None);
         };
         let targets=self.client.query("SELECT name,seconds,category,fetched_from_cache,compiled_count FROM build_targets WHERE build_key=$1 ORDER BY seconds DESC LIMIT 100",&[&key])?;
         let phases=self.client.query("SELECT name,seconds FROM build_phases WHERE build_key=$1 ORDER BY seconds DESC LIMIT 50",&[&key])?;
-        let metadata=self.client.query("SELECT key,value FROM build_metadata WHERE build_key=$1 ORDER BY key",&[&key])?;
+        let metadata = self.client.query(
+            "SELECT key,value FROM build_metadata WHERE build_key=$1 ORDER BY key",
+            &[&key],
+        )?;
         let files=self.client.query("SELECT file,target,seconds,occurrences,step_type FROM build_files WHERE build_key=$1 ORDER BY seconds DESC LIMIT 50",&[&key])?;
         let swift=self.client.query("SELECT file,line,symbol,kind,milliseconds,target FROM build_swift_timings WHERE build_key=$1 ORDER BY milliseconds DESC LIMIT 50",&[&key])?;
         // Errors before warnings: a failed build's reason is the first thing
@@ -771,13 +945,15 @@ impl PostgresStore {
         // Counted over distinct tests, not attempts, so a retry does not make a
         // suite look larger than it is. `failed` counts tests whose last
         // attempt failed: one that failed then passed on retry is a pass.
-        let test_totals=self.client.query_one(
+        let test_totals = self.client.query_one(
             "WITH final AS (
                  SELECT DISTINCT ON (suite,name) suite,name,status
                  FROM build_tests WHERE build_key=$1 ORDER BY suite,name,attempt DESC)
              SELECT (SELECT COUNT(*)::bigint FROM final),
                     (SELECT COUNT(*) FILTER (WHERE status='failed')::bigint FROM final),
-                    (SELECT COALESCE(SUM(seconds),0.0) FROM build_tests WHERE build_key=$1)",&[&key])?;
+                    (SELECT COALESCE(SUM(seconds),0.0) FROM build_tests WHERE build_key=$1)",
+            &[&key],
+        )?;
         // Capped like every other detail list on this page. Ordered by ordinal,
         // which is the timeline order the steps were transmitted in, so the
         // first 500 rows are the *start* of the build rather than an arbitrary
@@ -786,10 +962,12 @@ impl PostgresStore {
         let steps=self.client.query(
             "SELECT step_type,title,file,target,architecture,seconds,started_at,ended_at,fetched_from_cache,executed
              FROM build_steps WHERE build_key=$1 ORDER BY ordinal LIMIT 500",&[&key])?;
-        let step_totals=self.client.query_one(
+        let step_totals = self.client.query_one(
             "SELECT COUNT(*)::bigint,COUNT(*) FILTER (WHERE executed)::bigint,
                     COALESCE(SUM(seconds) FILTER (WHERE executed),0.0)
-             FROM build_steps WHERE build_key=$1",&[&key])?;
+             FROM build_steps WHERE build_key=$1",
+            &[&key],
+        )?;
         Ok(Some(serde_json::json!({
             "id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"project":r.get::<_,String>(2),"category":r.get::<_,String>(3),
             "total_seconds":r.get::<_,f64>(4),"cache_hit_rate":r.get::<_,Option<f64>>(5),"compiled_count":r.get::<_,i32>(6),"replayed_steps":r.get::<_,i32>(15),
@@ -813,7 +991,11 @@ impl PostgresStore {
     /// p50/p95 over recent builds. Percentiles need a floor of history to mean
     /// anything, so a project with one build reports nulls rather than
     /// presenting a single sample as a distribution.
-    pub fn duration_percentiles_for(&mut self, limit:i64, project:Option<&str>) -> Result<Value,StoreError> {
+    pub fn duration_percentiles_for(
+        &mut self,
+        limit: i64,
+        project: Option<&str>,
+    ) -> Result<Value, StoreError> {
         let row=self.client.query_one(
             "WITH recent AS (SELECT total_seconds FROM builds WHERE ($1::TEXT IS NULL OR project=$1) ORDER BY received_at DESC LIMIT $2)
              SELECT COUNT(*)::bigint,
@@ -821,15 +1003,21 @@ impl PostgresStore {
                     percentile_cont(0.95) WITHIN GROUP (ORDER BY total_seconds),
                     MIN(total_seconds),MAX(total_seconds),AVG(total_seconds) FROM recent",
             &[&project,&limit])?;
-        let builds=row.get::<_,i64>(0);
-        Ok(serde_json::json!({"builds":builds,"enough_history":builds>=MIN_HISTORY,
+        let builds = row.get::<_, i64>(0);
+        Ok(
+            serde_json::json!({"builds":builds,"enough_history":builds>=MIN_HISTORY,
             "p50":row.get::<_,Option<f64>>(1),"p95":row.get::<_,Option<f64>>(2),
-            "min_seconds":row.get::<_,Option<f64>>(3),"max_seconds":row.get::<_,Option<f64>>(4),"avg_seconds":row.get::<_,Option<f64>>(5)}))
+            "min_seconds":row.get::<_,Option<f64>>(3),"max_seconds":row.get::<_,Option<f64>>(4),"avg_seconds":row.get::<_,Option<f64>>(5)}),
+        )
     }
 
     /// Per-calendar-day p50/p95, which is what makes a week-over-week
     /// regression visible rather than just a noisy per-build line.
-    pub fn daily_percentiles_for(&mut self, days:i64, project:Option<&str>) -> Result<Value,StoreError> {
+    pub fn daily_percentiles_for(
+        &mut self,
+        days: i64,
+        project: Option<&str>,
+    ) -> Result<Value, StoreError> {
         let rows=self.client.query(
             "SELECT day::TEXT,COUNT(*)::bigint,
                     percentile_cont(0.5) WITHIN GROUP (ORDER BY total_seconds),
@@ -837,12 +1025,19 @@ impl PostgresStore {
              FROM builds WHERE ($1::TEXT IS NULL OR project=$1) AND day >= (CURRENT_DATE - $2::INTEGER)
              GROUP BY day ORDER BY day",
             &[&project,&(days as i32)])?;
-        Ok(serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"day":r.get::<_,String>(0),"builds":r.get::<_,i64>(1),"p50":r.get::<_,Option<f64>>(2),"p95":r.get::<_,Option<f64>>(3)})).collect::<Vec<_>>()}))
+        Ok(
+            serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"day":r.get::<_,String>(0),"builds":r.get::<_,i64>(1),"p50":r.get::<_,Option<f64>>(2),"p95":r.get::<_,Option<f64>>(3)})).collect::<Vec<_>>()}),
+        )
     }
 
     /// Slowest targets averaged over recent builds — the "what should we fix
     /// first" list, ranked by mean rather than a single unlucky build.
-    pub fn target_trend(&mut self, builds:i64, top:i64, project:Option<&str>) -> Result<Value,StoreError> {
+    pub fn target_trend(
+        &mut self,
+        builds: i64,
+        top: i64,
+        project: Option<&str>,
+    ) -> Result<Value, StoreError> {
         let rows=self.client.query(
             "WITH recent AS (SELECT build_key FROM builds WHERE ($1::TEXT IS NULL OR project=$1) ORDER BY received_at DESC LIMIT $2)
              SELECT t.name,COUNT(*)::bigint,AVG(t.seconds),MAX(t.seconds),
@@ -850,48 +1045,75 @@ impl PostgresStore {
              FROM build_targets t JOIN recent r ON r.build_key=t.build_key
              GROUP BY t.name ORDER BY AVG(t.seconds) DESC LIMIT $3",
             &[&project,&builds,&top])?;
-        Ok(serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"name":r.get::<_,String>(0),"observations":r.get::<_,i64>(1),"avg_seconds":r.get::<_,Option<f64>>(2),"max_seconds":r.get::<_,Option<f64>>(3),"cached_builds":r.get::<_,i64>(4)})).collect::<Vec<_>>()}))
+        Ok(
+            serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"name":r.get::<_,String>(0),"observations":r.get::<_,i64>(1),"avg_seconds":r.get::<_,Option<f64>>(2),"max_seconds":r.get::<_,Option<f64>>(3),"cached_builds":r.get::<_,i64>(4)})).collect::<Vec<_>>()}),
+        )
     }
 
     /// Where the time goes by build phase, averaged over recent builds.
-    pub fn phase_trend(&mut self, builds:i64, top:i64, project:Option<&str>) -> Result<Value,StoreError> {
+    pub fn phase_trend(
+        &mut self,
+        builds: i64,
+        top: i64,
+        project: Option<&str>,
+    ) -> Result<Value, StoreError> {
         let rows=self.client.query(
             "WITH recent AS (SELECT build_key FROM builds WHERE ($1::TEXT IS NULL OR project=$1) ORDER BY received_at DESC LIMIT $2)
              SELECT p.name,COUNT(*)::bigint,AVG(p.seconds),MAX(p.seconds)
              FROM build_phases p JOIN recent r ON r.build_key=p.build_key
              GROUP BY p.name ORDER BY AVG(p.seconds) DESC LIMIT $3",
             &[&project,&builds,&top])?;
-        Ok(serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"name":r.get::<_,String>(0),"observations":r.get::<_,i64>(1),"avg_seconds":r.get::<_,Option<f64>>(2),"max_seconds":r.get::<_,Option<f64>>(3)})).collect::<Vec<_>>()}))
+        Ok(
+            serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"name":r.get::<_,String>(0),"observations":r.get::<_,i64>(1),"avg_seconds":r.get::<_,Option<f64>>(2),"max_seconds":r.get::<_,Option<f64>>(3)})).collect::<Vec<_>>()}),
+        )
     }
 
     /// Slowest individual files to compile. `occurrences` separates "this file
     /// is slow" from "this file compiles once per architecture".
-    pub fn slowest_files(&mut self, builds:i64, limit:i64, project:Option<&str>) -> Result<Value,StoreError> {
+    pub fn slowest_files(
+        &mut self,
+        builds: i64,
+        limit: i64,
+        project: Option<&str>,
+    ) -> Result<Value, StoreError> {
         let rows=self.client.query(
             "WITH recent AS (SELECT build_key FROM builds WHERE ($1::TEXT IS NULL OR project=$1) ORDER BY received_at DESC LIMIT $2)
              SELECT f.file,MAX(f.target),COUNT(*)::bigint,AVG(f.seconds),MAX(f.seconds),SUM(f.occurrences)::bigint
              FROM build_files f JOIN recent r ON r.build_key=f.build_key
              GROUP BY f.file ORDER BY AVG(f.seconds) DESC LIMIT $3",
             &[&project,&builds,&limit])?;
-        Ok(serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"file":r.get::<_,String>(0),"target":r.get::<_,Option<String>>(1),"observations":r.get::<_,i64>(2),"avg_seconds":r.get::<_,Option<f64>>(3),"max_seconds":r.get::<_,Option<f64>>(4),"compilations":r.get::<_,Option<i64>>(5)})).collect::<Vec<_>>()}))
+        Ok(
+            serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"file":r.get::<_,String>(0),"target":r.get::<_,Option<String>>(1),"observations":r.get::<_,i64>(2),"avg_seconds":r.get::<_,Option<f64>>(3),"max_seconds":r.get::<_,Option<f64>>(4),"compilations":r.get::<_,Option<i64>>(5)})).collect::<Vec<_>>()}),
+        )
     }
 
     /// Slowest Swift function bodies / type-check sites. Empty unless the
     /// project builds with the -warn-long-* flags, which the payload reports
     /// so the dashboard can say "not enabled" instead of "nothing slow".
-    pub fn slowest_swift_timings(&mut self, builds:i64, limit:i64, project:Option<&str>) -> Result<Value,StoreError> {
+    pub fn slowest_swift_timings(
+        &mut self,
+        builds: i64,
+        limit: i64,
+        project: Option<&str>,
+    ) -> Result<Value, StoreError> {
         let rows=self.client.query(
             "WITH recent AS (SELECT build_key FROM builds WHERE ($1::TEXT IS NULL OR project=$1) ORDER BY received_at DESC LIMIT $2)
              SELECT s.file,s.line,MAX(s.symbol),s.kind,COUNT(*)::bigint,AVG(s.milliseconds),MAX(s.milliseconds),MAX(s.target)
              FROM build_swift_timings s JOIN recent r ON r.build_key=s.build_key
              GROUP BY s.file,s.line,s.kind ORDER BY AVG(s.milliseconds) DESC LIMIT $3",
             &[&project,&builds,&limit])?;
-        Ok(serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"file":r.get::<_,String>(0),"line":r.get::<_,i32>(1),"symbol":r.get::<_,Option<String>>(2),"kind":r.get::<_,String>(3),"observations":r.get::<_,i64>(4),"avg_milliseconds":r.get::<_,Option<f64>>(5),"max_milliseconds":r.get::<_,Option<f64>>(6),"target":r.get::<_,Option<String>>(7)})).collect::<Vec<_>>()}))
+        Ok(
+            serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"file":r.get::<_,String>(0),"line":r.get::<_,i32>(1),"symbol":r.get::<_,Option<String>>(2),"kind":r.get::<_,String>(3),"observations":r.get::<_,i64>(4),"avg_milliseconds":r.get::<_,Option<f64>>(5),"max_milliseconds":r.get::<_,Option<f64>>(6),"target":r.get::<_,Option<String>>(7)})).collect::<Vec<_>>()}),
+        )
     }
 
     /// Warning and error counts per build, so a rising warning count is
     /// visible before it becomes an error.
-    pub fn diagnostic_trend_for(&mut self, limit:i64, project:Option<&str>) -> Result<Value,StoreError> {
+    pub fn diagnostic_trend_for(
+        &mut self,
+        limit: i64,
+        project: Option<&str>,
+    ) -> Result<Value, StoreError> {
         let rows=self.client.query(
             "WITH recent AS (SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint AS at,received_at
                              FROM builds WHERE ($1::TEXT IS NULL OR project=$1) ORDER BY received_at DESC LIMIT $2)
@@ -902,19 +1124,28 @@ impl PostgresStore {
              FROM recent r LEFT JOIN build_diagnostics d ON d.build_key=r.build_key
              GROUP BY r.build_key,r.at,r.received_at ORDER BY r.received_at",
             &[&project,&limit])?;
-        Ok(serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"warnings":r.get::<_,i64>(2),"errors":r.get::<_,i64>(3),"unique_diagnostics":r.get::<_,i64>(4)})).collect::<Vec<_>>()}))
+        Ok(
+            serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"warnings":r.get::<_,i64>(2),"errors":r.get::<_,i64>(3),"unique_diagnostics":r.get::<_,i64>(4)})).collect::<Vec<_>>()}),
+        )
     }
 
     /// The diagnostics appearing in the most builds — the recurring ones worth
     /// fixing, as opposed to a one-off from a single broken build.
-    pub fn diagnostic_clusters(&mut self, builds:i64, limit:i64, project:Option<&str>) -> Result<Value,StoreError> {
+    pub fn diagnostic_clusters(
+        &mut self,
+        builds: i64,
+        limit: i64,
+        project: Option<&str>,
+    ) -> Result<Value, StoreError> {
         let rows=self.client.query(
             "WITH recent AS (SELECT build_key FROM builds WHERE ($1::TEXT IS NULL OR project=$1) ORDER BY received_at DESC LIMIT $2)
              SELECT d.fingerprint,MAX(d.severity),MAX(d.category),MAX(d.message),MAX(d.file),COUNT(DISTINCT d.build_key)::bigint,SUM(d.occurrences)::bigint
              FROM build_diagnostics d JOIN recent r ON r.build_key=d.build_key
              GROUP BY d.fingerprint ORDER BY COUNT(DISTINCT d.build_key) DESC,SUM(d.occurrences) DESC LIMIT $3",
             &[&project,&builds,&limit])?;
-        Ok(serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"fingerprint":r.get::<_,String>(0),"severity":r.get::<_,Option<String>>(1),"category":r.get::<_,Option<String>>(2),"message":r.get::<_,Option<String>>(3),"file":r.get::<_,Option<String>>(4),"builds":r.get::<_,i64>(5),"occurrences":r.get::<_,Option<i64>>(6)})).collect::<Vec<_>>()}))
+        Ok(
+            serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"fingerprint":r.get::<_,String>(0),"severity":r.get::<_,Option<String>>(1),"category":r.get::<_,Option<String>>(2),"message":r.get::<_,Option<String>>(3),"file":r.get::<_,Option<String>>(4),"builds":r.get::<_,i64>(5),"occurrences":r.get::<_,Option<i64>>(6)})).collect::<Vec<_>>()}),
+        )
     }
 
     /// Tests that both pass and fail across recent builds. Mixed outcomes are
@@ -927,7 +1158,12 @@ impl PostgresStore {
     /// the code, machine and environment all held constant, which is flakiness
     /// with nothing else to blame. Plain `flaky` mixes outcomes across
     /// different builds, where a source change is the likelier explanation.
-    pub fn flaky_tests(&mut self, builds:i64, limit:i64, project:Option<&str>) -> Result<Value,StoreError> {
+    pub fn flaky_tests(
+        &mut self,
+        builds: i64,
+        limit: i64,
+        project: Option<&str>,
+    ) -> Result<Value, StoreError> {
         let rows=self.client.query(
             "WITH recent AS (SELECT build_key FROM builds WHERE ($1::TEXT IS NULL OR project=$1) ORDER BY received_at DESC LIMIT $2),
                   per_build AS (
@@ -945,14 +1181,21 @@ impl PostgresStore {
              HAVING SUM(failed) > 0
              ORDER BY COUNT(*) FILTER (WHERE failed>0 AND passed>0) DESC, SUM(failed) DESC LIMIT $3",
             &[&project,&builds,&limit])?;
-        Ok(serde_json::json!({"items":rows.iter().map(|r|{let runs=r.get::<_,i64>(2);let failed=r.get::<_,i64>(3);let passed=r.get::<_,i64>(4);let retried=r.get::<_,i64>(6);serde_json::json!({"suite":r.get::<_,String>(0),"test":r.get::<_,String>(1),"runs":runs,"failed":failed,"passed":passed,"flaky":failed>0&&passed>0,"retried_builds":retried,"avg_seconds":r.get::<_,Option<f64>>(5)})}).collect::<Vec<_>>()}))
+        Ok(
+            serde_json::json!({"items":rows.iter().map(|r|{let runs=r.get::<_,i64>(2);let failed=r.get::<_,i64>(3);let passed=r.get::<_,i64>(4);let retried=r.get::<_,i64>(6);serde_json::json!({"suite":r.get::<_,String>(0),"test":r.get::<_,String>(1),"runs":runs,"failed":failed,"passed":passed,"flaky":failed>0&&passed>0,"retried_builds":retried,"avg_seconds":r.get::<_,Option<f64>>(5)})}).collect::<Vec<_>>()}),
+        )
     }
 
     /// Targets whose average duration in the most recent builds is materially
     /// worse than the window before them. This is a trend signal, not the
     /// baseline-matched regression detection history has always done — it makes
     /// no claim about environment matching, so the dashboard labels it as such.
-    pub fn target_regressions(&mut self, builds:i64, limit:i64, project:Option<&str>) -> Result<Value,StoreError> {
+    pub fn target_regressions(
+        &mut self,
+        builds: i64,
+        limit: i64,
+        project: Option<&str>,
+    ) -> Result<Value, StoreError> {
         // `builds` appears both as a row-number boundary and as a LIMIT, which
         // Postgres cannot infer a single type for; the window boundary is cast
         // explicitly and the LIMIT gets its own bigint parameter.
@@ -977,13 +1220,19 @@ impl PostgresStore {
              ORDER BY (recent-prior) DESC LIMIT $4",
             &[&project,&window_total,&builds,&limit,
               &TARGET_REGRESSION_MIN_SECONDS,&TARGET_REGRESSION_MIN_PERCENT])?;
-        Ok(serde_json::json!({"items":rows.iter().map(|r|{let recent=r.get::<_,f64>(1);let prior=r.get::<_,f64>(2);serde_json::json!({"name":r.get::<_,String>(0),"current_seconds":recent,"previous_seconds":prior,"delta_seconds":recent-prior,"delta_percent":(recent-prior)/prior*100.0,"observations":r.get::<_,i64>(3),"confidence":"trend"})}).collect::<Vec<_>>()}))
+        Ok(
+            serde_json::json!({"items":rows.iter().map(|r|{let recent=r.get::<_,f64>(1);let prior=r.get::<_,f64>(2);serde_json::json!({"name":r.get::<_,String>(0),"current_seconds":recent,"previous_seconds":prior,"delta_seconds":recent-prior,"delta_percent":(recent-prior)/prior*100.0,"observations":r.get::<_,i64>(3),"confidence":"trend"})}).collect::<Vec<_>>()}),
+        )
     }
 
     /// Machine, Xcode and platform mix across recent builds. A duration shift
     /// that lines up with an Xcode upgrade is an environment change, not a
     /// code regression, and this is what lets a developer tell them apart.
-    pub fn environment_breakdown(&mut self, builds:i64, project:Option<&str>) -> Result<Value,StoreError> {
+    pub fn environment_breakdown(
+        &mut self,
+        builds: i64,
+        project: Option<&str>,
+    ) -> Result<Value, StoreError> {
         let rows=self.client.query(
             "WITH recent AS (SELECT xcode_version,platform,architecture,machine_id,total_seconds
                              FROM builds WHERE ($1::TEXT IS NULL OR project=$1) ORDER BY received_at DESC LIMIT $2)
@@ -991,7 +1240,9 @@ impl PostgresStore {
                     COUNT(*)::bigint,COUNT(DISTINCT machine_id)::bigint,AVG(total_seconds)
              FROM recent GROUP BY 1,2,3 ORDER BY COUNT(*) DESC",
             &[&project,&builds])?;
-        Ok(serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"xcode_version":r.get::<_,String>(0),"platform":r.get::<_,String>(1),"architecture":r.get::<_,String>(2),"builds":r.get::<_,i64>(3),"machines":r.get::<_,i64>(4),"avg_seconds":r.get::<_,Option<f64>>(5)})).collect::<Vec<_>>()}))
+        Ok(
+            serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"xcode_version":r.get::<_,String>(0),"platform":r.get::<_,String>(1),"architecture":r.get::<_,String>(2),"builds":r.get::<_,i64>(3),"machines":r.get::<_,i64>(4),"avg_seconds":r.get::<_,Option<f64>>(5)})).collect::<Vec<_>>()}),
+        )
     }
 
     /// Build counts per person, for the opt-in identified attribution tier.
@@ -1004,7 +1255,11 @@ impl PostgresStore {
     ///
     /// Returns an empty list where nobody has opted in, which is the normal
     /// case and is what the panel renders its empty state from.
-    pub fn people_breakdown(&mut self, builds:i64, project:Option<&str>) -> Result<Value,StoreError> {
+    pub fn people_breakdown(
+        &mut self,
+        builds: i64,
+        project: Option<&str>,
+    ) -> Result<Value, StoreError> {
         let rows=self.client.query(
             "WITH recent AS (SELECT build_user,build_host,machine_id,total_seconds,status
                              FROM builds WHERE ($1::TEXT IS NULL OR project=$1) AND build_user IS NOT NULL
@@ -1013,9 +1268,11 @@ impl PostgresStore {
                     AVG(total_seconds),COUNT(*) FILTER (WHERE status='failed')::bigint
              FROM recent GROUP BY 1 ORDER BY COUNT(*) DESC",
             &[&project,&builds])?;
-        Ok(serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({
+        Ok(
+            serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({
             "user":r.get::<_,String>(0),"builds":r.get::<_,i64>(1),"machines":r.get::<_,i64>(2),
-            "avg_seconds":r.get::<_,Option<f64>>(3),"failed":r.get::<_,i64>(4)})).collect::<Vec<_>>()}))
+            "avg_seconds":r.get::<_,Option<f64>>(3),"failed":r.get::<_,i64>(4)})).collect::<Vec<_>>()}),
+        )
     }
 
     /// Builds older than `keep_days`, excluding the newest build of each
@@ -1086,7 +1343,8 @@ impl PostgresStore {
                     coalesce(architecture,''), received_at
              FROM builds WHERE build_key = $1",
             &[&build_key],
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         let project: String = current.get(0);
@@ -1098,7 +1356,8 @@ impl PostgresStore {
              WHERE project = $1 AND received_at < $2
              ORDER BY received_at DESC LIMIT 1",
             &[&project, &current.get::<_, std::time::SystemTime>(7)],
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
 
@@ -1188,7 +1447,11 @@ impl PostgresStore {
     /// droppable day is prunable by construction — that is what makes the day
     /// droppable — so this can never under-report what `prune` removes.
     pub fn prune_preview(&mut self, keep_days: u32) -> Result<Vec<String>, StoreError> {
-        Ok(self.prunable_builds(keep_days)?.into_iter().map(|(_, key)| key).collect())
+        Ok(self
+            .prunable_builds(keep_days)?
+            .into_iter()
+            .map(|(_, key)| key)
+            .collect())
     }
 
     /// Deletes builds older than `keep_days`, keeping the newest build of each
@@ -1226,9 +1489,11 @@ impl PostgresStore {
                 // IF EXISTS because a day can predate the per-day partitions and
                 // still have its rows in the default, where the row-wise path
                 // below catches them.
-                tx.execute(format!("DROP TABLE IF EXISTS {child}").as_str(), &[]).map_err(
-                    |source| StoreError::Query { operation: "dropping a day partition", source },
-                )?;
+                tx.execute(format!("DROP TABLE IF EXISTS {child}").as_str(), &[])
+                    .map_err(|source| StoreError::Query {
+                        operation: "dropping a day partition",
+                        source,
+                    })?;
             }
             tx.commit()?;
         }
@@ -1251,19 +1516,25 @@ impl PostgresStore {
                     .as_str(),
                     &[&day, &keys],
                 )
-                .map_err(|source| StoreError::Query { operation: "pruning child rows", source })?;
+                .map_err(|source| StoreError::Query {
+                    operation: "pruning child rows",
+                    source,
+                })?;
             }
             tx.execute(
                 "DELETE FROM builds WHERE day = to_date($1,'YYYY-MM-DD') AND build_key = ANY($2)",
                 &[&day, &keys],
             )
-            .map_err(|source| StoreError::Query { operation: "pruning builds", source })?;
+            .map_err(|source| StoreError::Query {
+                operation: "pruning builds",
+                source,
+            })?;
         }
         tx.commit()?;
         Ok(total)
     }
 
-    pub fn git_context(&mut self, builds:i64, project:Option<&str>) -> Result<Value,StoreError> {
+    pub fn git_context(&mut self, builds: i64, project: Option<&str>) -> Result<Value, StoreError> {
         let rows=self.client.query(
             "WITH recent AS (SELECT build_key,EXTRACT(EPOCH FROM COALESCE(to_timestamp(started_at),received_at))::bigint AS at,received_at,total_seconds,category
                              FROM builds WHERE ($1::TEXT IS NULL OR project=$1) ORDER BY received_at DESC LIMIT $2)
@@ -1274,7 +1545,9 @@ impl PostgresStore {
              FROM recent r LEFT JOIN build_metadata m ON m.build_key=r.build_key
              GROUP BY r.build_key,r.at,r.total_seconds,r.category,r.received_at ORDER BY r.received_at DESC",
             &[&project,&builds])?;
-        Ok(serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"total_seconds":r.get::<_,f64>(2),"category":r.get::<_,String>(3),"branch":r.get::<_,Option<String>>(4),"commit":r.get::<_,Option<String>>(5),"dirty":r.get::<_,Option<String>>(6)})).collect::<Vec<_>>()}))
+        Ok(
+            serde_json::json!({"items":rows.iter().map(|r|serde_json::json!({"id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"total_seconds":r.get::<_,f64>(2),"category":r.get::<_,String>(3),"branch":r.get::<_,Option<String>>(4),"commit":r.get::<_,Option<String>>(5),"dirty":r.get::<_,Option<String>>(6)})).collect::<Vec<_>>()}),
+        )
     }
 }
 
@@ -1394,7 +1667,10 @@ fn insert_wire(tx: &mut Transaction<'_>, build: &WireBuild, day: &str) -> Result
                 &(target.compiled_count as i32),
             ],
         )
-        .map_err(|source| StoreError::Query { operation: "inserting target", source })?;
+        .map_err(|source| StoreError::Query {
+            operation: "inserting target",
+            source,
+        })?;
     }
     for phase in &build.phases {
         tx.execute(
@@ -1402,7 +1678,10 @@ fn insert_wire(tx: &mut Transaction<'_>, build: &WireBuild, day: &str) -> Result
              VALUES (to_date($1,'YYYY-MM-DD'),$2,$3,$4) ON CONFLICT DO NOTHING",
             &[&day, &build.build_key, &phase.name, &phase.seconds],
         )
-        .map_err(|source| StoreError::Query { operation: "inserting phase", source })?;
+        .map_err(|source| StoreError::Query {
+            operation: "inserting phase",
+            source,
+        })?;
     }
     // The wire-version-2 detail. Empty for a build sent by an older client,
     // and for one whose sender had no analysis to draw on, so these loops are
@@ -1428,7 +1707,10 @@ fn insert_wire(tx: &mut Transaction<'_>, build: &WireBuild, day: &str) -> Result
                 &(file.occurrences as i32),
             ],
         )
-        .map_err(|source| StoreError::Query { operation: "inserting file timing", source })?;
+        .map_err(|source| StoreError::Query {
+            operation: "inserting file timing",
+            source,
+        })?;
     }
     for timing in &build.swift_timings {
         tx.execute(
@@ -1447,7 +1729,10 @@ fn insert_wire(tx: &mut Transaction<'_>, build: &WireBuild, day: &str) -> Result
                 &timing.target,
             ],
         )
-        .map_err(|source| StoreError::Query { operation: "inserting swift timing", source })?;
+        .map_err(|source| StoreError::Query {
+            operation: "inserting swift timing",
+            source,
+        })?;
     }
     insert_steps(tx, build, day)?;
     for diagnostic in &build.diagnostics {
@@ -1468,11 +1753,19 @@ fn insert_wire(tx: &mut Transaction<'_>, build: &WireBuild, day: &str) -> Result
                 &diagnostic.target,
             ],
         )
-        .map_err(|source| StoreError::Query { operation: "inserting diagnostic", source })?;
+        .map_err(|source| StoreError::Query {
+            operation: "inserting diagnostic",
+            source,
+        })?;
     }
     // Numbered exactly as the local path numbers them, so a build that arrived
     // over the wire and the same build collected locally agree about attempts.
-    let attempts = attempt_numbers(build.tests.iter().map(|test| (test.suite.as_str(), test.name.as_str())));
+    let attempts = attempt_numbers(
+        build
+            .tests
+            .iter()
+            .map(|test| (test.suite.as_str(), test.name.as_str())),
+    );
     for (test, attempt) in build.tests.iter().zip(attempts) {
         tx.execute(
             "INSERT INTO build_tests (day,build_key,suite,name,status,seconds,message,attempt)
@@ -1488,7 +1781,10 @@ fn insert_wire(tx: &mut Transaction<'_>, build: &WireBuild, day: &str) -> Result
                 &attempt,
             ],
         )
-        .map_err(|source| StoreError::Query { operation: "inserting test result", source })?;
+        .map_err(|source| StoreError::Query {
+            operation: "inserting test result",
+            source,
+        })?;
     }
     Ok(true)
 }
@@ -1519,7 +1815,10 @@ fn attempt_numbers<'a>(tests: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<i
 /// Serde-renamed enums (`swift_concurrency`, `warning`, …) as their storage
 /// string, so stored values match what the JSON API already emits.
 fn serde_plain<T: serde::Serialize>(value: &T) -> Result<String, StoreError> {
-    Ok(serde_json::to_value(value)?.as_str().unwrap_or("unknown").to_owned())
+    Ok(serde_json::to_value(value)?
+        .as_str()
+        .unwrap_or("unknown")
+        .to_owned())
 }
 
 /// Partition day for a build, from its start time; falls back to today when
@@ -1618,14 +1917,19 @@ mod tests {
 
     #[test]
     fn a_migration_header_missing_its_name_is_rejected() {
-        assert!(parse_migrations("--@migration 0001\nSELECT 1;\n").unwrap_err().contains("malformed"));
+        assert!(
+            parse_migrations("--@migration 0001\nSELECT 1;\n")
+                .unwrap_err()
+                .contains("malformed")
+        );
     }
 
     /// Commentary before the first marker belongs to no migration and must not
     /// be executed as SQL.
     #[test]
     fn preamble_before_the_first_marker_is_dropped() {
-        let parsed = parse_migrations("-- file comment\n--@migration 0001 one\nSELECT 1;\n").unwrap();
+        let parsed =
+            parse_migrations("-- file comment\n--@migration 0001 one\nSELECT 1;\n").unwrap();
         assert_eq!(parsed.len(), 1);
         assert!(!parsed[0].sql.contains("file comment"));
         assert!(parsed[0].sql.contains("SELECT 1;"));
@@ -1635,9 +1939,8 @@ mod tests {
     /// at 1, and a repeat of one does not advance the other.
     #[test]
     fn attempts_number_each_test_independently() {
-        let numbered = attempt_numbers(
-            [("S", "a"), ("S", "b"), ("S", "a"), ("T", "a")].into_iter(),
-        );
+        let numbered =
+            attempt_numbers([("S", "a"), ("S", "b"), ("S", "a"), ("T", "a")].into_iter());
         assert_eq!(numbered, vec![1, 1, 2, 1]);
     }
 
@@ -1655,8 +1958,14 @@ mod tests {
     #[test]
     fn enums_store_as_their_serde_names() {
         use buildlens_core::{DiagnosticCategory, DiagnosticSeverity};
-        assert_eq!(serde_plain(&DiagnosticSeverity::Warning).unwrap(), "warning");
-        assert_eq!(serde_plain(&DiagnosticCategory::SwiftConcurrency).unwrap(), "swift_concurrency");
+        assert_eq!(
+            serde_plain(&DiagnosticSeverity::Warning).unwrap(),
+            "warning"
+        );
+        assert_eq!(
+            serde_plain(&DiagnosticCategory::SwiftConcurrency).unwrap(),
+            "swift_concurrency"
+        );
     }
 
     #[test]
@@ -1672,13 +1981,19 @@ mod tests {
     #[test]
     fn partition_names_encode_the_day_without_separators() {
         assert_eq!(partition_name("builds", "2023-11-14"), "builds_p20231114");
-        assert_eq!(partition_name("build_tests", "2024-02-29"), "build_tests_p20240229");
+        assert_eq!(
+            partition_name("build_tests", "2024-02-29"),
+            "build_tests_p20240229"
+        );
         // A child must never be mistakable for a parent or for a default: both
         // `prune_covers_every_build_scoped_table` and the partition inventory
         // filter on those shapes.
         for table in DAY_PARTITIONED_TABLES {
             let child = partition_name(table, "2023-11-14");
-            assert!(!child.ends_with("_default"), "{child} must not read as a default partition");
+            assert!(
+                !child.ends_with("_default"),
+                "{child} must not read as a default partition"
+            );
             assert!(
                 !DAY_PARTITIONED_TABLES.contains(&child.as_str()),
                 "{child} must not collide with a parent name"
@@ -1701,7 +2016,15 @@ mod tests {
     /// database column, which is why this is not merely defensive.
     #[test]
     fn next_day_rejects_a_malformed_day() {
-        for bad in ["", "2023-11", "2023-11-14-1", "not-a-date", "2023-1-4", "2023-13-01", "2023-11-00"] {
+        for bad in [
+            "",
+            "2023-11",
+            "2023-11-14-1",
+            "not-a-date",
+            "2023-1-4",
+            "2023-13-01",
+            "2023-11-00",
+        ] {
             assert!(next_day(bad).is_err(), "{bad:?} must not parse as a day");
         }
     }
@@ -1710,7 +2033,11 @@ mod tests {
     fn days_from_civil_inverts_civil_from_days() {
         for days in [-719_162_i64, -1, 0, 1, 19_000, 19_782, 100_000] {
             let civil = civil_from_days(days);
-            assert_eq!(days_from_civil(&civil).unwrap(), days, "{civil} round-trips");
+            assert_eq!(
+                days_from_civil(&civil).unwrap(),
+                days,
+                "{civil} round-trips"
+            );
         }
     }
 
@@ -1719,7 +2046,13 @@ mod tests {
         let days = window_days("2023-11-14", 2, 2);
         assert_eq!(
             days,
-            vec!["2023-11-12", "2023-11-13", "2023-11-14", "2023-11-15", "2023-11-16"],
+            vec![
+                "2023-11-12",
+                "2023-11-13",
+                "2023-11-14",
+                "2023-11-15",
+                "2023-11-16"
+            ],
             "both ends are included and the anchor is in the middle"
         );
         assert_eq!(window_days("2023-11-14", 7, 7).len(), 15);
@@ -1735,7 +2068,12 @@ mod tests {
         let declared: Vec<&str> = SCHEMA_SQL
             .lines()
             .filter(|line| line.contains("PARTITION BY RANGE (day)"))
-            .filter_map(|line| line.split_once("CREATE TABLE IF NOT EXISTS ")?.1.split_whitespace().next())
+            .filter_map(|line| {
+                line.split_once("CREATE TABLE IF NOT EXISTS ")?
+                    .1
+                    .split_whitespace()
+                    .next()
+            })
             .collect();
         assert_eq!(
             declared.len(),
@@ -1779,7 +2117,10 @@ mod tests {
         assert_eq!(SwiftTimingKind::FunctionBody.as_str(), "function_body");
         assert_eq!(SwiftTimingKind::TypeCheck.as_str(), "type_check");
         // And the enum spelling matches what serde would write.
-        assert_eq!(serde_plain(&SwiftTimingKind::TypeCheck).unwrap(), "type_check");
+        assert_eq!(
+            serde_plain(&SwiftTimingKind::TypeCheck).unwrap(),
+            "type_check"
+        );
     }
 
     /// `serde_plain` falls back to "unknown" rather than panicking on a value
@@ -1818,11 +2159,17 @@ mod tests {
         // A big target gaining a full second, well past both thresholds.
         assert!(regressed(10.0, 12.0));
         // Percent alone is not enough: a tiny step that doubled is noise.
-        assert!(!regressed(0.2, 0.4), "a 0.2s step doubling is not a regression");
+        assert!(
+            !regressed(0.2, 0.4),
+            "a 0.2s step doubling is not a regression"
+        );
         // Absolute alone is not enough either, once the constant is 10%: a
         // 100s target gaining 0.6s is 0.6%.
         assert!(!regressed(100.0, 100.6));
         // And exactly at both thresholds counts, so the boundary is inclusive.
-        assert!(regressed(5.0, 5.0 + 5.0 * TARGET_REGRESSION_MIN_PERCENT / 100.0));
+        assert!(regressed(
+            5.0,
+            5.0 + 5.0 * TARGET_REGRESSION_MIN_PERCENT / 100.0
+        ));
     }
 }

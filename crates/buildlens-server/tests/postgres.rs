@@ -19,11 +19,11 @@
 // tests in the binary itself.
 #![allow(dead_code)]
 
+use buildlens_core::BuildCategory;
 use buildlens_core::wire::{
     Attribution, BuildStatus, WIRE_VERSION, WireBuild, WireDiagnostic, WireFile, WirePhase,
     WireSwiftTiming, WireTarget, WireTest,
 };
-use buildlens_core::BuildCategory;
 use postgres::{Client, NoTls};
 
 fn database_url() -> Option<String> {
@@ -78,7 +78,10 @@ fn build(key: &str, seconds: f64, started_at: Option<f64>, machine: Option<&str>
             fetched_from_cache: false,
             compiled_count: 50,
         }],
-        phases: vec![WirePhase { name: "Prepare build".into(), seconds: 1.0 }],
+        phases: vec![WirePhase {
+            name: "Prepare build".into(),
+            seconds: 1.0,
+        }],
         // Wire version 2's detail. Populated rather than left empty so the
         // stored-and-read-back tests cover the tables a pushed build now
         // writes — the whole point of the version bump.
@@ -165,10 +168,7 @@ fn a_pushed_build_stores_the_same_detail_a_local_collect_does() {
     };
     let url = isolated_url(&url, "t_detail");
     let mut store = buildlens_server_store(&url);
-    assert!(
-        store
-            .insert(&build("detail", 100.0, Some(1_700_000_000.0), Some("m1")))
-    );
+    assert!(store.insert(&build("detail", 100.0, Some(1_700_000_000.0), Some("m1"))));
 
     let mut client = Client::connect(&url, NoTls).unwrap();
     for table in [
@@ -262,7 +262,10 @@ fn partitions_by_the_build_start_day() {
             .get(0);
         assert!(present, "{child} was never created");
         let rows: i64 = client
-            .query_one(format!("SELECT count(*)::bigint FROM {child}").as_str(), &[])
+            .query_one(
+                format!("SELECT count(*)::bigint FROM {child}").as_str(),
+                &[],
+            )
             .unwrap()
             .get(0);
         assert_eq!(rows, 1, "{child} did not receive its build");
@@ -271,7 +274,10 @@ fn partitions_by_the_build_start_day() {
         .query_one("SELECT count(*)::bigint FROM builds_default", &[])
         .unwrap()
         .get(0);
-    assert_eq!(stragglers, 0, "no row should be left in the default partition");
+    assert_eq!(
+        stragglers, 0,
+        "no row should be left in the default partition"
+    );
 }
 
 #[test]
@@ -290,8 +296,12 @@ fn stats_report_percentiles_and_machine_counts() {
         .as_secs() as f64;
     for (index, seconds) in [100.0, 200.0, 300.0, 400.0, 500.0].iter().enumerate() {
         let machine = if index % 2 == 0 { "m1" } else { "m2" };
-        store
-            .insert(&build(&format!("s{index}"), *seconds, Some(today), Some(machine)));
+        store.insert(&build(
+            &format!("s{index}"),
+            *seconds,
+            Some(today),
+            Some(machine),
+        ));
     }
     let stats = store.store().stats(30).unwrap();
     let item = &stats["items"].as_array().unwrap()[0];
@@ -407,8 +417,15 @@ fn build_detail_reports_both_diagnostic_counts() {
     wire.warning_count = 3;
     store.insert(&wire);
 
-    let detail = store.store().build_detail("counts").unwrap().expect("build exists");
-    assert_eq!(detail["error_count"], 7, "the error count was being dropped");
+    let detail = store
+        .store()
+        .build_detail("counts")
+        .unwrap()
+        .expect("build exists");
+    assert_eq!(
+        detail["error_count"], 7,
+        "the error count was being dropped"
+    );
     assert_eq!(detail["warning_count"], 3);
     // The child rows belong in the same call, or the page renders empty.
     assert_eq!(detail["targets"].as_array().unwrap().len(), 1);
@@ -443,8 +460,7 @@ fn the_day_window_is_inclusive_of_its_boundary() {
         .as_secs() as f64;
     // Exactly 7 days back, which the old strict comparison dropped.
     let seven_days_ago = now - 7.0 * 86_400.0;
-    store
-        .insert(&build("edge", 100.0, Some(seven_days_ago), Some("m1")));
+    store.insert(&build("edge", 100.0, Some(seven_days_ago), Some("m1")));
 
     let stats = store.store().stats(7).unwrap();
     assert_eq!(
@@ -492,10 +508,16 @@ fn the_day_window_query_prunes_to_its_partitions() {
 
     let mut client = Client::connect(&url, NoTls).unwrap();
     let total: i64 = client
-        .query_one("SELECT count(*)::bigint FROM buildlens_partitions WHERE parent = 'builds'", &[])
+        .query_one(
+            "SELECT count(*)::bigint FROM buildlens_partitions WHERE parent = 'builds'",
+            &[],
+        )
         .unwrap()
         .get(0);
-    assert!(total > 4, "expected a partition per day plus the default, got {total}");
+    assert!(
+        total > 4,
+        "expected a partition per day plus the default, got {total}"
+    );
 
     // ANALYZE so the plan reports what was actually executed; FORMAT TEXT and a
     // substring count keeps this robust across versions.
@@ -573,26 +595,24 @@ fn percentiles_report_whether_there_is_enough_history() {
     let mut store = buildlens_server_store(&url);
 
     for index in 0..3 {
-        store
-            .insert(&build(
-                &format!("p{index}"),
-                100.0,
-                Some(1_700_000_000.0),
-                Some("m1"),
-            ));
+        store.insert(&build(
+            &format!("p{index}"),
+            100.0,
+            Some(1_700_000_000.0),
+            Some("m1"),
+        ));
     }
     let thin = store.store().percentiles(100, None).unwrap();
     assert_eq!(thin["builds"], 3);
     assert_eq!(thin["enough_history"], false);
 
     for index in 3..8 {
-        store
-            .insert(&build(
-                &format!("p{index}"),
-                100.0,
-                Some(1_700_000_000.0),
-                Some("m1"),
-            ));
+        store.insert(&build(
+            &format!("p{index}"),
+            100.0,
+            Some(1_700_000_000.0),
+            Some("m1"),
+        ));
     }
     let full = store.store().percentiles(100, None).unwrap();
     assert_eq!(full["builds"], 8);
@@ -611,16 +631,34 @@ fn an_empty_database_answers_every_query() {
     let url = isolated_url(&url, "t_empty");
     let mut store = buildlens_server_store(&url);
 
-    assert_eq!(store.store().builds(10).unwrap()["items"].as_array().unwrap().len(), 0);
-    assert_eq!(store.store().stats(30).unwrap()["items"].as_array().unwrap().len(), 0);
     assert_eq!(
-        store.store().daily(30, None).unwrap()["items"].as_array().unwrap().len(),
+        store.store().builds(10).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        store.store().stats(30).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        store.store().daily(30, None).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
         0
     );
     let percentiles = store.store().percentiles(100, None).unwrap();
     assert_eq!(percentiles["builds"], 0);
     assert_eq!(percentiles["enough_history"], false);
-    assert!(percentiles["p50"].is_null(), "no builds means no percentile");
+    assert!(
+        percentiles["p50"].is_null(),
+        "no builds means no percentile"
+    );
 }
 
 /// Migration runs on every connect, so a second connection to a database that
@@ -633,8 +671,7 @@ fn migrating_an_existing_schema_is_idempotent() {
     };
     let url = isolated_url(&url, "t_migrate");
     let mut first = buildlens_server_store(&url);
-    first
-        .insert(&build("before", 10.0, Some(1_700_000_000.0), Some("m1")));
+    first.insert(&build("before", 10.0, Some(1_700_000_000.0), Some("m1")));
 
     let mut client = Client::connect(&url, NoTls).unwrap();
     let partitions = |client: &mut Client| -> i64 {
@@ -648,7 +685,10 @@ fn migrating_an_existing_schema_is_idempotent() {
     // Reconnecting re-runs migrate() against a populated schema.
     let mut second = buildlens_server_store(&url);
     assert_eq!(
-        second.store().builds(10).unwrap()["items"].as_array().unwrap().len(),
+        second.store().builds(10).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
         1,
         "re-migrating must not disturb existing rows"
     );

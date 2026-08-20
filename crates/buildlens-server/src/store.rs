@@ -79,7 +79,6 @@ pub fn connect_and_migrate(url: &str) -> Result<Client, ServerError> {
     Ok(client)
 }
 
-
 /// The query surface, over one connection borrowed from the [`Pool`] for the
 /// life of a single request.
 ///
@@ -331,7 +330,11 @@ impl<'a> PostgresStore<'a> {
 
     /// Slowest targets across the fleet, which is the query a single machine
     /// cannot answer.
-    pub fn slowest_targets(&mut self, days: i64, limit: i64) -> Result<serde_json::Value, ServerError> {
+    pub fn slowest_targets(
+        &mut self,
+        days: i64,
+        limit: i64,
+    ) -> Result<serde_json::Value, ServerError> {
         let rows = self.client.query(
             "SELECT name, COUNT(*)::BIGINT, AVG(seconds), MAX(seconds)
              FROM build_targets
@@ -370,8 +373,6 @@ fn ranked(rows: Vec<postgres::Row>) -> serde_json::Value {
         .collect();
     serde_json::json!({ "items": items })
 }
-
-
 
 /// A real `ServerError::Database`, for tests that assert how store failures
 /// are reported. Connecting to a closed port is the cheapest way to obtain a

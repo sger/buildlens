@@ -135,7 +135,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len();
-        assert!(tracked < MAX_TRACKED, "stale windows were not reclaimed: {tracked}");
+        assert!(
+            tracked < MAX_TRACKED,
+            "stale windows were not reclaimed: {tracked}"
+        );
     }
 
     /// A limit of zero refuses everything rather than dividing by zero or

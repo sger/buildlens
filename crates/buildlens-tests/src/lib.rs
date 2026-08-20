@@ -127,8 +127,20 @@ mod tests {
     /// across builds; a pass does not need one.
     #[test]
     fn only_failures_carry_a_fingerprint() {
-        assert!(XCTestParser.parse(XCTEST_PASS).unwrap().fingerprint.is_none());
-        assert!(XCTestParser.parse(XCTEST_FAIL).unwrap().fingerprint.is_some());
+        assert!(
+            XCTestParser
+                .parse(XCTEST_PASS)
+                .unwrap()
+                .fingerprint
+                .is_none()
+        );
+        assert!(
+            XCTestParser
+                .parse(XCTEST_FAIL)
+                .unwrap()
+                .fingerprint
+                .is_some()
+        );
         assert!(
             SwiftTestingParser
                 .parse(SWIFT_FAIL)
@@ -175,7 +187,10 @@ mod tests {
             XCTestParser.started(line).as_deref(),
             Some("CoreTests:testThing")
         );
-        assert!(XCTestParser.parse(line).is_none(), "a start is not a result");
+        assert!(
+            XCTestParser.parse(line).is_none(),
+            "a start is not a result"
+        );
     }
 
     #[test]
@@ -195,7 +210,11 @@ mod tests {
     #[test]
     fn swift_testing_reports_no_start_or_crash() {
         assert!(SwiftTestingParser.started(SWIFT_PASS).is_none());
-        assert!(SwiftTestingParser.crash("Fatal error: boom", None).is_none());
+        assert!(
+            SwiftTestingParser
+                .crash("Fatal error: boom", None)
+                .is_none()
+        );
     }
 
     /// The two formats must not both claim one line, or `parse_any` would

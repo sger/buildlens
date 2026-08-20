@@ -602,7 +602,6 @@ impl WireBuild {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,7 +786,10 @@ mod tests {
         let build =
             WireBuild::from_metrics(&detailed, "App", None, Attribution::Anonymous, 50).unwrap();
         let text = serde_json::to_string(&build).unwrap();
-        assert!(text.contains("Internal.swift"), "the file timing was dropped");
+        assert!(
+            text.contains("Internal.swift"),
+            "the file timing was dropped"
+        );
         assert!(
             text.contains("expensiveGeneric"),
             "the Swift timing's symbol was dropped"
@@ -801,7 +803,10 @@ mod tests {
     }
 
     fn identity() -> Identity {
-        Identity { user: Some("s.gerokostas".into()), host: Some("Spiros-MBP".into()) }
+        Identity {
+            user: Some("s.gerokostas".into()),
+            host: Some("Spiros-MBP".into()),
+        }
     }
 
     #[test]
@@ -838,7 +843,10 @@ mod tests {
             let text = serde_json::to_string(&build).unwrap();
             assert_eq!(build.user, None, "{tier:?} transmitted a user");
             assert_eq!(build.host, None, "{tier:?} transmitted a host");
-            assert!(!text.contains("s.gerokostas"), "{tier:?} leaked the user name");
+            assert!(
+                !text.contains("s.gerokostas"),
+                "{tier:?} leaked the user name"
+            );
             assert!(!text.contains("Spiros-MBP"), "{tier:?} leaked the hostname");
         }
     }
@@ -921,7 +929,12 @@ mod tests {
             .map(|i| test_result("S", &format!("pass{i}"), crate::TestStatus::Passed))
             .collect();
         many.push(test_result("S", "theCrash", crate::TestStatus::Started));
-        assert!(with_tests(&many).tests.iter().any(|test| test.name == "theCrash"));
+        assert!(
+            with_tests(&many)
+                .tests
+                .iter()
+                .any(|test| test.name == "theCrash")
+        );
     }
 
     /// Every attempt of one test must stay together and in log order. Ordering
@@ -936,8 +949,15 @@ mod tests {
             test_result("S", "flaky", crate::TestStatus::Passed),
         ]);
         let names: Vec<_> = sent.tests.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["flaky", "flaky", "quiet"], "the retried test leads");
-        assert_eq!(sent.tests[0].status, "failed", "its first attempt stays first");
+        assert_eq!(
+            names,
+            vec!["flaky", "flaky", "quiet"],
+            "the retried test leads"
+        );
+        assert_eq!(
+            sent.tests[0].status, "failed",
+            "its first attempt stays first"
+        );
         assert_eq!(sent.tests[1].status, "passed", "the retry stays second");
     }
 

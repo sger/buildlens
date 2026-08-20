@@ -254,9 +254,7 @@ fn collect_candidates(root: &Path, project: Option<&str>) -> Result<Vec<PathBuf>
                 entries
                     .filter_map(|entry| entry.ok())
                     .map(|entry| entry.path())
-                    .filter(|path| {
-                        path.extension().is_some_and(|ext| ext == "xcactivitylog")
-                    }),
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "xcactivitylog")),
             );
         }
     }
@@ -281,8 +279,8 @@ pub fn wait_until_stable(path: &Path, timeout: Duration) -> Result<()> {
     let mut last: Option<(u64, std::time::SystemTime)> = None;
     let mut stable_since: Option<Instant> = None;
     loop {
-        let metadata = std::fs::metadata(path)
-            .with_context(|| format!("cannot stat {}", path.display()))?;
+        let metadata =
+            std::fs::metadata(path).with_context(|| format!("cannot stat {}", path.display()))?;
         let current = (metadata.len(), metadata.modified()?);
         if last == Some(current) {
             let since = *stable_since.get_or_insert_with(Instant::now);
@@ -325,7 +323,8 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("buildlens-collect-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("buildlens-collect-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -502,8 +501,9 @@ mod tests {
         std::fs::create_dir_all(&normal).unwrap();
         std::fs::write(normal.join("debug.xcactivitylog"), b"x").unwrap();
 
-        let archived = root
-            .join("App-abc123/Build/Intermediates.noindex/ArchiveIntermediates/AppScheme/Logs/Build");
+        let archived = root.join(
+            "App-abc123/Build/Intermediates.noindex/ArchiveIntermediates/AppScheme/Logs/Build",
+        );
         std::fs::create_dir_all(&archived).unwrap();
         let archive_log = archived.join("release.xcactivitylog");
         std::fs::write(&archive_log, b"x").unwrap();
@@ -522,8 +522,16 @@ mod tests {
             .unwrap();
 
         let all = find_activity_logs(&root, None).unwrap();
-        assert_eq!(all.len(), 2, "expected both the debug and archive logs: {all:?}");
-        assert!(find_newest_activity_log(&root, None).unwrap().ends_with("release.xcactivitylog"));
+        assert_eq!(
+            all.len(),
+            2,
+            "expected both the debug and archive logs: {all:?}"
+        );
+        assert!(
+            find_newest_activity_log(&root, None)
+                .unwrap()
+                .ends_with("release.xcactivitylog")
+        );
     }
 
     /// `Logs/Package` holds SPM dependency-resolution logs — no targets, no

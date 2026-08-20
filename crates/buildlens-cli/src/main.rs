@@ -345,7 +345,8 @@ fn parse_tag_arg(argument: &str) -> Result<(String, String), String> {
     buildlens_plugins::parse_tag(argument)
 }
 fn is_activity_log(path: &std::path::Path) -> bool {
-    path.extension().is_some_and(|extension| extension == "xcactivitylog")
+    path.extension()
+        .is_some_and(|extension| extension == "xcactivitylog")
 }
 /// Activity logs carry no parseable text diagnostics; the analysis is the
 /// metrics attached to an otherwise empty report.
@@ -368,10 +369,7 @@ fn analysis_for(
 ///
 /// `None` when the tests have not finished, which for a watcher is the normal
 /// case at collect time — the manifest scan attaches them later.
-fn bundle_for_build(
-    root: &std::path::Path,
-    log: &std::path::Path,
-) -> Option<std::path::PathBuf> {
+fn bundle_for_build(root: &std::path::Path, log: &std::path::Path) -> Option<std::path::PathBuf> {
     let build_key = log.file_stem()?.to_str()?;
     let entry = buildlens_xcresult::manifest_entries(root)
         .into_iter()
@@ -424,11 +422,20 @@ fn apply_xcresult_tests(
     // The summary counts distinct runs, matching what the text-log path
     // produces, so a retried test is not counted as two tests.
     analysis.tests.total = results.len();
-    analysis.tests.passed = results.iter().filter(|r| r.status == buildlens_core::TestStatus::Passed).count();
-    analysis.tests.failed = results.iter().filter(|r| r.status == buildlens_core::TestStatus::Failed).count();
+    analysis.tests.passed = results
+        .iter()
+        .filter(|r| r.status == buildlens_core::TestStatus::Passed)
+        .count();
+    analysis.tests.failed = results
+        .iter()
+        .filter(|r| r.status == buildlens_core::TestStatus::Failed)
+        .count();
     analysis.tests.slowest = results.clone();
     analysis.tests.slowest.sort_by(|left, right| {
-        right.duration_seconds.partial_cmp(&left.duration_seconds).unwrap_or(std::cmp::Ordering::Equal)
+        right
+            .duration_seconds
+            .partial_cmp(&left.duration_seconds)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     analysis.tests.slowest.truncate(20);
     // These results replace the text log's, so the verdict has to be restated
@@ -534,8 +541,7 @@ fn diagnostics_from_metrics(
 ) -> buildlens_core::DiagnosticSummary {
     use buildlens_core::DiagnosticSeverity;
     use std::collections::BTreeMap;
-    let mut by_fingerprint: BTreeMap<String, buildlens_core::DiagnosticAggregate> =
-        BTreeMap::new();
+    let mut by_fingerprint: BTreeMap<String, buildlens_core::DiagnosticAggregate> = BTreeMap::new();
     let (mut raw_warnings, mut raw_errors) = (0usize, 0usize);
     for item in raw {
         // Xcode's scale: 1 is a warning, 2 and above an error.
@@ -619,15 +625,16 @@ fn baseline_comparison_text(comparison: &buildlens_storage::BaselineComparison) 
         ));
     }
     if comparison.environment_changed {
-        text.push_str(
-            "  Environment changed between these builds, so this is low confidence.\n",
-        );
+        text.push_str("  Environment changed between these builds, so this is low confidence.\n");
     }
     if comparison.regressions.is_empty() {
         text.push_str("  No target got materially slower.\n");
         return text;
     }
-    text.push_str(&format!("  {} slower target(s):\n", comparison.regressions.len()));
+    text.push_str(&format!(
+        "  {} slower target(s):\n",
+        comparison.regressions.len()
+    ));
     for regression in comparison.regressions.iter().take(10) {
         text.push_str(&format!(
             "    {}: {:.2}s -> {:.2}s (+{:.2}s, +{:.1}%) [{}]\n",
@@ -697,7 +704,10 @@ fn collect_metadata(
         repo_root: repo,
         build_start_unix,
         build: &analysis.build,
-        environment: analysis.metrics.as_ref().map(|metrics| &metrics.environment),
+        environment: analysis
+            .metrics
+            .as_ref()
+            .map(|metrics| &metrics.environment),
         user_metadata_path: collect.metadata_file.as_deref(),
         tags: &tags,
         probe: &probe,
@@ -722,11 +732,28 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<std::process::ExitCode> {
     let c = Cli::parse();
     match c.command {
-        Command::Metrics { input, format, output, raw, detail } => {
+        Command::Metrics {
+            input,
+            format,
+            output,
+            raw,
+            detail,
+        } => {
             let metrics = buildlens_metrics::analyze_file(&input, detail.into())?;
-            let metrics = if raw { metrics } else { buildlens_metrics::redacted(metrics, None) };
-            let total = metrics.total_seconds.map(|x| format!("{x:.3}s")).unwrap_or_else(|| "unknown".into());
-            let cache = metrics.cache.hit_rate.map(|x| format!("{:.0}% ({})", x * 100.0, metrics.cache.status)).unwrap_or_else(|| metrics.cache.status.clone());
+            let metrics = if raw {
+                metrics
+            } else {
+                buildlens_metrics::redacted(metrics, None)
+            };
+            let total = metrics
+                .total_seconds
+                .map(|x| format!("{x:.3}s"))
+                .unwrap_or_else(|| "unknown".into());
+            let cache = metrics
+                .cache
+                .hit_rate
+                .map(|x| format!("{:.0}% ({})", x * 100.0, metrics.cache.status))
+                .unwrap_or_else(|| metrics.cache.status.clone());
             if !metrics.warnings.is_empty() {
                 for warning in &metrics.warnings {
                     eprintln!("warning: {warning}");
@@ -739,15 +766,58 @@ fn run() -> Result<std::process::ExitCode> {
             }
             let text = match format {
                 Format::Json => serde_json::to_string_pretty(&metrics)?,
-                Format::Markdown => format!("## BuildLens Metrics\n\n- **Source:** {:?}\n- **Category:** {}\n- **Total:** {}\n- **Cache hits:** {}\n- **Phases:** {}\n- **Targets:** {}\n- **Files:** {}\n- **Warnings:** {}\n", metrics.source_kind, metrics.category.as_str(), total, cache, metrics.phases.len(), metrics.targets.len(), metrics.files.len(), metrics.warnings.len()),
+                Format::Markdown => format!(
+                    "## BuildLens Metrics\n\n- **Source:** {:?}\n- **Category:** {}\n- **Total:** {}\n- **Cache hits:** {}\n- **Phases:** {}\n- **Targets:** {}\n- **Files:** {}\n- **Warnings:** {}\n",
+                    metrics.source_kind,
+                    metrics.category.as_str(),
+                    total,
+                    cache,
+                    metrics.phases.len(),
+                    metrics.targets.len(),
+                    metrics.files.len(),
+                    metrics.warnings.len()
+                ),
                 Format::Terminal => {
-                    let targets = metrics.targets.iter().take(10).map(|x| format!("\n{}: {:.3}s [{}]", x.name, x.seconds, x.category.as_str())).collect::<String>();
-                    let phases = metrics.phases.iter().take(10).map(|x| format!("\n{}: {:.3}s", x.name, x.seconds)).collect::<String>();
-                    let files = metrics.files.iter().take(10).map(|x| format!("\n{}: {:.3}s", x.file, x.seconds)).collect::<String>();
-                    format!("BuildLens Metrics\n\nSource: {:?}\nCategory: {}\nTotal: {}\nCache hits: {}\nPhases: {}\nTargets: {}\nFiles: {}\n\nSlowest targets:{}\n\nSlowest phases:{}\n\nSlowest files:{}\n", metrics.source_kind, metrics.category.as_str(), total, cache, metrics.phases.len(), metrics.targets.len(), metrics.files.len(), targets, phases, files)
+                    let targets = metrics
+                        .targets
+                        .iter()
+                        .take(10)
+                        .map(|x| {
+                            format!("\n{}: {:.3}s [{}]", x.name, x.seconds, x.category.as_str())
+                        })
+                        .collect::<String>();
+                    let phases = metrics
+                        .phases
+                        .iter()
+                        .take(10)
+                        .map(|x| format!("\n{}: {:.3}s", x.name, x.seconds))
+                        .collect::<String>();
+                    let files = metrics
+                        .files
+                        .iter()
+                        .take(10)
+                        .map(|x| format!("\n{}: {:.3}s", x.file, x.seconds))
+                        .collect::<String>();
+                    format!(
+                        "BuildLens Metrics\n\nSource: {:?}\nCategory: {}\nTotal: {}\nCache hits: {}\nPhases: {}\nTargets: {}\nFiles: {}\n\nSlowest targets:{}\n\nSlowest phases:{}\n\nSlowest files:{}\n",
+                        metrics.source_kind,
+                        metrics.category.as_str(),
+                        total,
+                        cache,
+                        metrics.phases.len(),
+                        metrics.targets.len(),
+                        metrics.files.len(),
+                        targets,
+                        phases,
+                        files
+                    )
                 }
             };
-            if let Some(path) = output { std::fs::write(path, text)?; } else { println!("{text}"); }
+            if let Some(path) = output {
+                std::fs::write(path, text)?;
+            } else {
+                println!("{text}");
+            }
         }
         Command::Dashboard { db, port } => {
             // The same server the container runs, so there is one
@@ -784,19 +854,26 @@ fn run() -> Result<std::process::ExitCode> {
                 analysis_for_pair(
                     path,
                     activity_log.clone(),
-                    AnalyzeOptions { detail: detail.clone().into(), no_ai },
+                    AnalyzeOptions {
+                        detail: detail.clone().into(),
+                        no_ai,
+                    },
                     detail.clone().into(),
                 )?
             } else {
                 let stdin = std::io::stdin();
                 let mut analysis = buildlens_parser::analyze_reader(
                     stdin.lock(),
-                    AnalyzeOptions { detail: detail.clone().into(), no_ai },
+                    AnalyzeOptions {
+                        detail: detail.clone().into(),
+                        no_ai,
+                    },
                 )?;
                 if let Some(companion) = &activity_log {
-                    analysis.metrics = buildlens_metrics::analyze_file(companion, detail.clone().into())
-                        .ok()
-                        .map(|metrics| buildlens_metrics::redacted(metrics, None));
+                    analysis.metrics =
+                        buildlens_metrics::analyze_file(companion, detail.clone().into())
+                            .ok()
+                            .map(|metrics| buildlens_metrics::redacted(metrics, None));
                 }
                 analysis
             };
@@ -817,7 +894,11 @@ fn run() -> Result<std::process::ExitCode> {
                 };
                 let intelligence = buildlens_intel::analyze(&a, &regressions);
                 a.investigation.next_steps.extend(
-                    intelligence.chains.iter().take(3).map(|chain| chain.summary.clone()),
+                    intelligence
+                        .chains
+                        .iter()
+                        .take(3)
+                        .map(|chain| chain.summary.clone()),
                 );
                 a.intelligence = Some(intelligence);
             }
@@ -929,10 +1010,8 @@ fn run() -> Result<std::process::ExitCode> {
         } => {
             warn_if_token_came_from_the_command_line(token.as_deref());
             let explicit = build_dir.as_deref().map(expand_home);
-            let root = collect::search_root(
-                explicit.as_deref(),
-                &expand_home(DEFAULT_DERIVED_DATA),
-            );
+            let root =
+                collect::search_root(explicit.as_deref(), &expand_home(DEFAULT_DERIVED_DATA));
             // Before the lookup below: a watcher must survive an empty
             // DerivedData and wait for the first build, not exit.
             if watch {
@@ -950,7 +1029,10 @@ fn run() -> Result<std::process::ExitCode> {
             let logs = if all {
                 collect::find_activity_logs(&root, match_project.as_deref())?
             } else {
-                vec![collect::find_newest_activity_log(&root, match_project.as_deref())?]
+                vec![collect::find_newest_activity_log(
+                    &root,
+                    match_project.as_deref(),
+                )?]
             };
             if dry_run {
                 for log in &logs {
@@ -983,7 +1065,10 @@ fn run() -> Result<std::process::ExitCode> {
             collect::wait_until_stable(&log, std::time::Duration::from_secs(timeout))?;
             let mut analysis = analysis_for(
                 log.clone(),
-                AnalyzeOptions { detail: Detail::Full, no_ai: true },
+                AnalyzeOptions {
+                    detail: Detail::Full,
+                    no_ai: true,
+                },
                 Detail::Full,
             )?;
             // Xcode.app writes an `.xcresult` for every ⌘U run into the same
@@ -1051,7 +1136,11 @@ fn run() -> Result<std::process::ExitCode> {
                 local_machine_id(anonymous),
                 tier,
                 local_identity,
-                if attempts.is_empty() { None } else { Some(&attempts) },
+                if attempts.is_empty() {
+                    None
+                } else {
+                    Some(&attempts)
+                },
             )?;
             let summary = analysis
                 .metrics
@@ -1067,7 +1156,15 @@ fn run() -> Result<std::process::ExitCode> {
                     )
                 })
                 .unwrap_or_default();
-            println!("{} {} in PostgreSQL{summary}", if inserted { "Collected" } else { "Skipped duplicate" }, log.display());
+            println!(
+                "{} {} in PostgreSQL{summary}",
+                if inserted {
+                    "Collected"
+                } else {
+                    "Skipped duplicate"
+                },
+                log.display()
+            );
             if let Some(server) = &server {
                 push_metrics(
                     &analysis,
@@ -1081,28 +1178,56 @@ fn run() -> Result<std::process::ExitCode> {
             }
         }
         Command::History { command } => match command {
-            HistoryCommand::Save { log, activity_log, xcresult, db, repo, collect } => {
+            HistoryCommand::Save {
+                log,
+                activity_log,
+                xcresult,
+                db,
+                repo,
+                collect,
+            } => {
                 let log_for_metadata = log.clone();
                 let mut analysis = analysis_for_pair(
                     log,
                     activity_log,
-                    AnalyzeOptions { detail: Detail::Full, no_ai: true },
+                    AnalyzeOptions {
+                        detail: Detail::Full,
+                        no_ai: true,
+                    },
                     Detail::Full,
                 )?;
                 let attempts = apply_xcresult_tests(&mut analysis, xcresult.as_deref())?;
                 apply_project_name(&mut analysis, collect.project.as_deref());
-                analysis.metadata = collect_metadata(&collect, &repo, Some(&log_for_metadata), &analysis);
+                analysis.metadata =
+                    collect_metadata(&collect, &repo, Some(&log_for_metadata), &analysis);
                 reject_unusable_metrics(&analysis, &log_for_metadata)?;
                 let mut store = PostgresStore::connect(&db)?;
                 let project = project_name_for_storage(&analysis);
                 let inserted = if attempts.is_empty() {
                     store.save_analysis(&analysis, &project, local_machine_id(false), false)?
                 } else {
-                    store.save_analysis_with_attempts(&analysis, &project, local_machine_id(false), false, &attempts)?
+                    store.save_analysis_with_attempts(
+                        &analysis,
+                        &project,
+                        local_machine_id(false),
+                        false,
+                        &attempts,
+                    )?
                 };
-                println!("{} build in PostgreSQL", if inserted { "Saved" } else { "Skipped duplicate" });
+                println!(
+                    "{} build in PostgreSQL",
+                    if inserted {
+                        "Saved"
+                    } else {
+                        "Skipped duplicate"
+                    }
+                );
             }
-            HistoryCommand::Prune { keep_days, db, confirm } => {
+            HistoryCommand::Prune {
+                keep_days,
+                db,
+                confirm,
+            } => {
                 if keep_days == 0 {
                     bail!("--keep-days must be at least 1; 0 would delete the entire history");
                 }
@@ -1135,7 +1260,10 @@ fn run() -> Result<std::process::ExitCode> {
             HistoryCommand::Compare { log, db, format } => {
                 let analysis = analysis_for(
                     log.clone(),
-                    AnalyzeOptions { detail: Detail::Full, no_ai: true },
+                    AnalyzeOptions {
+                        detail: Detail::Full,
+                        no_ai: true,
+                    },
                     Detail::Full,
                 )?;
                 let key = analysis
@@ -1143,7 +1271,9 @@ fn run() -> Result<std::process::ExitCode> {
                     .as_ref()
                     .and_then(|metrics| metrics.build_id.clone())
                     .filter(|id| !id.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("{} has no build id to compare", log.display()))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{} has no build id to compare", log.display())
+                    })?;
                 let mut store = PostgresStore::connect(&db)?;
                 let Some(comparison) = store.compare_to_baseline(&key)? else {
                     // No baseline means no claim. Saying "no regressions" here
@@ -1337,7 +1467,9 @@ fn push_metrics(
     // sends personal data, and the person running it should see that it did.
     if attribution == Attribution::Identified {
         if let Some(user) = identity.user.as_deref() {
-            eprintln!("note: sending identified builds as {user} — this attaches your name to every build");
+            eprintln!(
+                "note: sending identified builds as {user} — this attaches your name to every build"
+            );
         }
     }
     // An explicit --project wins here too, so the team server groups builds
@@ -1362,7 +1494,10 @@ fn push_metrics(
     };
     let result = push::push(metrics, &options)?;
     if dry_run {
-        println!("Would send to {server}:\n{}", serde_json::to_string_pretty(&result)?);
+        println!(
+            "Would send to {server}:\n{}",
+            serde_json::to_string_pretty(&result)?
+        );
     } else if result.get("duplicate").and_then(serde_json::Value::as_bool) == Some(true) {
         println!("Server already had this build; nothing re-sent");
     } else {
@@ -1421,7 +1556,9 @@ fn project_name_from_log(source_log: &str) -> String {
         Some((name, suffix))
             if !name.is_empty()
                 && suffix.len() >= 3
-                && suffix.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) =>
+                && suffix
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) =>
         {
             name.to_owned()
         }
@@ -1501,8 +1638,7 @@ fn watch_loop(
     // keying on the path alone makes every build after the first invisible.
     // History is still the real dedup; this only avoids re-parsing unchanged
     // logs on every scan.
-    let mut seen: std::collections::HashSet<(PathBuf, u64, i64)> =
-        std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(PathBuf, u64, i64)> = std::collections::HashSet::new();
     // Consecutive stability failures per log identity, so a log that never
     // finishes is given up on rather than retried forever. Keyed like `seen`:
     // a genuinely new write of the same path starts its own count.
@@ -1735,7 +1871,10 @@ fn import_one(
     collect::wait_until_stable(log, std::time::Duration::from_secs(timeout))?;
     let mut analysis = analysis_for(
         log.to_path_buf(),
-        AnalyzeOptions { detail: Detail::Full, no_ai: true },
+        AnalyzeOptions {
+            detail: Detail::Full,
+            no_ai: true,
+        },
         Detail::Full,
     )?;
     // Deliberately not defaulting to the directory selector here: `--all`
@@ -1775,7 +1914,11 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    fn analysis_with(errors: usize, warnings: usize, failed: usize) -> buildlens_core::BuildAnalysis {
+    fn analysis_with(
+        errors: usize,
+        warnings: usize,
+        failed: usize,
+    ) -> buildlens_core::BuildAnalysis {
         let mut analysis = buildlens_core::BuildAnalysis::default();
         analysis.diagnostics.raw_errors = errors;
         analysis.diagnostics.raw_warnings = warnings;
@@ -1873,13 +2016,23 @@ mod tests {
     #[test]
     fn a_token_argument_is_detected_in_either_form() {
         let args = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-        assert!(token_passed_as_argument(args(&["buildlens", "--token", "secret"]).into_iter()));
-        assert!(token_passed_as_argument(args(&["buildlens", "--token=secret"]).into_iter()));
-        assert!(!token_passed_as_argument(args(&["buildlens", "collect"]).into_iter()));
+        assert!(token_passed_as_argument(
+            args(&["buildlens", "--token", "secret"]).into_iter()
+        ));
+        assert!(token_passed_as_argument(
+            args(&["buildlens", "--token=secret"]).into_iter()
+        ));
+        assert!(!token_passed_as_argument(
+            args(&["buildlens", "collect"]).into_iter()
+        ));
         // The environment variable is the safe path and must not warn.
-        assert!(!token_passed_as_argument(args(&["buildlens", "--server", "http://x"]).into_iter()));
+        assert!(!token_passed_as_argument(
+            args(&["buildlens", "--server", "http://x"]).into_iter()
+        ));
         // A flag that merely starts with the same letters is not --token.
-        assert!(!token_passed_as_argument(args(&["buildlens", "--tokens"]).into_iter()));
+        assert!(!token_passed_as_argument(
+            args(&["buildlens", "--tokens"]).into_iter()
+        ));
     }
 
     /// `--db` carries a connection URL. As a `PathBuf` it went through
@@ -1936,7 +2089,12 @@ mod tests {
             "--project",
             "KaizenApp",
         ]);
-        let Command::Collect { match_project, collect, .. } = cli.command else {
+        let Command::Collect {
+            match_project,
+            collect,
+            ..
+        } = cli.command
+        else {
             panic!("expected the collect subcommand");
         };
         assert_eq!(match_project.as_deref(), Some("Kaizen"));
@@ -1948,15 +2106,26 @@ mod tests {
     #[test]
     fn match_project_falls_back_to_the_recorded_name() {
         let cli = Cli::parse_from(["buildlens", "collect", "--match-project", "Kaizen"]);
-        let Command::Collect { match_project, collect, .. } = cli.command else {
+        let Command::Collect {
+            match_project,
+            collect,
+            ..
+        } = cli.command
+        else {
             panic!("expected the collect subcommand");
         };
-        assert_eq!(collect.project.as_deref().or(match_project.as_deref()), Some("Kaizen"));
+        assert_eq!(
+            collect.project.as_deref().or(match_project.as_deref()),
+            Some("Kaizen")
+        );
     }
 
     /// Built through `BuildMetrics::empty` rather than by listing every field,
     /// so adding a field to core does not break this helper.
-    fn analysis_from(source_log: Option<&str>, project: Option<&str>) -> buildlens_core::BuildAnalysis {
+    fn analysis_from(
+        source_log: Option<&str>,
+        project: Option<&str>,
+    ) -> buildlens_core::BuildAnalysis {
         let mut metrics = buildlens_core::BuildMetrics::empty(
             buildlens_core::MetricsSourceKind::Xcactivitylog,
             Vec::new(),
@@ -1979,11 +2148,18 @@ mod tests {
     #[test]
     fn an_analysis_with_no_metrics_is_rejected() {
         let analysis = buildlens_core::BuildAnalysis::default();
-        assert!(analysis.metrics.is_none(), "the fixture must have no metrics");
-        let error = reject_unusable_metrics(&analysis, std::path::Path::new("/tmp/Empty.xcactivitylog"))
-            .expect_err("a metric-less analysis must not pass validation");
+        assert!(
+            analysis.metrics.is_none(),
+            "the fixture must have no metrics"
+        );
+        let error =
+            reject_unusable_metrics(&analysis, std::path::Path::new("/tmp/Empty.xcactivitylog"))
+                .expect_err("a metric-less analysis must not pass validation");
         let message = error.to_string();
-        assert!(message.contains("Empty.xcactivitylog"), "must name the log: {message}");
+        assert!(
+            message.contains("Empty.xcactivitylog"),
+            "must name the log: {message}"
+        );
         assert!(
             message.contains("no build metrics"),
             "must say what was wrong rather than leaving it to the store: {message}"
@@ -2006,7 +2182,10 @@ mod tests {
             occurrences: 1,
         });
         assert!(metrics.is_usable(), "the fixture must be a usable build");
-        assert!(reject_unusable_metrics(&analysis, std::path::Path::new("/tmp/A.xcactivitylog")).is_ok());
+        assert!(
+            reject_unusable_metrics(&analysis, std::path::Path::new("/tmp/A.xcactivitylog"))
+                .is_ok()
+        );
     }
 
     /// A log outside a DerivedData layout infers nothing, so the caller keeps
@@ -2032,7 +2211,9 @@ mod tests {
         };
         for entry in entries.flatten() {
             let logs = entry.path().join("Logs/Build");
-            let Ok(files) = std::fs::read_dir(&logs) else { continue };
+            let Ok(files) = std::fs::read_dir(&logs) else {
+                continue;
+            };
             let Some(log) = files
                 .flatten()
                 .map(|f| f.path())
@@ -2057,7 +2238,9 @@ mod tests {
     #[test]
     fn storage_infers_the_project_from_a_derived_data_path() {
         let analysis = analysis_from(
-            Some("/Users/x/Library/Developer/Xcode/DerivedData/Kaizen-btrrdvosubixawcn/Logs/Build/A.xcactivitylog"),
+            Some(
+                "/Users/x/Library/Developer/Xcode/DerivedData/Kaizen-btrrdvosubixawcn/Logs/Build/A.xcactivitylog",
+            ),
             None,
         );
         assert_eq!(project_name_for_storage(&analysis), "Kaizen");
@@ -2067,7 +2250,9 @@ mod tests {
     #[test]
     fn an_explicit_project_name_beats_path_inference() {
         let analysis = analysis_from(
-            Some("/Users/x/Library/Developer/Xcode/DerivedData/Kaizen-btrrdvosubixawcn/Logs/Build/A.xcactivitylog"),
+            Some(
+                "/Users/x/Library/Developer/Xcode/DerivedData/Kaizen-btrrdvosubixawcn/Logs/Build/A.xcactivitylog",
+            ),
             Some("KaizenApp"),
         );
         assert_eq!(project_name_for_storage(&analysis), "KaizenApp");
@@ -2076,6 +2261,9 @@ mod tests {
     /// Only a log with nothing to infer from falls back to "unknown".
     #[test]
     fn storage_falls_back_to_unknown_without_a_usable_path() {
-        assert_eq!(project_name_for_storage(&analysis_from(None, None)), "unknown");
+        assert_eq!(
+            project_name_for_storage(&analysis_from(None, None)),
+            "unknown"
+        );
     }
 }

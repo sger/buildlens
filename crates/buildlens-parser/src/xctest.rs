@@ -134,7 +134,10 @@ mod tests {
     fn reads_the_dotted_form_xcode_16_prints() {
         let line = "Test case 'FlakyTests.testFlakyNetworkCall()' failed on 'Clone 1 of iPhone 17 Pro - UnitTestsApp (78886)' (0.004 seconds)";
         let result = result(line).expect("an XCTest result");
-        assert_eq!(result.suite, "FlakyTests", "the class, not \"SwiftTesting\"");
+        assert_eq!(
+            result.suite, "FlakyTests",
+            "the class, not \"SwiftTesting\""
+        );
         assert_eq!(result.test, "testFlakyNetworkCall()");
         assert_eq!(result.status, TestStatus::Failed);
         assert_eq!(result.duration_seconds, Some(0.004));

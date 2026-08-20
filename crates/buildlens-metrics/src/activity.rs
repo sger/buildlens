@@ -1222,9 +1222,16 @@ mod tests {
         // replayed one is not one of them — the fix here is the count, which
         // was 2 before, not a reclassification of a one-step build.
         assert_eq!(metrics.category, BuildCategory::Clean);
-        assert_eq!(metrics.replayed_steps, 1, "the exclusion is recorded, not silent");
+        assert_eq!(
+            metrics.replayed_steps, 1,
+            "the exclusion is recorded, not silent"
+        );
         let steps = &metrics.targets[0].steps;
-        assert_eq!(steps.len(), 2, "both are kept; the dependency view reads them");
+        assert_eq!(
+            steps.len(),
+            2,
+            "both are kept; the dependency view reads them"
+        );
         assert_eq!(steps.iter().filter(|s| s.executed).count(), 1);
     }
 
@@ -1240,7 +1247,10 @@ mod tests {
         };
         let log = build(vec![target(
             "App",
-            vec![replayed("CompileSwift a.swift"), replayed("CompileSwift b.swift")],
+            vec![
+                replayed("CompileSwift a.swift"),
+                replayed("CompileSwift b.swift"),
+            ],
         )]);
         let metrics = map(&log, vec![], &MapOptions { full_detail: true });
         assert_eq!(metrics.category, BuildCategory::Noop);

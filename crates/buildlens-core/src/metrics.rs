@@ -190,7 +190,9 @@ pub struct MetricDiagnostic {
     pub target: Option<String>,
 }
 
-fn is_zero(value: &usize) -> bool { *value == 0 }
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BuildMetrics {
@@ -379,9 +381,10 @@ impl BuildMetrics {
         self.targets.is_empty()
             && self.files.is_empty()
             && self.compiled_count == 0
-            && self.warnings.iter().any(|warning| {
-                ABORTED.iter().any(|marker| warning.contains(marker))
-            })
+            && self
+                .warnings
+                .iter()
+                .any(|warning| ABORTED.iter().any(|marker| warning.contains(marker)))
     }
 
     /// True for a log that timed something other than a build: `xcodebuild
@@ -538,16 +541,20 @@ mod usability_tests {
         let mut metrics = BuildMetrics::empty(MetricsSourceKind::Xcactivitylog, Vec::new());
         metrics.total_seconds = Some(7.63);
         // The exact phases observed, in order.
-        metrics.phases = ["Prepare clean", "Create build operation",
-                          "Send project description to build service", "Create build request"]
-            .iter()
-            .map(|name| PhaseMetric {
-                name: (*name).into(),
-                seconds: 0.1,
-                started_at: None,
-                ended_at: None,
-            })
-            .collect();
+        metrics.phases = [
+            "Prepare clean",
+            "Create build operation",
+            "Send project description to build service",
+            "Create build request",
+        ]
+        .iter()
+        .map(|name| PhaseMetric {
+            name: (*name).into(),
+            seconds: 0.1,
+            started_at: None,
+            ended_at: None,
+        })
+        .collect();
         assert!(metrics.timed_no_work(), "a clean action compiles nothing");
         assert!(!metrics.is_usable(), "and so is not stored as a build");
     }
@@ -558,7 +565,9 @@ mod usability_tests {
     /// row beside the same build read from a log Xcode wrote differently.
     #[test]
     fn a_fragment_from_an_aborted_parse_is_not_a_usable_build() {
-        let metrics = partial("unknown SLF location class 'IDELogDocumentLocation' at byte 478; keeping partial result");
+        let metrics = partial(
+            "unknown SLF location class 'IDELogDocumentLocation' at byte 478; keeping partial result",
+        );
         assert!(metrics.decoded_partially());
         assert!(!metrics.is_usable(), "a one-phase fragment is not a build");
         // Not the clean-log case: that message would misdirect the reader.
@@ -659,7 +668,10 @@ mod usability_tests {
             architecture: None,
             occurrences: 1,
         }];
-        assert!(!metrics.decoded_partially(), "real measurements were recorded");
+        assert!(
+            !metrics.decoded_partially(),
+            "real measurements were recorded"
+        );
         assert!(metrics.is_usable());
     }
 

@@ -65,7 +65,9 @@ impl ResponseCache {
         // As with the store lock: a panicked request must not turn one failure
         // into a permanent outage. There is no invariant here beyond "these
         // strings were once a valid response".
-        self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The cached body for `key`, if one is present and still fresh.
@@ -147,13 +149,19 @@ fn no_cache() -> tiny_http::Header {
 }
 
 fn split_url(url: &str) -> (String, String) {
-    url.split_once('?').map(|(a, b)| (a.to_owned(), b.to_owned())).unwrap_or((url.to_owned(), String::new()))
+    url.split_once('?')
+        .map(|(a, b)| (a.to_owned(), b.to_owned()))
+        .unwrap_or((url.to_owned(), String::new()))
 }
 
 /// Percent-decoded string query parameter. Project names contain spaces and
 /// non-ASCII characters, so a raw read would fail to match the stored name.
 fn text_param(query: &str, name: &str) -> Option<String> {
-    let raw = query.split('&').filter_map(|pair| pair.split_once('=')).find(|(key, _)| *key == name)?.1;
+    let raw = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == name)?
+        .1;
     Some(percent_decode(raw))
 }
 
@@ -172,16 +180,18 @@ fn percent_decode(raw: &str) -> String {
                 decoded.push(b' ');
                 index += 1;
             }
-            b'%' if index + 3 <= bytes.len() => match u8::from_str_radix(&raw[index + 1..index + 3], 16) {
-                Ok(byte) => {
-                    decoded.push(byte);
-                    index += 3;
+            b'%' if index + 3 <= bytes.len() => {
+                match u8::from_str_radix(&raw[index + 1..index + 3], 16) {
+                    Ok(byte) => {
+                        decoded.push(byte);
+                        index += 3;
+                    }
+                    Err(_) => {
+                        decoded.push(b'%');
+                        index += 1;
+                    }
                 }
-                Err(_) => {
-                    decoded.push(b'%');
-                    index += 1;
-                }
-            },
+            }
             byte => {
                 decoded.push(byte);
                 index += 1;
@@ -200,7 +210,10 @@ fn not_found(message: &str) -> Routed {
 }
 
 fn number_param(query: &str, name: &str, default: i64) -> i64 {
-    text_param(query, name).and_then(|value| value.parse().ok()).unwrap_or(default).clamp(1, MAX_LIMIT)
+    text_param(query, name)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+        .clamp(1, MAX_LIMIT)
 }
 
 /// Renders a store result as a JSON response.
@@ -218,7 +231,11 @@ fn number_param(query: &str, name: &str, default: i64) -> i64 {
 fn json<T: serde::Serialize>(value: Result<T, StoreError>) -> Routed {
     match value {
         Ok(value) => match serde_json::to_string(&value) {
-            Ok(body) => Routed { status: 200, content_type: "application/json", body },
+            Ok(body) => Routed {
+                status: 200,
+                content_type: "application/json",
+                body,
+            },
             Err(error) => {
                 eprintln!("dashboard: could not serialize a response: {error}");
                 error_response("could not render this result")
@@ -258,7 +275,11 @@ pub fn route_cached(
     }
     let key = format!("{path}?{query}");
     if let Some(body) = cache.get(&key) {
-        return Routed { status: 200, content_type: "application/json", body };
+        return Routed {
+            status: 200,
+            content_type: "application/json",
+            body,
+        };
     }
     let routed = route(path, query, store);
     if routed.status == 200 {
@@ -292,8 +313,16 @@ pub fn route(path: &str, query: &str, store: &Arc<std::sync::Mutex<PostgresStore
         poisoned.into_inner()
     });
     match path {
-        "/" => Routed { status: 200, content_type: "text/html", body: INDEX.into() },
-        "/health" => Routed { status: 200, content_type: "application/json", body: "{\"status\":\"ok\"}".into() },
+        "/" => Routed {
+            status: 200,
+            content_type: "text/html",
+            body: INDEX.into(),
+        },
+        "/health" => Routed {
+            status: 200,
+            content_type: "application/json",
+            body: "{\"status\":\"ok\"}".into(),
+        },
         "/api/summary" | "/api/builds" => json(store.dashboard_snapshot()),
         "/api/projects" => json(store.projects()),
         "/api/trends/duration" => json(store.duration_trend_for(limit.min(200), project)),
@@ -304,7 +333,9 @@ pub fn route(path: &str, query: &str, store: &Arc<std::sync::Mutex<PostgresStore
         "/api/trends/diagnostics" => json(store.diagnostic_trend_for(limit, project)),
         "/api/files/slowest" => json(store.slowest_files(builds, limit.min(50), project)),
         "/api/swift/slowest" => json(store.slowest_swift_timings(builds, limit.min(50), project)),
-        "/api/diagnostics/clusters" => json(store.diagnostic_clusters(builds, limit.min(50), project)),
+        "/api/diagnostics/clusters" => {
+            json(store.diagnostic_clusters(builds, limit.min(50), project))
+        }
         "/api/tests/flaky" => json(store.flaky_tests(builds, limit.min(50), project)),
         "/api/regressions" => json(store.target_regressions(builds, limit.min(50), project)),
         "/api/environment" => json(store.environment_breakdown(builds, project)),
@@ -454,9 +485,18 @@ mod tests {
         cache.put("/api/trends/duration?project=Other".into(), "other");
         cache.put("/api/trends/daily?project=App".into(), "daily");
 
-        assert_eq!(cache.get("/api/trends/duration?project=App").as_deref(), Some("app"));
-        assert_eq!(cache.get("/api/trends/duration?project=Other").as_deref(), Some("other"));
-        assert_eq!(cache.get("/api/trends/daily?project=App").as_deref(), Some("daily"));
+        assert_eq!(
+            cache.get("/api/trends/duration?project=App").as_deref(),
+            Some("app")
+        );
+        assert_eq!(
+            cache.get("/api/trends/duration?project=Other").as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            cache.get("/api/trends/daily?project=App").as_deref(),
+            Some("daily")
+        );
         // The failure mode worth guarding: a key that was never stored must miss
         // rather than fall back to a similar one.
         assert!(cache.get("/api/trends/duration?project=Absent").is_none());
@@ -486,7 +526,10 @@ mod tests {
         // The real answer is now cached; replace it so a cache hit is visible.
         cache.put("/api/projects?".into(), "{\"sentinel\":true}");
         let second = route_cached("/api/projects", "", &store, &cache);
-        assert_eq!(second.body, "{\"sentinel\":true}", "the repeat request hit the database");
+        assert_eq!(
+            second.body, "{\"sentinel\":true}",
+            "the repeat request hit the database"
+        );
 
         // A different query must not read that entry.
         let scoped = route_cached("/api/projects", "project=App", &store, &cache);
@@ -512,7 +555,10 @@ mod tests {
         ));
         let cache = ResponseCache::new();
         assert_eq!(route_cached("/api/nope", "", &store, &cache).status, 404);
-        assert!(cache.get("/api/nope?").is_none(), "a 404 must not be cached");
+        assert!(
+            cache.get("/api/nope?").is_none(),
+            "a 404 must not be cached"
+        );
     }
 
     /// Invalidation must drop everything, so a stored build is visible on the
@@ -535,8 +581,13 @@ mod tests {
     fn an_expired_entry_is_not_served() {
         let cache = ResponseCache::new();
         let stale = std::time::Instant::now() - CACHE_TTL - std::time::Duration::from_millis(1);
-        cache.lock().insert("/api/summary?".into(), (stale, "stale".into()));
-        assert!(cache.get("/api/summary?").is_none(), "an entry past its TTL must miss");
+        cache
+            .lock()
+            .insert("/api/summary?".into(), (stale, "stale".into()));
+        assert!(
+            cache.get("/api/summary?").is_none(),
+            "an entry past its TTL must miss"
+        );
         // And the miss removes it, rather than leaving it to be re-checked.
         assert!(cache.lock().is_empty());
     }
@@ -549,7 +600,11 @@ mod tests {
             .split_once("REFRESH_MS")
             .and_then(|(_, rest)| rest.split_once('='))
             .and_then(|(_, rest)| {
-                let digits: String = rest.trim_start().chars().take_while(char::is_ascii_digit).collect();
+                let digits: String = rest
+                    .trim_start()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
                 digits.parse::<u64>().ok()
             })
             .expect("REFRESH_MS is declared in dashboard-ui/src/main.tsx");
@@ -583,7 +638,10 @@ mod tests {
         }
         // A deep link like /#/trends reaches the server as "/", so the views
         // only resolve while "/" keeps serving the app.
-        assert!(UI_SOURCE.contains("hashchange"), "views must react to hash changes");
+        assert!(
+            UI_SOURCE.contains("hashchange"),
+            "views must react to hash changes"
+        );
         // The nav must *call* openTab, not merely define it: the original bug
         // was buttons that rendered fine and did nothing on click.
         assert!(
@@ -602,7 +660,10 @@ mod tests {
             "the generated-file banner is missing from the bundle"
         );
         // After the doctype, so the doctype still comes first.
-        assert!(INDEX.starts_with("<!doctype html>"), "the doctype must lead");
+        assert!(
+            INDEX.starts_with("<!doctype html>"),
+            "the doctype must lead"
+        );
     }
 
     /// Every route the server answers must be one the UI actually requests.
@@ -640,7 +701,9 @@ mod tests {
     #[test]
     fn the_page_scopes_its_project_filtered_requests() {
         let anchor = "/api/trends/targets";
-        let at = INDEX.find(anchor).expect("index.html never requests the anchor route");
+        let at = INDEX
+            .find(anchor)
+            .expect("index.html never requests the anchor route");
         // Walk back over the opening `("` to the identifier before it.
         let before = INDEX[..at].trim_end_matches(['"', '\'', '(']);
         let helper: String = before
@@ -651,11 +714,15 @@ mod tests {
             .into_iter()
             .rev()
             .collect();
-        assert!(!helper.is_empty(), "could not identify the scope() helper in the bundle");
+        assert!(
+            !helper.is_empty(),
+            "could not identify the scope() helper in the bundle"
+        );
 
         for path in PROJECT_SCOPED {
             assert!(
-                INDEX.contains(&format!("{helper}(\"{path}\"")) || INDEX.contains(&format!("{helper}('{path}'")),
+                INDEX.contains(&format!("{helper}(\"{path}\""))
+                    || INDEX.contains(&format!("{helper}('{path}'")),
                 "{path} is fetched without going through scope() (helper `{helper}`)"
             );
         }
@@ -674,7 +741,10 @@ mod tests {
     #[test]
     fn responses_are_not_cacheable() {
         let value = String::from_utf8(no_cache().value.as_bytes().to_vec()).unwrap();
-        assert!(value.contains("no-store"), "index and API responses must not be cached: {value}");
+        assert!(
+            value.contains("no-store"),
+            "index and API responses must not be cached: {value}"
+        );
         let field = format!("{}", no_cache().field);
         assert_eq!(field.to_ascii_lowercase(), "cache-control");
     }
@@ -687,7 +757,10 @@ mod tests {
     /// add, so `/` must keep serving the app for a deep link to resolve.
     #[test]
     fn build_detail_is_a_hash_routed_page() {
-        assert!(INDEX.contains("#/build/"), "index.html lost its build route");
+        assert!(
+            INDEX.contains("#/build/"),
+            "index.html lost its build route"
+        );
         assert!(
             INDEX.contains("hashchange"),
             "the page must react to hash changes, or the back button breaks"
@@ -699,10 +772,19 @@ mod tests {
 
     #[test]
     fn percent_encoded_project_names_decode() {
-        assert_eq!(text_param("project=My%20App", "project").as_deref(), Some("My App"));
-        assert_eq!(text_param("project=My+App", "project").as_deref(), Some("My App"));
+        assert_eq!(
+            text_param("project=My%20App", "project").as_deref(),
+            Some("My App")
+        );
+        assert_eq!(
+            text_param("project=My+App", "project").as_deref(),
+            Some("My App")
+        );
         // A value ending in an escape must not lose its final character.
-        assert_eq!(text_param("project=A%2FB", "project").as_deref(), Some("A/B"));
+        assert_eq!(
+            text_param("project=A%2FB", "project").as_deref(),
+            Some("A/B")
+        );
         assert_eq!(text_param("limit=10", "project"), None);
     }
 
@@ -837,7 +919,7 @@ mod tests {
                 diagnostics: vec![],
                 tests: vec![],
             })
-            .ok();  // Already present from an earlier run is fine.
+            .ok(); // Already present from an earlier run is fine.
         let store = Arc::new(std::sync::Mutex::new(connected));
 
         let routed = route("/api/build/dashboard%20decode%20probe", "", &store);
@@ -846,7 +928,11 @@ mod tests {
             "an escaped key must reach the stored build: {}",
             routed.body
         );
-        assert!(routed.body.contains("dashboard decode probe"), "{}", routed.body);
+        assert!(
+            routed.body.contains("dashboard decode probe"),
+            "{}",
+            routed.body
+        );
         // An empty key is a client error rather than a lookup.
         assert_eq!(route("/api/build/", "", &store).status, 400);
     }
@@ -866,8 +952,14 @@ mod tests {
 
     #[test]
     fn urls_split_into_path_and_query() {
-        assert_eq!(split_url("/api/builds?limit=5"), ("/api/builds".into(), "limit=5".into()));
-        assert_eq!(split_url("/api/builds"), ("/api/builds".into(), String::new()));
+        assert_eq!(
+            split_url("/api/builds?limit=5"),
+            ("/api/builds".into(), "limit=5".into())
+        );
+        assert_eq!(
+            split_url("/api/builds"),
+            ("/api/builds".into(), String::new())
+        );
         assert_eq!(split_url("/"), ("/".into(), String::new()));
         // A trailing `?` yields an empty query rather than a missing one.
         assert_eq!(split_url("/x?"), ("/x".into(), String::new()));

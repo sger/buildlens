@@ -105,20 +105,11 @@ impl Failure {
     fn into_reply(self) -> (Reply, Option<anyhow::Error>) {
         match self {
             Self::BadRequest(message) => (Reply::error(400, &message), None),
-            Self::TooLarge => (
-                Reply::error(413, "payload exceeds the 1 MiB limit"),
-                None,
-            ),
+            Self::TooLarge => (Reply::error(413, "payload exceeds the 1 MiB limit"), None),
             // Rate limiting is a client-visible condition it can act on by
             // backing off, so unlike an internal failure it is described.
-            Self::TooManyRequests => (
-                Reply::error(429, "too many requests, slow down"),
-                None,
-            ),
-            Self::Internal(error) => (
-                Reply::error(500, "internal error"),
-                Some(error),
-            ),
+            Self::TooManyRequests => (Reply::error(429, "too many requests, slow down"), None),
+            Self::Internal(error) => (Reply::error(500, "internal error"), Some(error)),
         }
     }
 }
@@ -320,7 +311,8 @@ pub fn run(config: Config) -> Result<()> {
     // Migrations run once, here, on their own connection — not per pooled
     // connection, which would re-apply every ALTER for each one the pool opens.
     store::connect_and_migrate(&database_url).context("connecting to Postgres")?;
-    let pool = store::pool(&database_url, pool_size as u32).context("building the connection pool")?;
+    let pool =
+        store::pool(&database_url, pool_size as u32).context("building the connection pool")?;
     // The dashboard's own connections. `PostgresStore::connect` applies the
     // full schema, which is a superset of what ingest needs: the server writes
     // builds, targets and phases, while the dashboard also reads file timings,
@@ -331,12 +323,9 @@ pub fn run(config: Config) -> Result<()> {
             .context("connecting the dashboard to Postgres")?,
     );
 
-    let server =
-        Arc::new(Server::http(&bind).map_err(|error| anyhow::anyhow!(error.to_string()))?);
+    let server = Arc::new(Server::http(&bind).map_err(|error| anyhow::anyhow!(error.to_string()))?);
     let limiter = Arc::new(RateLimiter::new(INGEST_PER_MINUTE));
-    eprintln!(
-        "BuildLens server listening on {bind} ({threads} threads, {pool_size} connections)"
-    );
+    eprintln!("BuildLens server listening on {bind} ({threads} threads, {pool_size} connections)");
     eprintln!("Dashboard: http://{bind}/");
 
     // Every worker runs the same accept loop; `recv` hands each request to
@@ -422,7 +411,12 @@ fn route(
     client_key: &str,
     context: &Handler<'_>,
 ) -> Result<Reply, Failure> {
-    let Handler { pool, limiter, dashboard, .. } = context;
+    let Handler {
+        pool,
+        limiter,
+        dashboard,
+        ..
+    } = context;
     // The dashboard's own routes — its HTML shell and the `/api/*` calls that
     // shell makes — are delegated whole to `buildlens_dashboard`, so the page
     // served here behaves exactly as the local `buildlens dashboard` does.
@@ -431,15 +425,19 @@ fn route(
     if method == &Method::Get && (path == "/" || path.starts_with("/api/")) {
         let routed =
             buildlens_dashboard::route_cached(path, query, dashboard.next(), &dashboard.cache);
-        return Ok(Reply::typed(routed.status, routed.body, routed.content_type));
+        return Ok(Reply::typed(
+            routed.status,
+            routed.body,
+            routed.content_type,
+        ));
     }
     match (method, path) {
         // Deliberately before any database work: a health check that fails
         // when Postgres is briefly unreachable would make the container
         // restart loop, taking down an endpoint that was about to recover.
-        (Method::Get, "/health") => Ok(Reply::ok(
-            serde_json::json!({ "status": "ok" }).to_string(),
-        )),
+        (Method::Get, "/health") => {
+            Ok(Reply::ok(serde_json::json!({ "status": "ok" }).to_string()))
+        }
         (Method::Post, "/v1/metrics") => {
             // Checked before reading the body, so a client in a retry loop is
             // refused without the server buffering a megabyte per attempt.
@@ -496,16 +494,22 @@ fn route(
             let builds = param(query, "builds").unwrap_or(100).clamp(1, 1000);
             let top = param(query, "top").unwrap_or(20).clamp(1, 200);
             let mut connection = connection(pool)?;
-            let snapshot = PostgresStore::new(&mut connection)
-                .ranked_targets(builds, top, text_param(query, "project").as_deref())?;
+            let snapshot = PostgresStore::new(&mut connection).ranked_targets(
+                builds,
+                top,
+                text_param(query, "project").as_deref(),
+            )?;
             Ok(Reply::ok(snapshot.to_string()))
         }
         (Method::Get, "/v1/phases/ranked") => {
             let builds = param(query, "builds").unwrap_or(100).clamp(1, 1000);
             let top = param(query, "top").unwrap_or(20).clamp(1, 200);
             let mut connection = connection(pool)?;
-            let snapshot = PostgresStore::new(&mut connection)
-                .ranked_phases(builds, top, text_param(query, "project").as_deref())?;
+            let snapshot = PostgresStore::new(&mut connection).ranked_phases(
+                builds,
+                top,
+                text_param(query, "project").as_deref(),
+            )?;
             Ok(Reply::ok(snapshot.to_string()))
         }
         _ => Ok(Reply::error(404, "not found")),
@@ -599,7 +603,9 @@ fn parse_payload(payload: &str) -> Result<WireBuild, Failure> {
         )));
     }
     if build.build_key.is_empty() {
-        return Err(Failure::BadRequest("build_key must not be empty".to_owned()));
+        return Err(Failure::BadRequest(
+            "build_key must not be empty".to_owned(),
+        ));
     }
     Ok(build)
 }
@@ -664,18 +670,16 @@ fn percent_decode(value: &str) -> String {
             }
             // `i + 3 <= len` is the slice bound: an escape needs two hex
             // digits after the '%'.
-            b'%' if i + 3 <= bytes.len() => {
-                match u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
+            b'%' if i + 3 <= bytes.len() => match u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
                 }
-            }
+                Err(_) => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
             byte => {
                 out.push(byte);
                 i += 1;
@@ -787,7 +791,10 @@ mod tests {
         let sentinel = "/api/summary?";
         dashboard.cache.put(sentinel.to_owned(), "stale");
         let first = ingest(&payload, &dashboard).expect("first ingest");
-        assert!(first.contains("\"stored\":true"), "expected a fresh store: {first}");
+        assert!(
+            first.contains("\"stored\":true"),
+            "expected a fresh store: {first}"
+        );
         assert!(
             dashboard.cache.get(sentinel).is_none(),
             "storing a build must drop the cached answers"
@@ -796,7 +803,10 @@ mod tests {
         // Second push is a duplicate, so the cache must survive.
         dashboard.cache.put(sentinel.to_owned(), "kept");
         let second = ingest(&payload, &dashboard).expect("second ingest");
-        assert!(second.contains("\"duplicate\":true"), "expected a duplicate: {second}");
+        assert!(
+            second.contains("\"duplicate\":true"),
+            "expected a duplicate: {second}"
+        );
         assert_eq!(
             dashboard.cache.get(sentinel).as_deref(),
             Some("kept"),
@@ -881,8 +891,8 @@ mod tests {
             let mut difference = (a.len() ^ b.len()) as u8;
             for index in 0..a.len().max(b.len()) {
                 count += 1;
-                difference |= a.get(index).copied().unwrap_or(0)
-                    ^ b.get(index).copied().unwrap_or(0);
+                difference |=
+                    a.get(index).copied().unwrap_or(0) ^ b.get(index).copied().unwrap_or(0);
             }
             let _ = difference;
             count
@@ -1141,7 +1151,10 @@ mod tests {
         let (reply, detail) = Failure::TooManyRequests.into_reply();
         assert_eq!(reply.status, 429);
         assert!(reply.body.contains("too many requests"), "{}", reply.body);
-        assert!(detail.is_none(), "a throttled client needs no server-side log");
+        assert!(
+            detail.is_none(),
+            "a throttled client needs no server-side log"
+        );
     }
 
     // --- configuration ---
@@ -1261,7 +1274,10 @@ mod tests {
             "\"wire_version\":9999",
         );
         let message = reject(&payload);
-        assert!(message.contains("unsupported wire version 9999"), "{message}");
+        assert!(
+            message.contains("unsupported wire version 9999"),
+            "{message}"
+        );
     }
 
     /// `build_key` is the idempotency key; an empty one would make every

@@ -23,9 +23,15 @@ fn serde_plain<T: serde::Serialize>(value: &T) -> String {
 /// so it survives reboots and reinstalls, hashed so it cannot be traced back.
 pub fn machine_id(probe: &dyn buildlens_plugins::SystemProbe) -> Option<String> {
     let model = probe.run("sysctl", &["-n", "hw.model"]).ok()?;
-    let cpu = probe.run("sysctl", &["-n", "machdep.cpu.brand_string"]).unwrap_or_default();
-    let memory = probe.run("sysctl", &["-n", "hw.memsize"]).unwrap_or_default();
-    let host = probe.run("sysctl", &["-n", "kern.uuid"]).unwrap_or_default();
+    let cpu = probe
+        .run("sysctl", &["-n", "machdep.cpu.brand_string"])
+        .unwrap_or_default();
+    let memory = probe
+        .run("sysctl", &["-n", "hw.memsize"])
+        .unwrap_or_default();
+    let host = probe
+        .run("sysctl", &["-n", "kern.uuid"])
+        .unwrap_or_default();
     let material = format!("{model}|{cpu}|{memory}|{host}");
     Some(buildlens_plugins::pseudonymize_email(&material).replace("user-", "machine-"))
 }
@@ -47,7 +53,10 @@ pub fn identity(probe: &dyn buildlens_plugins::SystemProbe) -> buildlens_core::w
         let value = value.trim().to_owned();
         if value.is_empty() { None } else { Some(value) }
     };
-    let user = std::env::var("USER").ok().or_else(|| std::env::var("LOGNAME").ok()).and_then(clean);
+    let user = std::env::var("USER")
+        .ok()
+        .or_else(|| std::env::var("LOGNAME").ok())
+        .and_then(clean);
     let host = hostname(probe);
     buildlens_core::wire::Identity { user, host }
 }
@@ -67,7 +76,13 @@ fn hostname(probe: &dyn buildlens_plugins::SystemProbe) -> Option<String> {
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
         .or_else(|| probe.run("scutil", &["--get", "LocalHostName"]).ok())?;
-    let short = raw.trim().split('.').next().unwrap_or_default().trim().to_owned();
+    let short = raw
+        .trim()
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
     if short.is_empty() { None } else { Some(short) }
 }
 
@@ -159,7 +174,11 @@ mod tests {
         // stopped matching when it changed.
         let probe = FakeProbe::with(&[
             ("sysctl", &["-n", "hw.model"], "Mac14,10\n"),
-            ("sysctl", &["-n", "machdep.cpu.brand_string"], "Apple M2 Pro\n"),
+            (
+                "sysctl",
+                &["-n", "machdep.cpu.brand_string"],
+                "Apple M2 Pro\n",
+            ),
             ("sysctl", &["-n", "hw.memsize"], "17179869184\n"),
             ("sysctl", &["-n", "kern.uuid"], "ABC-123\n"),
         ]);

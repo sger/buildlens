@@ -399,7 +399,10 @@ impl<'a> Parser<'a, '_> {
         // discard a build.
         if !is_text
             && !is_member
-            && !matches!(class_name.as_str(), "DVTDocumentLocation" | "IDELogDocumentLocation")
+            && !matches!(
+                class_name.as_str(),
+                "DVTDocumentLocation" | "IDELogDocumentLocation"
+            )
         {
             self.fail(format!("unknown SLF location class '{class_name}'"));
             return None;
@@ -574,13 +577,17 @@ mod tests {
             "-".to_string(),     // subMessages
             "0#".to_string(),    // severity
             "-".to_string(),     // type
-            format!("{}%{}3@", "DVTMemberDocumentLocation".len(), "DVTMemberDocumentLocation"),
+            format!(
+                "{}%{}3@",
+                "DVTMemberDocumentLocation".len(),
+                "DVTMemberDocumentLocation"
+            ),
             string("file:///tmp/CasinoEmbed.storyboard"),
             double(2.0),
             string("M22-vh-94L"), // member identifier
-            "-".to_string(), // categoryIdent
-            "-".to_string(), // secondaryLocations
-            "-".to_string(), // additionalDescription
+            "-".to_string(),      // categoryIdent
+            "-".to_string(),      // secondaryLocations
+            "-".to_string(),      // additionalDescription
         ]
         .concat()
     }
@@ -619,30 +626,30 @@ mod tests {
 
     fn log_with_message(message: &str) -> String {
         let body = [
-            "0#".to_string(),  // sectionType
-            string("domain"),  // domainType
+            "0#".to_string(),    // sectionType
+            string("domain"),    // domainType
             string("Build App"), // title
             string("Build App"), // signature
-            double(1.0),       // timeStartedRecording
-            double(3.5),       // timeStoppedRecording
-            "-".to_string(),   // subSections
-            "-".to_string(),   // text
+            double(1.0),         // timeStartedRecording
+            double(3.5),         // timeStoppedRecording
+            "-".to_string(),     // subSections
+            "-".to_string(),     // text
             // messages: one entry, registering the message class inline
             format!(
                 "1({}%IDEActivityLogMessage2@{}",
                 "IDEActivityLogMessage".len(),
                 message
             ),
-            "0#".to_string(),  // wasCancelled
-            "0#".to_string(),  // isQuiet
-            "0#".to_string(),  // wasFetchedFromCache
-            "-".to_string(),   // subtitle
-            "-".to_string(),   // location
-            "-".to_string(),   // commandDetailDesc
-            string("UID"),     // uniqueIdentifier
-            "-".to_string(),   // localizedResultString
-            "-".to_string(),   // xcbuildSignature
-            "-".to_string(),   // attachments
+            "0#".to_string(), // wasCancelled
+            "0#".to_string(), // isQuiet
+            "0#".to_string(), // wasFetchedFromCache
+            "-".to_string(),  // subtitle
+            "-".to_string(),  // location
+            "-".to_string(),  // commandDetailDesc
+            string("UID"),    // uniqueIdentifier
+            "-".to_string(),  // localizedResultString
+            "-".to_string(),  // xcbuildSignature
+            "-".to_string(),  // attachments
         ]
         .concat();
         format!("SLF012#21%IDEActivityLogSection1@{body}")
@@ -660,13 +667,21 @@ mod tests {
             let input = log_with_message_location(class);
             let (log, warnings) = parse(input.as_bytes(), &ParseOptions { keep_text: false });
             assert_eq!(warnings, Vec::<String>::new(), "{class} produced warnings");
-            let main = log.main_section.unwrap_or_else(|| panic!("{class}: no main section"));
+            let main = log
+                .main_section
+                .unwrap_or_else(|| panic!("{class}: no main section"));
             // The whole section must survive, not just the part before the
             // location — that prefix is exactly what the bug left behind.
-            assert_eq!(main.unique_identifier, "UID", "{class}: parse stopped early");
+            assert_eq!(
+                main.unique_identifier, "UID",
+                "{class}: parse stopped early"
+            );
             assert_eq!(main.messages.len(), 1, "{class}: message lost");
             assert_eq!(
-                main.messages[0].location.as_ref().map(|l| l.document_url.as_str()),
+                main.messages[0]
+                    .location
+                    .as_ref()
+                    .map(|l| l.document_url.as_str()),
                 Some("x-xcode-log://ABC"),
                 "{class}: location not read"
             );
@@ -687,14 +702,24 @@ mod tests {
     fn storyboard_member_locations_do_not_abort_the_parse() {
         let input = log_with_member_location();
         let (log, warnings) = parse(input.as_bytes(), &ParseOptions { keep_text: false });
-        assert_eq!(warnings, Vec::<String>::new(), "member location produced warnings");
+        assert_eq!(
+            warnings,
+            Vec::<String>::new(),
+            "member location produced warnings"
+        );
         let main = log.main_section.expect("no main section");
         // The fields after the message are what the abort used to discard, and
         // they are the ones the dashboard shows.
-        assert_eq!(main.unique_identifier, "UID", "parse stopped before the build id");
+        assert_eq!(
+            main.unique_identifier, "UID",
+            "parse stopped before the build id"
+        );
         assert_eq!(main.messages.len(), 1, "message lost");
         assert_eq!(
-            main.messages[0].location.as_ref().map(|l| l.document_url.as_str()),
+            main.messages[0]
+                .location
+                .as_ref()
+                .map(|l| l.document_url.as_str()),
             Some("file:///tmp/CasinoEmbed.storyboard"),
             "location not read"
         );
@@ -743,22 +768,41 @@ mod toolchain_tests {
 
     #[test]
     fn extracts_text_between_two_markers() {
-        assert_eq!(between("a/Applications/Xcode-26.3.0.app/b", "/Applications/Xcode-", ".app"), Some("26.3.0"));
-        assert_eq!(between("-target arm64-apple-ios", "-target ", "-apple"), Some("arm64"));
+        assert_eq!(
+            between(
+                "a/Applications/Xcode-26.3.0.app/b",
+                "/Applications/Xcode-",
+                ".app"
+            ),
+            Some("26.3.0")
+        );
+        assert_eq!(
+            between("-target arm64-apple-ios", "-target ", "-apple"),
+            Some("arm64")
+        );
     }
 
     /// A missing marker must yield nothing rather than the rest of the string,
     /// which would put a whole compiler invocation into a version field.
     #[test]
     fn a_missing_marker_yields_nothing() {
-        assert_eq!(between("no markers here", "/Applications/Xcode-", ".app"), None);
-        assert_eq!(between("/Applications/Xcode-26.3.0", "/Applications/Xcode-", ".app"), None);
+        assert_eq!(
+            between("no markers here", "/Applications/Xcode-", ".app"),
+            None
+        );
+        assert_eq!(
+            between("/Applications/Xcode-26.3.0", "/Applications/Xcode-", ".app"),
+            None
+        );
         assert_eq!(between("", "a", "b"), None);
     }
 
     /// An empty span is not a value: `Xcode-.app` names no version.
     #[test]
     fn an_empty_span_is_not_a_value() {
-        assert_eq!(between("/Applications/Xcode-.app", "/Applications/Xcode-", ".app"), None);
+        assert_eq!(
+            between("/Applications/Xcode-.app", "/Applications/Xcode-", ".app"),
+            None
+        );
     }
 }

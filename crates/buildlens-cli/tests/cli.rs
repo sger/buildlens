@@ -61,7 +61,10 @@ fn companion_must_be_an_activity_log() {
         &fixture("successful-build.log"),
     ]);
     assert!(!ok);
-    assert!(stderr.contains("expects an .xcactivitylog"), "got: {stderr}");
+    assert!(
+        stderr.contains("expects an .xcactivitylog"),
+        "got: {stderr}"
+    );
 }
 
 #[test]
@@ -87,26 +90,20 @@ fn half_written_logs_are_refused_rather_than_stored() {
     // touched, so an unreachable one proves the log is rejected first.
     let db = "postgres://invalid/nonexistent";
 
-    let (ok, _, stderr) = run(&[
-        "history",
-        "save",
-        partial.to_str().unwrap(),
-        "--db",
-        db,
-    ]);
+    let (ok, _, stderr) = run(&["history", "save", partial.to_str().unwrap(), "--db", db]);
     assert!(!ok, "a truncated log must not be recorded");
-    assert!(stderr.contains("did not decode into a usable build"), "got: {stderr}");
-    assert!(stderr.contains("buildlens collect"), "message should suggest the collector");
+    assert!(
+        stderr.contains("did not decode into a usable build"),
+        "got: {stderr}"
+    );
+    assert!(
+        stderr.contains("buildlens collect"),
+        "message should suggest the collector"
+    );
 
     let empty = scratch.join("empty.xcactivitylog");
     std::fs::write(&empty, b"").unwrap();
-    let (ok, _, stderr) = run(&[
-        "history",
-        "save",
-        empty.to_str().unwrap(),
-        "--db",
-        db,
-    ]);
+    let (ok, _, stderr) = run(&["history", "save", empty.to_str().unwrap(), "--db", db]);
     assert!(!ok);
     assert!(stderr.contains("empty"), "got: {stderr}");
     let _ = std::fs::remove_dir_all(&scratch);

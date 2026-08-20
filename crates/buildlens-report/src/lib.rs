@@ -156,13 +156,19 @@ fn git_terminal(git: &GitCorrelation) -> String {
         git.likely_related.as_str().to_uppercase(),
         git.confidence,
         git.evidence.join("; ")
-    ) + &ownership_block("FAILING TEST LOCATION", &git.failure_ownership, "Test location author: ")
-        + &ownership_block(
-            "RELEVANT IMPLEMENTATION CHANGE",
-            &git.implementation_ownership,
-            "Last changed by: ",
-        )
-        + &ownership_block("DIAGNOSTIC OWNERSHIP", &git.diagnostic_ownership, "Diagnostic owner: ")
+    ) + &ownership_block(
+        "FAILING TEST LOCATION",
+        &git.failure_ownership,
+        "Test location author: ",
+    ) + &ownership_block(
+        "RELEVANT IMPLEMENTATION CHANGE",
+        &git.implementation_ownership,
+        "Last changed by: ",
+    ) + &ownership_block(
+        "DIAGNOSTIC OWNERSHIP",
+        &git.diagnostic_ownership,
+        "Diagnostic owner: ",
+    )
 }
 
 fn intelligence_terminal(intelligence: &Intelligence) -> String {
@@ -365,13 +371,19 @@ fn git_markdown(git: &GitCorrelation) -> String {
         git.likely_related.as_str(),
         git.confidence,
         git.evidence.join("; ")
-    ) + &ownership_markdown("Failure ownership", &git.failure_ownership, "Test location author")
-        + &ownership_markdown(
-            "Implementation ownership",
-            &git.implementation_ownership,
-            "Last relevant implementation change",
-        )
-        + &ownership_markdown("Diagnostic ownership", &git.diagnostic_ownership, "Diagnostic owner")
+    ) + &ownership_markdown(
+        "Failure ownership",
+        &git.failure_ownership,
+        "Test location author",
+    ) + &ownership_markdown(
+        "Implementation ownership",
+        &git.implementation_ownership,
+        "Last relevant implementation change",
+    ) + &ownership_markdown(
+        "Diagnostic ownership",
+        &git.diagnostic_ownership,
+        "Diagnostic owner",
+    )
 }
 
 fn intelligence_markdown(intelligence: &Intelligence) -> String {
@@ -979,8 +991,16 @@ mod tests {
         };
         let text = terminal(&analysis);
         for heading in [
-            "BUILD", "FAILURES", "WARNINGS", "TESTS", "SWIFT 6", "BUILD TIMING", "METRICS",
-            "SWIFT TIMINGS", "GIT CORRELATION", "INTELLIGENCE",
+            "BUILD",
+            "FAILURES",
+            "WARNINGS",
+            "TESTS",
+            "SWIFT 6",
+            "BUILD TIMING",
+            "METRICS",
+            "SWIFT TIMINGS",
+            "GIT CORRELATION",
+            "INTELLIGENCE",
         ] {
             assert!(text.contains(heading), "missing {heading} in:\n{text}");
         }
