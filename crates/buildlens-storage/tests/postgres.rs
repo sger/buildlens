@@ -324,13 +324,20 @@ fn a_build_snapshot_carries_its_files_hotspots_diagnostics_and_tests() {
     // uses, so the dashboard and the CLI cannot disagree about one build. It
     // is computed on read rather than stored, which is what lets a threshold
     // change apply to builds already recorded.
+    // Asserted by kind rather than by count: this fixture's one 900ms site is
+    // both an expensive function body and, being the only measured file in its
+    // target, a concentrated one. Pinning a total would break whenever a rule
+    // is added or a threshold moves, which says nothing about the wiring this
+    // test exists to check.
     let advice = snapshot["advice"].as_array().expect("advice array");
-    assert_eq!(advice.len(), 1);
-    assert_eq!(advice[0]["kind"], "large_function_body");
-    assert_eq!(advice[0]["symbol"], "slowFunction()");
-    assert_eq!(advice[0]["line"], 42);
+    let body = advice
+        .iter()
+        .find(|a| a["kind"] == "large_function_body")
+        .expect("the slow function body");
+    assert_eq!(body["symbol"], "slowFunction()");
+    assert_eq!(body["line"], 42);
     assert!(
-        advice[0]["explanation"]
+        body["explanation"]
             .as_str()
             .expect("explanation")
             .contains("slowFunction()")

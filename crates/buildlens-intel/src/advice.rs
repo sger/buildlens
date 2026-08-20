@@ -10,22 +10,36 @@ use crate::language;
 use buildlens_core::{Advice, AdviceKind, BuildAnalysis, SwiftTimingKind, SwiftTimingMetric};
 use std::collections::BTreeMap;
 
-/// A single site below this is not worth a line of output: Xcode's own default
-/// warning threshold is 100ms, and a site near it is indistinguishable from
-/// measurement noise on a loaded machine.
-const MIN_SITE_MS: f64 = 250.0;
+/// A single site below this is not worth a line of output.
+///
+/// Calibrated against a real SwiftUI app rather than a synthetic one: across
+/// 91 measured sites the median was 17ms, p90 38ms and the slowest 93ms. The
+/// first version of this used 250ms, taken from a package written to be
+/// pathologically slow, and so reported nothing on healthy code — which looked
+/// like a broken panel rather than the good news it was.
+///
+/// 150ms sits above p99 on that sample, so a site clearing it is a genuine
+/// outlier rather than the top of a normal distribution.
+const MIN_SITE_MS: f64 = 150.0;
 
 /// A file must hold at least this share of its target's type-checking time,
 /// *and* [`MIN_FILE_MS`] in absolute terms, before it is called concentrated.
 /// A share alone would flag the only file in a target that barely type-checks
 /// at all.
-const FILE_SHARE: f64 = 0.40;
-const MIN_FILE_MS: f64 = 1_000.0;
+///
+/// The same recalibration: the worst file in that app held 12% of its target,
+/// so a 40% bar could only ever fire on a project with one dominant file.
+const FILE_SHARE: f64 = 0.25;
+const MIN_FILE_MS: f64 = 400.0;
 
 /// Likewise for a whole target: a share of a build that takes no time is not
 /// a finding.
-const TARGET_SHARE: f64 = 0.25;
-const MIN_TARGET_MS: f64 = 2_000.0;
+///
+/// That app spent 1.95s type-checking across a 27s target — 7%, which is
+/// healthy and should stay silent. 15% is the point where type-checking is a
+/// large enough slice to be worth naming.
+const TARGET_SHARE: f64 = 0.15;
+const MIN_TARGET_MS: f64 = 1_500.0;
 
 /// Site-level advice past this point is a list nobody reads to the end — the
 /// same reasoning as `bottleneck::MAX_BOTTLENECKS`.
@@ -504,6 +518,59 @@ mod tests {
 
     /// Advice is persisted and compared across builds, so the discriminant
     /// must not move with a `Debug` reformat.
+    /// Regression guard for the calibration, taken from a real SwiftUI app:
+    /// 91 sites, median 17ms, slowest 93ms, 1.95s of type-checking in a 27s
+    /// target. That is a healthy build and every rule must stay silent on it.
+    /// An earlier threshold set tuned on a deliberately pathological package
+    /// also reported nothing here, but for the wrong reason — it would have
+    /// stayed silent on a genuinely slow project too.
+    #[test]
+    fn a_healthy_real_world_build_produces_no_advice() {
+        let timings = [93.0, 71.0, 64.0, 55.0, 55.0, 52.0, 46.0, 44.0, 42.0, 38.0]
+            .iter()
+            .enumerate()
+            .map(|(index, milliseconds)| {
+                timing(
+                    SwiftTimingKind::FunctionBody,
+                    &format!("/app/View{index}.swift"),
+                    10,
+                    Some("body"),
+                    *milliseconds,
+                    "TestRouterApp",
+                )
+            })
+            .collect();
+        let mut analysis = analysis_with_timings(timings);
+        // The 27.2s target the 1.95s of type-checking sat inside.
+        if let Some(metrics) = analysis.metrics.as_mut() {
+            metrics.targets[0].name = "TestRouterApp".into();
+            metrics.targets[0].seconds = 27.2;
+        }
+        assert!(
+            advice(&analysis).is_empty(),
+            "a build spending 7% of a target on type-checking has nothing to advise"
+        );
+    }
+
+    /// The other half of the calibration: a site that is a real outlier still
+    /// clears the floor, so lowering it did not make the rule unfireable.
+    #[test]
+    fn a_genuine_outlier_still_clears_the_floor() {
+        let analysis = analysis_with_timings(vec![timing(
+            SwiftTimingKind::TypeCheck,
+            "/app/Slow.swift",
+            47,
+            None,
+            354.0,
+            "App",
+        )]);
+        assert!(
+            advice(&analysis)
+                .iter()
+                .any(|item| item.kind == AdviceKind::ExpressionHotspot)
+        );
+    }
+
     #[test]
     fn kind_strings_are_stable() {
         assert_eq!(AdviceKind::ExpressionHotspot.as_str(), "expression_hotspot");

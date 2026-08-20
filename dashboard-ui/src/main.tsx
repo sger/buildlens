@@ -110,21 +110,46 @@ function TestCell({build}:{build:Build}) {
     : <span className="ok-text" title={`All ${total} tests passed`}>{total} passed</span>;
 }
 
+/// How many bars a panel shows before collapsing the rest behind a toggle.
+///
+/// Six panels rendering 25 rows each made the detail page several screens of
+/// scrolling, most of it the flat tail of each distribution — on a real build
+/// the 8th-slowest type-check site was 42ms against a 93ms leader, which is
+/// noise wearing a bar. Eight is where the ranked head ends on the builds this
+/// was checked against; the tail stays one click away rather than deleted,
+/// because "show me everything" is a fair thing to want from a detail page.
+const BAR_PREVIEW = 8;
+
 /// A bar-ranked list. Widths are relative to the largest row, so the shape of
 /// the distribution is readable without axes.
+///
+/// Widths stay relative to the largest row in the *whole* list, not the
+/// visible slice, so expanding does not silently rescale every bar under the
+/// reader.
 function Bars({rows,empty}:{rows:{key:string;label:React.ReactNode;note?:React.ReactNode;value:number;display:string}[];empty:string}) {
+  const [expanded,setExpanded]=useState(false);
   if(!rows.length) return <div className="empty">{empty}</div>;
   const max=Math.max(...rows.map(r=>r.value),0.0001);
-  return <ul className="bars">{rows.map(r=><li key={r.key}><div className="bar-head"><span className="bar-label" title={typeof r.label==="string"?r.label:undefined}>{r.label}</span><span className="bar-value mono">{r.display}</span></div><div className="bar-track"><i style={{width:`${Math.max((r.value/max)*100,2)}%`}}/></div>{r.note&&<small>{r.note}</small>}</li>)}</ul>;
+  const shown=expanded?rows:rows.slice(0,BAR_PREVIEW);
+  const hidden=rows.length-shown.length;
+  return <>
+    <ul className="bars">{shown.map(r=><li key={r.key}><div className="bar-head"><span className="bar-label" title={typeof r.label==="string"?r.label:undefined}>{r.label}</span><span className="bar-value mono">{r.display}</span></div><div className="bar-track"><i style={{width:`${Math.max((r.value/max)*100,2)}%`}}/></div>{r.note&&<small>{r.note}</small>}</li>)}</ul>
+    {(hidden>0||expanded)&&<button type="button" className="more" onClick={()=>setExpanded(!expanded)}>{expanded?"Show fewer":`Show ${hidden} more`}</button>}
+  </>;
 }
 
 /// Advice reads as prose, not as a ranking, so it deliberately does not reuse
 /// `Bars`: the number is evidence for the sentence rather than the point.
 ///
-/// An empty list means the build was not measured -- the `-warn-long-*` flags
-/// were absent -- not that nothing is slow, so the empty text says which.
-function AdviceList({rows}:{rows:AdviceRow[]}) {
-  if(!rows.length) return <div className="empty">Not enabled for this build — add -warn-long-function-bodies or -warn-long-expression-type-checking to see advice.</div>;
+/// Empty means one of two unrelated things, and saying the wrong one is worse
+/// than saying nothing. No timings at all means the `-warn-long-*` flags were
+/// absent, so the build was never measured. Timings but no advice means it was
+/// measured and nothing crossed a threshold -- a healthy build, and telling
+/// someone to enable flags they already have reads as a broken panel.
+function AdviceList({rows,measured}:{rows:AdviceRow[];measured:boolean}) {
+  if(!rows.length) return <div className="empty">{measured
+    ? "Nothing stands out — type-checking is a small share of this build, and no single site or file dominates it."
+    : "Not enabled for this build — add -warn-long-function-bodies or -warn-long-expression-type-checking to see advice."}</div>;
   return <ul className="advice">{rows.map((a,index)=>{
     const where = a.file ? (a.line ? `${short(a.file)}:${a.line}` : short(a.file)) : (a.target||"");
     return <li key={`${a.kind}:${a.file}:${a.line??0}:${index}`}>
@@ -247,7 +272,7 @@ function BuildPage({id}:{id:string}) {
           <Bars empty="No per-file timings in this build." rows={(build.files||[]).slice(0,25).map(f=>({key:f.file,label:<span title={f.file}>{short(f.file)}</span>,value:f.seconds,display:seconds(f.seconds),note:`${f.target||"unknown target"}${(f.compilations||0)>1?` · compiled ${f.compilations}×`:""}`}))}/>
         </Section>
         <Section title="Swift type-checking advice" note="What the hotspots below add up to">
-          <AdviceList rows={build.advice||[]}/>
+          <AdviceList rows={build.advice||[]} measured={(build.swift||[]).length>0}/>
         </Section>
         <Section title="Swift type-check hotspots" note="Needs -warn-long-function-bodies">
           <Bars empty="Not enabled for this build — add -warn-long-function-bodies or -warn-long-expression-type-checking to see hotspots." rows={(build.swift||[]).slice(0,25).map(s=>({key:`${s.file}:${s.line}:${s.kind}`,label:<span title={`${s.file}:${s.line}`}>{s.symbol||`${short(s.file)}:${s.line}`}</span>,value:s.milliseconds,display:ms(s.milliseconds),note:`${s.kind.replace(/_/g," ")} · ${short(s.file)}:${s.line}`}))}/>

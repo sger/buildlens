@@ -11,10 +11,21 @@ pub const ENVIRONMENT_SHIFTED: &str =
     "the build environment shifted since the baseline, which may explain the timing";
 pub const BUILD_SUSPENDED: &str = "the machine slept during this build, so timings are unreliable";
 
+/// The remedy is splitting, not annotating.
+///
+/// An earlier version of this said an explicit type annotation "usually
+/// removes most of it". Measured against swiftc, that is false: annotating a
+/// mixed-type arithmetic chain took it from ~354ms to ~590ms, and annotating a
+/// slow collection literal turned a 3.2s warning into a hard "unable to
+/// type-check in reasonable time" error. The annotation is one more constraint
+/// to reconcile against every operator overload, so it widens the solver's
+/// search rather than pruning it. Breaking the expression into named
+/// sub-expressions is what the compiler's own error text recommends, and it
+/// took that same 3.2s case to zero warnings.
 pub fn expression_hotspot(milliseconds: f64) -> String {
     format!(
-        "this expression took {milliseconds:.0}ms to type-check on its own; an explicit type \
-         annotation usually removes most of it"
+        "this expression took {milliseconds:.0}ms to type-check on its own; splitting it into \
+         named sub-expressions is what usually removes the cost"
     )
 }
 

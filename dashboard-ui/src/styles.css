@@ -169,6 +169,10 @@
   .bars small, .rows small { @apply text-faint text-[11px] block truncate min-w-0; }
   /* Advice is a sentence with a number attached, not a bar: the explanation
      wraps to as many lines as it needs, where .bars truncates to stay scannable. */
+  /* Reveals the tail of a ranked list. Sized like a note rather than an
+     action: it is a disclosure, not a primary control. */
+  .more { @apply mt-3 border-0 bg-transparent p-0 text-accent text-[12px] font-semibold cursor-pointer; }
+  .more:hover { @apply underline; }
   .advice { @apply list-none mt-4 mb-0 p-0 grid gap-[15px]; }
   .advice li { @apply grid gap-[5px] min-w-0 border-l-2 border-accent pl-3; }
   .advice p { @apply m-0 text-[12.5px] leading-relaxed text-[#4a5763]; }

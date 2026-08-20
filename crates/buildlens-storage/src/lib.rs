@@ -1030,7 +1030,19 @@ impl PostgresStore {
         // disagreeing about one build. Reconstructed from the rows just read
         // rather than stored, so it stays correct when the rules change.
         let advice = {
-            let timings: Vec<buildlens_core::SwiftTimingMetric> = swift
+            // Every timing, not the 50 `swift` shows. Advice weighs each site
+            // against its file's and its target's total, so computing it from
+            // a truncated set overstates both shares — a build with 91 timings
+            // reported its worst file as 16% of the target when it is 12%.
+            // The display list stays capped; the arithmetic behind it must not
+            // be, or the dashboard and `analyze` would disagree about one
+            // build, which is what `from_timings` exists to prevent.
+            let all_swift = self.client.query(
+                "SELECT file,line,symbol,kind,milliseconds,target FROM build_swift_timings \
+                 WHERE build_key=$1 ORDER BY milliseconds DESC",
+                &[&key],
+            )?;
+            let timings: Vec<buildlens_core::SwiftTimingMetric> = all_swift
                 .iter()
                 .map(|s| buildlens_core::SwiftTimingMetric {
                     kind: match s.get::<_, String>(3).as_str() {
