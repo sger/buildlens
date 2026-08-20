@@ -1327,10 +1327,19 @@ fn metric_regression_summary(comparison: &buildlens_core::HistoryComparison) -> 
 /// `--build-dir` nor `$BUILD_DIR` says otherwise.
 const DEFAULT_DERIVED_DATA: &str = "~/Library/Developer/Xcode/DerivedData";
 
-/// How many scans a log may fail the stability check before the watcher stops
-/// retrying it. A build still being written passes well inside this; a log
-/// Xcode abandoned mid-build never will, and without a bound it would be
-/// retried — and reported — on every scan for as long as the watcher runs.
+/// How many scans a log may fail the stability check *without growing* before
+/// the watcher stops retrying it. A log Xcode abandoned mid-build sits at a
+/// fixed size forever and is given up on after this many scans; without a bound
+/// it would be retried — and reported — on every scan for as long as the
+/// watcher runs.
+///
+/// Deliberately counted per stalled size rather than per attempt. A long build
+/// writes its log progressively, so it fails the stability check repeatedly
+/// while still growing perfectly normally; counting those failures gave up on
+/// builds that were minutes from finishing and never looked at them again,
+/// because `seen` had already recorded the identity that failed. The log then
+/// completed and was silently never collected. Growth resets the count, so only
+/// a log that has genuinely stopped changing is ever abandoned.
 const MAX_UNSTABLE_RETRIES: u32 = 3;
 
 /// Unix seconds `keep_days` before now. Builds recorded before this go.
@@ -1623,6 +1632,60 @@ fn repo_root_from_log(log: &std::path::Path) -> Option<std::path::PathBuf> {
 /// for a log already in history — so a log seen on every scan is imported
 /// once. Errors are reported and skipped: a watcher that exits on one bad log
 /// stops collecting the builds after it.
+/// What to do about a log that failed the stability check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unstable {
+    /// Still worth another scan.
+    Retrying,
+    /// The scan on which the bound was reached, and so the one that reports it.
+    GivingUp,
+    /// Already given up on, and still not changing. Silent.
+    Abandoned,
+}
+
+/// Records a stability failure and decides whether the log is worth another
+/// look, given the size it now holds.
+///
+/// The whole point is that *growth resets the count*. A long build writes its
+/// log progressively, so it fails the stability check on scan after scan while
+/// being perfectly healthy; counting those failures is what made the watcher
+/// abandon builds minutes before they finished. Only a log that has stopped
+/// changing is abandoned, which is the actual signature of one Xcode discarded.
+fn note_unstable(
+    unstable: &mut std::collections::HashMap<PathBuf, (u64, u32)>,
+    log: &std::path::Path,
+    size: u64,
+) -> Unstable {
+    let entry = unstable.entry(log.to_path_buf()).or_insert((size, 0));
+    if entry.0 == size {
+        entry.1 += 1;
+    } else {
+        *entry = (size, 1);
+    }
+    match entry.1.cmp(&MAX_UNSTABLE_RETRIES) {
+        std::cmp::Ordering::Less => Unstable::Retrying,
+        std::cmp::Ordering::Equal => Unstable::GivingUp,
+        std::cmp::Ordering::Greater => Unstable::Abandoned,
+    }
+}
+
+/// The `seen` key a log holds right now, or a zeroed one if it cannot be read.
+///
+/// Matches the identity built at the top of the scan loop, so the two agree on
+/// what "this log, as written" means.
+fn current_identity(log: &std::path::Path) -> (PathBuf, u64, i64) {
+    let Ok(meta) = std::fs::metadata(log) else {
+        return (log.to_path_buf(), 0, 0);
+    };
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or_default();
+    (log.to_path_buf(), meta.len(), modified)
+}
+
 fn watch_loop(
     root: &std::path::Path,
     match_project: Option<&str>,
@@ -1639,10 +1702,16 @@ fn watch_loop(
     // History is still the real dedup; this only avoids re-parsing unchanged
     // logs on every scan.
     let mut seen: std::collections::HashSet<(PathBuf, u64, i64)> = std::collections::HashSet::new();
-    // Consecutive stability failures per log identity, so a log that never
-    // finishes is given up on rather than retried forever. Keyed like `seen`:
-    // a genuinely new write of the same path starts its own count.
-    let mut unstable: std::collections::HashMap<(PathBuf, u64, i64), u32> =
+    // Stability failures per log, as (the size it last failed at, how many
+    // consecutive scans it has failed at that size).
+    //
+    // Keyed on the path alone, unlike `seen`. The size and mtime a scan reads
+    // are captured *before* `import_one` blocks waiting for the log to settle,
+    // and a log being written has changed both by the time that wait gives up,
+    // so a key carrying them names an identity that no longer exists and every
+    // failure looked like the first. Recording the size here instead is what
+    // lets growth be told apart from a stall.
+    let mut unstable: std::collections::HashMap<PathBuf, (u64, u32)> =
         std::collections::HashMap::new();
     let mut first_scan = true;
     // Bundles whose results are already in history, by bundle name.
@@ -1696,7 +1765,7 @@ fn watch_loop(
                             // A log that was still being written on earlier
                             // scans has now arrived; its failures were not the
                             // abandoned-log case the bound exists for.
-                            unstable.remove(&(log.clone(), stamp.0, stamp.1));
+                            unstable.remove(log.as_path());
                             println!("Collected {}", log.display());
                         }
                         // Already in history. Announced rather than passed over
@@ -1712,7 +1781,7 @@ fn watch_loop(
                             // between scans is an ordinary outcome rather than
                             // a failure to report. Nothing is left to retry.
                             if message.contains("cannot stat") {
-                                unstable.remove(&key);
+                                unstable.remove(log.as_path());
                                 continue;
                             }
                             // Only a log still being written is worth another
@@ -1722,22 +1791,40 @@ fn watch_loop(
                             // failure on every scan, forever.
                             let transient = message.contains("did not become stable");
                             if transient {
-                                // Bounded: an abandoned log fails this check
-                                // identically on every scan, so retrying it
-                                // without limit spends the whole timeout per
-                                // scan and reports a build that will never
-                                // arrive.
-                                let attempts = unstable.entry(key.clone()).or_insert(0);
-                                *attempts += 1;
-                                if *attempts < MAX_UNSTABLE_RETRIES {
-                                    seen.remove(&key);
-                                    continue;
+                                // Measured now rather than reused from `stamp`,
+                                // which was read before the wait: a log that
+                                // grew during it is still being written, and
+                                // that is the fact this decision turns on.
+                                let size = std::fs::metadata(&log)
+                                    .map(|meta| meta.len())
+                                    .unwrap_or(stamp.0);
+                                let verdict = note_unstable(&mut unstable, &log, size);
+                                // Forget every identity this log could be
+                                // recorded under, whether or not the bound was
+                                // reached. `seen` is what stops a log being
+                                // re-examined, and an unstable log must stay
+                                // eligible: `key` is the identity read before
+                                // the wait, and the second is the one it holds
+                                // now — a log that reached its final size
+                                // *during* the wait was already recorded under
+                                // that identity by the insert at the top of
+                                // this scan. Leaving either behind means the
+                                // next scan sees a log it believes it has
+                                // handled, and a build that finished a moment
+                                // too late is never looked at again, silently.
+                                seen.remove(&key);
+                                seen.remove(&current_identity(&log));
+                                // Reported once per stall, not once per scan.
+                                // The count keeps rising while the size holds;
+                                // if the log grows later it resets and the
+                                // build is collected as normal.
+                                if verdict == Unstable::GivingUp {
+                                    eprintln!(
+                                        "gave up on {} after {MAX_UNSTABLE_RETRIES} scans with no \
+                                         change at {size} bytes: {error}",
+                                        log.display()
+                                    );
                                 }
-                                unstable.remove(&key);
-                                eprintln!(
-                                    "gave up on {} after {MAX_UNSTABLE_RETRIES} attempts: {error}",
-                                    log.display()
-                                );
                                 continue;
                             }
                             eprintln!("skipped {}: {error}", log.display());
@@ -1924,6 +2011,129 @@ mod tests {
         analysis.diagnostics.raw_warnings = warnings;
         analysis.tests.failed = failed;
         analysis
+    }
+
+    /// A log that is still growing must never be abandoned, however many scans
+    /// it takes.
+    ///
+    /// This is the regression that made the watcher lose builds. A long build
+    /// writes its activity log progressively, so `wait_until_stable` times out
+    /// on scan after scan while the build is perfectly healthy. Counting those
+    /// as strikes retired the log after three of them, and because `seen` had
+    /// already recorded the identity that failed, the finished log was never
+    /// looked at again — no "Collected", no "gave up", nothing. The build was
+    /// simply gone, and the dashboard was blamed for not refreshing.
+    #[test]
+    fn a_growing_log_is_never_given_up_on() {
+        let mut unstable = std::collections::HashMap::new();
+        let log = std::path::Path::new("/dd/App/Logs/Build/a.xcactivitylog");
+        // Ten scans, each finding the log bigger than the last.
+        for scan in 1..=10 {
+            let verdict = note_unstable(&mut unstable, log, scan * 4096);
+            assert_eq!(
+                verdict,
+                Unstable::Retrying,
+                "scan {scan} abandoned a log that had grown since the last one"
+            );
+        }
+    }
+
+    /// A log that has genuinely stopped changing is still abandoned, and the
+    /// bound is still reported exactly once.
+    ///
+    /// This is the case the bound exists for: Xcode discards the log of a build
+    /// it cancels, leaving a file that will never be complete. Retrying it
+    /// forever spends the whole timeout on every scan.
+    #[test]
+    fn a_stalled_log_is_given_up_on_once() {
+        let mut unstable = std::collections::HashMap::new();
+        let log = std::path::Path::new("/dd/App/Logs/Build/b.xcactivitylog");
+        assert_eq!(note_unstable(&mut unstable, log, 4096), Unstable::Retrying);
+        assert_eq!(note_unstable(&mut unstable, log, 4096), Unstable::Retrying);
+        // The third failure at one size reaches the bound and reports it.
+        assert_eq!(note_unstable(&mut unstable, log, 4096), Unstable::GivingUp);
+        // Every scan after that is silent, or an abandoned log is announced on
+        // every scan for as long as the watcher runs.
+        for _ in 0..5 {
+            assert_eq!(note_unstable(&mut unstable, log, 4096), Unstable::Abandoned);
+        }
+    }
+
+    /// Growth after a log was given up on brings it back.
+    ///
+    /// A build can stall long enough to be abandoned and then resume — Xcode
+    /// pausing on a long link step, a machine that went to sleep mid-build.
+    /// The log is complete in the end, so it is a build like any other, and
+    /// refusing to collect it because of an earlier stall loses it for good.
+    #[test]
+    fn growth_after_giving_up_makes_a_log_eligible_again() {
+        let mut unstable = std::collections::HashMap::new();
+        let log = std::path::Path::new("/dd/App/Logs/Build/c.xcactivitylog");
+        for _ in 0..3 {
+            note_unstable(&mut unstable, log, 4096);
+        }
+        assert_eq!(
+            note_unstable(&mut unstable, log, 4096),
+            Unstable::Abandoned,
+            "a log stalled at one size stays abandoned"
+        );
+        // It grew: the build was alive after all.
+        assert_eq!(
+            note_unstable(&mut unstable, log, 8192),
+            Unstable::Retrying,
+            "a log that grew after being abandoned must be retried"
+        );
+    }
+
+    /// Two logs are counted independently, so a stalled one cannot retire a
+    /// healthy one building alongside it.
+    #[test]
+    fn each_log_carries_its_own_count() {
+        let mut unstable = std::collections::HashMap::new();
+        let stalled = std::path::Path::new("/dd/A/Logs/Build/a.xcactivitylog");
+        let growing = std::path::Path::new("/dd/B/Logs/Build/b.xcactivitylog");
+        for _ in 0..3 {
+            note_unstable(&mut unstable, stalled, 4096);
+        }
+        for scan in 1..=5 {
+            assert_eq!(
+                note_unstable(&mut unstable, growing, scan * 1024),
+                Unstable::Retrying
+            );
+        }
+        assert_eq!(
+            note_unstable(&mut unstable, stalled, 4096),
+            Unstable::Abandoned
+        );
+    }
+
+    /// The identity used to clear `seen` must match the one the scan loop
+    /// builds, or clearing it silently does nothing.
+    ///
+    /// Asserted against a real file rather than a constructed tuple: the size
+    /// and mtime have to come from the same syscall the loop uses.
+    #[test]
+    fn current_identity_matches_the_file_on_disk() {
+        let dir = std::env::temp_dir().join("buildlens-identity-test");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let log = dir.join("id.xcactivitylog");
+        std::fs::write(&log, b"0123456789").expect("write log");
+
+        let (path, size, modified) = current_identity(&log);
+        assert_eq!(path, log);
+        assert_eq!(size, 10, "size must come from the file itself");
+        let expected = std::fs::metadata(&log)
+            .and_then(|meta| meta.modified())
+            .expect("mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("epoch")
+            .as_secs() as i64;
+        assert_eq!(modified, expected);
+
+        // A log Xcode discarded reads as a zeroed identity rather than panicking.
+        std::fs::remove_file(&log).expect("remove log");
+        assert_eq!(current_identity(&log), (log.clone(), 0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `--fail-on` is a CI gate, so each policy must check exactly what its
