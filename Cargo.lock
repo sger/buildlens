@@ -276,6 +276,7 @@ name = "buildlens-storage"
 version = "0.0.1"
 dependencies = [
  "buildlens-core",
+ "buildlens-intel",
  "postgres",
  "serde",
  "serde_json",

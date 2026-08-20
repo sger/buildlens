@@ -15,10 +15,13 @@ type BuildFileRow = { file:string; target?:string|null; seconds:number; compilat
 type BuildStepRow = { step_type:string; title:string; file?:string|null; target?:string|null; architecture?:string|null; seconds:number; started_at?:number|null; ended_at?:number|null; fetched_from_cache:boolean; executed:boolean };
 type StepTotals = { total:number; executed:number; executed_seconds:number };
 type BuildSwiftRow = { file:string; line:number; symbol?:string|null; kind:string; milliseconds:number; target?:string|null };
+/// Derived server-side by `buildlens_intel::from_timings`, so the dashboard and
+/// the CLI cannot disagree about which hotspots are worth acting on.
+type AdviceRow = { kind:string; file:string; line?:number; column?:number; symbol?:string|null; target?:string|null; milliseconds:number; explanation:string };
 type BuildDiagRow = { fingerprint:string; severity:string; category:string; message:string; file?:string|null; line?:number|null; target?:string|null; occurrences:number };
 type BuildTestRow = { suite:string; test:string; status:string; seconds?:number|null; message?:string|null; attempts?:number };
 type TestTotals = { total:number; failed:number; seconds:number };
-type Detail = Build & { compiled_count?:number; replayed_steps?:number; machine_id?:string|null; user?:string|null; host?:string|null; xcode_version?:string|null; platform?:string|null; architecture?:string|null; targets?:TargetRow[]; phases?:PhaseRow[]; metadata?:Record<string,string>; files?:BuildFileRow[]; swift?:BuildSwiftRow[]; diagnostics?:BuildDiagRow[]; tests?:BuildTestRow[]; test_totals?:TestTotals; steps?:BuildStepRow[]; step_totals?:StepTotals; };
+type Detail = Build & { compiled_count?:number; replayed_steps?:number; machine_id?:string|null; user?:string|null; host?:string|null; xcode_version?:string|null; platform?:string|null; architecture?:string|null; targets?:TargetRow[]; phases?:PhaseRow[]; metadata?:Record<string,string>; files?:BuildFileRow[]; swift?:BuildSwiftRow[]; advice?:AdviceRow[]; diagnostics?:BuildDiagRow[]; tests?:BuildTestRow[]; test_totals?:TestTotals; steps?:BuildStepRow[]; step_totals?:StepTotals; };
 type Percentiles = { builds:number; enough_history:boolean; p50?:number|null; p95?:number|null; min_seconds?:number|null; max_seconds?:number|null; avg_seconds?:number|null };
 type Ranked = { name:string; observations:number; avg_seconds?:number|null; max_seconds?:number|null; cached_builds?:number };
 type FileRow = { file:string; target?:string|null; observations:number; avg_seconds?:number|null; max_seconds?:number|null; compilations?:number|null };
@@ -113,6 +116,23 @@ function Bars({rows,empty}:{rows:{key:string;label:React.ReactNode;note?:React.R
   if(!rows.length) return <div className="empty">{empty}</div>;
   const max=Math.max(...rows.map(r=>r.value),0.0001);
   return <ul className="bars">{rows.map(r=><li key={r.key}><div className="bar-head"><span className="bar-label" title={typeof r.label==="string"?r.label:undefined}>{r.label}</span><span className="bar-value mono">{r.display}</span></div><div className="bar-track"><i style={{width:`${Math.max((r.value/max)*100,2)}%`}}/></div>{r.note&&<small>{r.note}</small>}</li>)}</ul>;
+}
+
+/// Advice reads as prose, not as a ranking, so it deliberately does not reuse
+/// `Bars`: the number is evidence for the sentence rather than the point.
+///
+/// An empty list means the build was not measured -- the `-warn-long-*` flags
+/// were absent -- not that nothing is slow, so the empty text says which.
+function AdviceList({rows}:{rows:AdviceRow[]}) {
+  if(!rows.length) return <div className="empty">Not enabled for this build — add -warn-long-function-bodies or -warn-long-expression-type-checking to see advice.</div>;
+  return <ul className="advice">{rows.map((a,index)=>{
+    const where = a.file ? (a.line ? `${short(a.file)}:${a.line}` : short(a.file)) : (a.target||"");
+    return <li key={`${a.kind}:${a.file}:${a.line??0}:${index}`}>
+      <div className="bar-head"><span className="bar-label" title={a.file||a.target||""}>{a.symbol||where||"this build"}</span><span className="bar-value mono">{ms(a.milliseconds)}</span></div>
+      <p>{a.explanation}</p>
+      {where&&a.symbol&&<small>{where}</small>}
+    </li>;
+  })}</ul>;
 }
 
 function Section({title,note,children}:{title:string;note?:string;children:React.ReactNode}) {
@@ -225,6 +245,9 @@ function BuildPage({id}:{id:string}) {
         </Section>
         <Section title="Slowest files" note="Compile time in this build">
           <Bars empty="No per-file timings in this build." rows={(build.files||[]).slice(0,25).map(f=>({key:f.file,label:<span title={f.file}>{short(f.file)}</span>,value:f.seconds,display:seconds(f.seconds),note:`${f.target||"unknown target"}${(f.compilations||0)>1?` · compiled ${f.compilations}×`:""}`}))}/>
+        </Section>
+        <Section title="Swift type-checking advice" note="What the hotspots below add up to">
+          <AdviceList rows={build.advice||[]}/>
         </Section>
         <Section title="Swift type-check hotspots" note="Needs -warn-long-function-bodies">
           <Bars empty="Not enabled for this build — add -warn-long-function-bodies or -warn-long-expression-type-checking to see hotspots." rows={(build.swift||[]).slice(0,25).map(s=>({key:`${s.file}:${s.line}:${s.kind}`,label:<span title={`${s.file}:${s.line}`}>{s.symbol||`${short(s.file)}:${s.line}`}</span>,value:s.milliseconds,display:ms(s.milliseconds),note:`${s.kind.replace(/_/g," ")} · ${short(s.file)}:${s.line}`}))}/>

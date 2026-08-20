@@ -320,6 +320,22 @@ fn a_build_snapshot_carries_its_files_hotspots_diagnostics_and_tests() {
     assert_eq!(swift[0]["milliseconds"], 900.0);
     assert_eq!(swift[0]["line"], 42);
 
+    // Advice is derived from those same hotspots by the function `analyze`
+    // uses, so the dashboard and the CLI cannot disagree about one build. It
+    // is computed on read rather than stored, which is what lets a threshold
+    // change apply to builds already recorded.
+    let advice = snapshot["advice"].as_array().expect("advice array");
+    assert_eq!(advice.len(), 1);
+    assert_eq!(advice[0]["kind"], "large_function_body");
+    assert_eq!(advice[0]["symbol"], "slowFunction()");
+    assert_eq!(advice[0]["line"], 42);
+    assert!(
+        advice[0]["explanation"]
+            .as_str()
+            .expect("explanation")
+            .contains("slowFunction()")
+    );
+
     let diagnostics = snapshot["diagnostics"]
         .as_array()
         .expect("diagnostics array");

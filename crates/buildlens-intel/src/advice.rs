@@ -42,14 +42,34 @@ pub fn advice(analysis: &BuildAnalysis) -> Vec<Advice> {
     let Some(metrics) = &analysis.metrics else {
         return Vec::new();
     };
-    if metrics.swift_timings.is_empty() {
+    let seconds_by_target: Vec<(&str, f64)> = metrics
+        .targets
+        .iter()
+        .map(|target| (target.name.as_str(), target.seconds))
+        .collect();
+    from_timings(&metrics.swift_timings, &seconds_by_target)
+}
+
+/// The same analysis, over timings that did not come from a parsed log.
+///
+/// The dashboard reads builds back from Postgres and never holds a
+/// `BuildAnalysis`, so without this it would need its own copy of the
+/// thresholds — and a threshold that differs between the CLI and the dashboard
+/// is a bug that shows as two tools disagreeing about the same build.
+///
+/// `seconds_by_target` may repeat a name (one row per project or
+/// architecture); the durations are summed, as `bottleneck` does.
+pub fn from_timings(
+    timings: &[SwiftTimingMetric],
+    seconds_by_target: &[(&str, f64)],
+) -> Vec<Advice> {
+    if timings.is_empty() {
         return Vec::new();
     }
-
     let mut result = Vec::new();
-    result.extend(site_advice(&metrics.swift_timings));
-    result.extend(file_advice(&metrics.swift_timings));
-    result.extend(target_advice(analysis, &metrics.swift_timings));
+    result.extend(site_advice(timings));
+    result.extend(file_advice(timings));
+    result.extend(target_advice(timings, seconds_by_target));
     result
 }
 
@@ -172,10 +192,7 @@ fn file_advice(timings: &[SwiftTimingMetric]) -> Vec<Advice> {
 }
 
 /// Targets where type-checking is a large share of the whole build step.
-fn target_advice(analysis: &BuildAnalysis, timings: &[SwiftTimingMetric]) -> Vec<Advice> {
-    let Some(metrics) = &analysis.metrics else {
-        return Vec::new();
-    };
+fn target_advice(timings: &[SwiftTimingMetric], seconds_by_target: &[(&str, f64)]) -> Vec<Advice> {
     let mut per_target: BTreeMap<&str, f64> = BTreeMap::new();
     for timing in timings {
         if let Some(target) = timing.target.as_deref() {
@@ -188,11 +205,10 @@ fn target_advice(analysis: &BuildAnalysis, timings: &[SwiftTimingMetric]) -> Vec
         .filter_map(|(target, milliseconds)| {
             // Same-named targets in different projects are summed, matching
             // what `bottleneck` does for the same reason.
-            let seconds: f64 = metrics
-                .targets
+            let seconds: f64 = seconds_by_target
                 .iter()
-                .filter(|candidate| candidate.name == target)
-                .map(|candidate| candidate.seconds)
+                .filter(|(name, _)| *name == target)
+                .map(|(_, seconds)| *seconds)
                 .sum();
             let total_ms = seconds * 1_000.0;
             let share = if total_ms > 0.0 {

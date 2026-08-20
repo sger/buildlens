@@ -973,6 +973,12 @@ impl PostgresStore {
         )?;
         let files=self.client.query("SELECT file,target,seconds,occurrences,step_type FROM build_files WHERE build_key=$1 ORDER BY seconds DESC LIMIT 50",&[&key])?;
         let swift=self.client.query("SELECT file,line,symbol,kind,milliseconds,target FROM build_swift_timings WHERE build_key=$1 ORDER BY milliseconds DESC LIMIT 50",&[&key])?;
+        // Target durations for the share rule below, taken before the JSON
+        // assembly borrows `targets`.
+        let target_names: Vec<(String, f64)> = targets
+            .iter()
+            .map(|t| (t.get::<_, String>(0), t.get::<_, f64>(1)))
+            .collect();
         // Errors before warnings: a failed build's reason is the first thing
         // this page has to answer, and ordering by occurrences alone can bury
         // a single fatal error under a repeated warning.
@@ -1019,6 +1025,32 @@ impl PostgresStore {
              FROM build_steps WHERE build_key=$1",
             &[&key],
         )?;
+        // The same advice the CLI reports, from the same function: a threshold
+        // that differed between here and `analyze` would show as two tools
+        // disagreeing about one build. Reconstructed from the rows just read
+        // rather than stored, so it stays correct when the rules change.
+        let advice = {
+            let timings: Vec<buildlens_core::SwiftTimingMetric> = swift
+                .iter()
+                .map(|s| buildlens_core::SwiftTimingMetric {
+                    kind: match s.get::<_, String>(3).as_str() {
+                        "function_body" => buildlens_core::SwiftTimingKind::FunctionBody,
+                        _ => buildlens_core::SwiftTimingKind::TypeCheck,
+                    },
+                    file: s.get::<_, String>(0),
+                    line: s.get::<_, i32>(1).max(0) as u32,
+                    column: 0,
+                    symbol: s.get::<_, Option<String>>(2),
+                    milliseconds: s.get::<_, f64>(4),
+                    target: s.get::<_, Option<String>>(5),
+                })
+                .collect();
+            let seconds_by_target: Vec<(&str, f64)> = target_names
+                .iter()
+                .map(|(name, seconds)| (name.as_str(), *seconds))
+                .collect();
+            buildlens_intel::from_timings(&timings, &seconds_by_target)
+        };
         Ok(Some(serde_json::json!({
             "id":r.get::<_,String>(0),"recorded_at":r.get::<_,i64>(1),"project":r.get::<_,String>(2),"category":r.get::<_,String>(3),
             "total_seconds":r.get::<_,f64>(4),"cache_hit_rate":r.get::<_,Option<f64>>(5),"compiled_count":r.get::<_,i32>(6),"replayed_steps":r.get::<_,i32>(15),
@@ -1032,6 +1064,7 @@ impl PostgresStore {
             "files":files.iter().map(|f|serde_json::json!({"file":f.get::<_,String>(0),"target":f.get::<_,Option<String>>(1),"seconds":f.get::<_,f64>(2),"compilations":f.get::<_,i32>(3),"step_type":f.get::<_,String>(4)})).collect::<Vec<_>>(),
             "steps":steps.iter().map(|s|serde_json::json!({"step_type":s.get::<_,String>(0),"title":s.get::<_,String>(1),"file":s.get::<_,Option<String>>(2),"target":s.get::<_,Option<String>>(3),"architecture":s.get::<_,Option<String>>(4),"seconds":s.get::<_,f64>(5),"started_at":s.get::<_,Option<f64>>(6),"ended_at":s.get::<_,Option<f64>>(7),"fetched_from_cache":s.get::<_,bool>(8),"executed":s.get::<_,bool>(9)})).collect::<Vec<_>>(),
             "step_totals":serde_json::json!({"total":step_totals.get::<_,i64>(0),"executed":step_totals.get::<_,i64>(1),"executed_seconds":step_totals.get::<_,f64>(2)}),
+            "advice":advice,
             "swift":swift.iter().map(|s|serde_json::json!({"file":s.get::<_,String>(0),"line":s.get::<_,i32>(1),"symbol":s.get::<_,Option<String>>(2),"kind":s.get::<_,String>(3),"milliseconds":s.get::<_,f64>(4),"target":s.get::<_,Option<String>>(5)})).collect::<Vec<_>>(),
             "diagnostics":diagnostics.iter().map(|d|serde_json::json!({"fingerprint":d.get::<_,String>(0),"severity":d.get::<_,String>(1),"category":d.get::<_,String>(2),"message":d.get::<_,String>(3),"file":d.get::<_,Option<String>>(4),"line":d.get::<_,Option<i32>>(5),"target":d.get::<_,Option<String>>(6),"occurrences":d.get::<_,i32>(7)})).collect::<Vec<_>>(),
             "tests":tests.iter().map(|t|serde_json::json!({"suite":t.get::<_,String>(0),"test":t.get::<_,String>(1),"status":t.get::<_,String>(2),"seconds":t.get::<_,Option<f64>>(3),"message":t.get::<_,Option<String>>(4),"attempts":t.get::<_,i64>(5)})).collect::<Vec<_>>(),

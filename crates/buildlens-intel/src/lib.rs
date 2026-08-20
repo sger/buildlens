@@ -12,6 +12,8 @@ mod evidence;
 mod impact;
 mod language;
 
+pub use advice::from_timings;
+
 use buildlens_core::{BuildAnalysis, Intelligence, MetricRegression};
 use buildlens_graph::TargetGraph;
 

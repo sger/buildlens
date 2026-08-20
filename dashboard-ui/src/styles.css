@@ -167,6 +167,12 @@
   .bar-track { @apply bg-hair rounded-full h-[7px] overflow-hidden; }
   .bar-track i { @apply block h-full bg-accent rounded-full; }
   .bars small, .rows small { @apply text-faint text-[11px] block truncate min-w-0; }
+  /* Advice is a sentence with a number attached, not a bar: the explanation
+     wraps to as many lines as it needs, where .bars truncates to stay scannable. */
+  .advice { @apply list-none mt-4 mb-0 p-0 grid gap-[15px]; }
+  .advice li { @apply grid gap-[5px] min-w-0 border-l-2 border-accent pl-3; }
+  .advice p { @apply m-0 text-[12.5px] leading-relaxed text-[#4a5763]; }
+  .advice small { @apply text-faint text-[11px] block truncate min-w-0; }
   .rows { @apply list-none mt-4 mb-0 p-0 grid gap-3; }
   .rows li { @apply grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-1 items-baseline min-w-0; }
   .rows li small { @apply col-span-full; }
