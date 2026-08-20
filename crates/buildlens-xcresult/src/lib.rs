@@ -250,7 +250,7 @@ pub fn newest_bundle(project_dir: impl AsRef<Path>) -> Result<Option<PathBuf>, X
     // Newest first. Sorted by mtime rather than by the timestamp in the name:
     // the name's format is Xcode's to change, and a bundle rewritten in place
     // by a rerun keeps its original name.
-    bundles.sort_by(|left, right| right.0.cmp(&left.0));
+    bundles.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     Ok(bundles.into_iter().next().map(|(_, path)| path))
 }
 
@@ -459,8 +459,6 @@ mod tests {
         );
         assert!(!XcresultError::ToolMissing.is_incomplete_bundle());
     }
-
-    use super::*;
 
     /// Captured from a real Xcode 26 run of a project with a deliberately
     /// flaky test, via `xcresulttool get test-results tests`. Trimmed to the

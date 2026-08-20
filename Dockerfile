@@ -38,6 +38,7 @@ COPY crates/buildlens-plugins/Cargo.toml crates/buildlens-plugins/
 COPY crates/buildlens-metrics/Cargo.toml crates/buildlens-metrics/
 COPY crates/buildlens-diagnostics/Cargo.toml crates/buildlens-diagnostics/
 COPY crates/buildlens-tests/Cargo.toml crates/buildlens-tests/
+COPY crates/buildlens-xcresult/Cargo.toml crates/buildlens-xcresult/
 COPY crates/buildlens-graph/Cargo.toml crates/buildlens-graph/
 COPY crates/buildlens-intel/Cargo.toml crates/buildlens-intel/
 COPY crates/buildlens-report/Cargo.toml crates/buildlens-report/

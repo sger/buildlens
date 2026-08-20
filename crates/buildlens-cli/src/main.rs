@@ -1465,12 +1465,12 @@ fn push_metrics(
     let identity = identity_for(attribution);
     // Said once per push, not buried in a doc comment: this is the tier that
     // sends personal data, and the person running it should see that it did.
-    if attribution == Attribution::Identified {
-        if let Some(user) = identity.user.as_deref() {
-            eprintln!(
-                "note: sending identified builds as {user} — this attaches your name to every build"
-            );
-        }
+    if attribution == Attribution::Identified
+        && let Some(user) = identity.user.as_deref()
+    {
+        eprintln!(
+            "note: sending identified builds as {user} — this attaches your name to every build"
+        );
     }
     // An explicit --project wins here too, so the team server groups builds
     // under the same name the local dashboard shows.
